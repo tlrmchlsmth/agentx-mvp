@@ -75,21 +75,19 @@ def discover_configs(results_dir):
                         metric_units[key] = val.get('unit', '')
 
             logs_dir = os.path.join(config_dir, sub, 'logs')
-            kv_cache_tokens = None
             if os.path.isdir(logs_dir):
-                for lf in os.listdir(logs_dir):
-                    if 'decode' in lf and lf.endswith('.log'):
-                        lpath = os.path.join(logs_dir, lf)
-                        with open(lpath) as lfile:
-                            for line in lfile:
-                                m_kv = re.search(r'GPU KV cache size:\s*([\d,]+)\s*tokens', line)
-                                if m_kv:
-                                    kv_cache_tokens = int(m_kv.group(1).replace(',', ''))
-                                    break
-                        if kv_cache_tokens is not None:
-                            break
-            if kv_cache_tokens is not None:
-                run_data['_kv_cache_tokens'] = kv_cache_tokens
+                for role in ('prefill', 'decode'):
+                    for lf in os.listdir(logs_dir):
+                        if role in lf and lf.endswith('.log'):
+                            lpath = os.path.join(logs_dir, lf)
+                            with open(lpath) as lfile:
+                                for line in lfile:
+                                    m_kv = re.search(r'GPU KV cache size:\s*([\d,]+)\s*tokens', line)
+                                    if m_kv:
+                                        run_data[f'_kv_cache_{role}'] = int(m_kv.group(1).replace(',', ''))
+                                        break
+                            if f'_kv_cache_{role}' in run_data:
+                                break
 
             runs[c_val] = run_data
 
@@ -715,7 +713,7 @@ root.appendChild(sec2Wrap);
   table.appendChild(tbody);
 
   const colDefs = [
-    'Config', 'Concurrency', 'Decode GPUs', 'KV Cache (tokens)', 'Output tok/s', 'tok/s/GPU',
+    'Config', 'Concurrency', 'Decode GPUs', 'KV Cache Prefill', 'KV Cache Decode', 'Output tok/s', 'tok/s/GPU',
     'ITL p50 (ms)', 'ITL p99 (ms)', 'Per-user tok/s',
     'TTFT avg (s)', 'TTFT p50 (s)', 'TTFT p99 (s)', 'TTFT min (s)', 'TTFT max (s)',
     '$/M input', '$/M output', '$/M total',
@@ -750,11 +748,13 @@ root.appendChild(sec2Wrap);
       tr.dataset.cfg = cfg;
       tr.dataset.conc = c;
 
-      const kvCache = d._kv_cache_tokens;
-      const kvStr = kvCache != null ? kvCache.toLocaleString() : '-';
+      const kvPrefill = d._kv_cache_prefill;
+      const kvDecode = d._kv_cache_decode;
 
       const vals = [
-        meta.label, C_LABELS[c], meta.decodeGPUs, kvStr,
+        meta.label, C_LABELS[c], meta.decodeGPUs,
+        kvPrefill != null ? kvPrefill.toLocaleString() : '-',
+        kvDecode != null ? kvDecode.toLocaleString() : '-',
         out?.avg?.toFixed(1) ?? '-', norm,
         itl?.p50?.toFixed(1) ?? '-', itl?.p99?.toFixed(1) ?? '-',
         otpu?.avg?.toFixed(1) ?? '-',
@@ -769,7 +769,7 @@ root.appendChild(sec2Wrap);
         const td = document.createElement('td');
         td.textContent = v;
         if (i === 0) {{ td.style.color = COLORS[cfg]; td.style.fontWeight = '500'; }}
-        if (i === 5) td.className = 'highlight';
+        if (i === 6) td.className = 'highlight';
         tr.appendChild(td);
       }});
 
