@@ -23,7 +23,7 @@ url       := "http://llm-d-inference-gateway-istio:80/v1"
 # url       := "http://optimized-baseline-direct"
 concurrency := "64"
 duration    := "900"
-sweep_concurrencies := "16 64 128 256"
+sweep_concurrencies := "64 128 256"
 
 pd_prefill := env_var('GLM_PD_PREFILL')
 pd_decode  := env_var('GLM_PD_DECODE')
