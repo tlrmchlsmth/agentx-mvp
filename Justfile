@@ -267,7 +267,7 @@ dump-logs dest=".":
     echo "Logs saved to {{dest}}/logs/"
 
 # Export Grafana dashboards for result directories.
-# Usage: just scrape-grafana results_p1_d2_c1 results_p1_d2_c4
+# Usage: just scrape-grafana results_p1w1_d1w2_c1 results_p1w1_d1w2_c4
 scrape-grafana +dirs:
     python3 export_dashboard.py results {{dirs}}
 
@@ -345,7 +345,7 @@ report outdir:
     python3 gen_interactivity_chart.py "$(dirname "{{outdir}}")" 2>/dev/null || true
 
 # Bootstrap a new namespace with all resources needed for benchmarking.
-# Usage: just setup-namespace ecrncevi-dev-p2d2
+# Usage: just setup-namespace ecrncevi-dev-p2w1d2w1
 setup-namespace ns:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -612,7 +612,7 @@ setup-namespace ns:
     echo "=== Namespace {{ns}} ready ==="
 
 # Free GPUs in a namespace by removing model serving, but keep prometheus/grafana alive.
-# Usage: just teardown-serving ecrncevi-dev-p2d2
+# Usage: just teardown-serving ecrncevi-dev-p2w1d2w1
 teardown-serving ns:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -623,7 +623,7 @@ teardown-serving ns:
 
 # Fully tear down an isolated benchmark namespace (including monitoring).
 # Snapshot Prometheus TSDB from a benchmark namespace into a local directory.
-# Usage: just snapshot-prometheus ecrncevi-dev-p1d1 results_run1/results_p1_d1
+# Usage: just snapshot-prometheus ecrncevi-dev-p1w1d1w1 results_run1/results_p1w1_d1w1
 snapshot-prometheus ns dest:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -647,7 +647,7 @@ snapshot-prometheus ns dest:
     kubectl exec -n "{{ns}}" "$PROM_POD" -c prometheus-server -- rm -rf "/data/snapshots/${SNAP_NAME}" 2>/dev/null || true
     echo "  Saved to $SNAP_DIR"
 
-# Usage: just teardown-namespace ecrncevi-dev-p2d2
+# Usage: just teardown-namespace ecrncevi-dev-p2w1d2w1
 teardown-namespace ns:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -661,45 +661,44 @@ teardown-namespace ns:
     kubectl delete namespace {{ns}} --ignore-not-found
     echo "=== Namespace {{ns}} deleted ==="
 
-# Run sweep in an isolated namespace per P:D config.
-# Usage: just sweep-isolated results_run1 "2:2 1:1 2:1"
+# Run sweep in an isolated namespace per config.
+# Format: PR:PW:DR:DW (prefill_replicas:prefill_width:decode_replicas:decode_width)
+# Usage: just sweep-isolated results_run1 "2:1:1:1 1:1:1:1 1:2:1:1"
 sweep-isolated outdir configs duration="900":
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p "{{outdir}}"
     NAMESPACES=()
+    RESULT_DIRS=()
     for cfg in {{configs}}; do
-        IFS=: read -r P D <<< "$cfg"
-        NS="{{NAMESPACE}}-p${P}d${D}"
-        dir="{{outdir}}/results_p${P}_d${D}"
+        IFS=: read -r PR PW DR DW <<< "$cfg"
+        NS="{{NAMESPACE}}-p${PR}w${PW}d${DR}w${DW}"
+        PREFIX="p${PR}w${PW}_d${DR}w${DW}"
+        dir="{{outdir}}/results_${PREFIX}"
         # Skip if all concurrency results already exist
         ALL_DONE=true
         for C in 1 16 64 256; do
-            if [ ! -f "$dir/results_p${P}_d${D}_c${C}/profile_export_aiperf.json" ]; then
+            if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export_aiperf.json" ]; then
                 ALL_DONE=false
                 break
             fi
         done
         if [ "$ALL_DONE" = true ]; then
-            echo "====== P${P}:D${D} — all concurrency levels done, skipping ======"
+            echo "====== ${cfg} — all concurrency levels done, skipping ======"
             continue
         fi
-        echo "====== Setting up P${P}:D${D} in namespace $NS ======"
+        echo "====== Setting up ${cfg} in namespace $NS ======"
         just setup-namespace "$NS"
         NAMESPACES+=("$NS")
-        # Run sweep for this single config in its own namespace (Grafana scraped in-pod)
-        NAMESPACE="$NS" just sweep "{{outdir}}" "${P}:${D}" {{duration}} &
+        RESULT_DIRS+=("$dir")
+        NAMESPACE="$NS" just sweep "{{outdir}}" "${cfg}" {{duration}} &
     done
     # Wait for all parallel sweeps to complete
     wait
     echo "====== All sweeps complete ======"
     # Snapshot Prometheus TSDB before tearing down serving
-    for NS in "${NAMESPACES[@]}"; do
-        # Derive the results dir from the namespace suffix (e.g. ecrncevi-dev-p1d1 -> results_p1_d1)
-        SUFFIX=${NS##*-p}
-        P=${SUFFIX%%d*}
-        D=${SUFFIX##*d}
-        just snapshot-prometheus "$NS" "{{outdir}}/results_p${P}_d${D}" || echo "WARNING: snapshot failed for $NS"
+    for i in "${!NAMESPACES[@]}"; do
+        just snapshot-prometheus "${NAMESPACES[$i]}" "${RESULT_DIRS[$i]}" || echo "WARNING: snapshot failed for ${NAMESPACES[$i]}"
     done
     # Free GPUs but keep prometheus/grafana for after-the-fact reporting
     for NS in "${NAMESPACES[@]}"; do
@@ -715,11 +714,12 @@ sweep-isolated outdir configs duration="900":
         echo "  just teardown-namespace $NS"
     done
 
-# Deploy PD: just start-pd <prefill_replicas> <decode_size> [max_tokens]
-# prefill_replicas = number of prefill pods
-# decode_size = number of decode nodes (each node = 8 GPUs via EP)
-# max_tokens = decode MAX_TOKENS env var (default 1024)
-start-pd prefill_replicas decode_size:
+# Deploy PD: just start-pd <prefill_replicas> <prefill_size> <decode_replicas> <decode_size>
+# prefill_replicas = number of prefill LWS replica groups
+# prefill_size = nodes per prefill replica (EP width, 1 = single-node)
+# decode_replicas = number of decode LWS replica groups
+# decode_size = nodes per decode replica (EP width, 1 = single-node)
+start-pd prefill_replicas prefill_size decode_replicas decode_size:
     #!/usr/bin/env bash
     set -euo pipefail
     ROOT={{llm_d_root}}
@@ -738,11 +738,11 @@ start-pd prefill_replicas decode_size:
         --set 'router.epp.flags.metrics-endpoint-auth=false' \
         -n {{NAMESPACE}} --version v0.9.0
     # Deploy prefill/decode LWS
-    PREFILL_REPLICAS={{prefill_replicas}} envsubst '${PREFILL_REPLICAS}' < {{pd_prefill}} | kubectl apply -n {{NAMESPACE}} -f -
-    DECODE_SIZE={{decode_size}} envsubst '${DECODE_SIZE}' < {{pd_decode}} | kubectl apply -n {{NAMESPACE}} -f -
+    PREFILL_REPLICAS={{prefill_replicas}} PREFILL_SIZE={{prefill_size}} envsubst '${PREFILL_REPLICAS} ${PREFILL_SIZE}' < {{pd_prefill}} | kubectl apply -n {{NAMESPACE}} -f -
+    DECODE_REPLICAS={{decode_replicas}} DECODE_SIZE={{decode_size}} envsubst '${DECODE_REPLICAS} ${DECODE_SIZE}' < {{pd_decode}} | kubectl apply -n {{NAMESPACE}} -f -
     # Deploy KV cache evictor for NVMe tier cleanup
     kubectl apply -n {{NAMESPACE}} -f "$ROOT/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/kv-cache-evictor.yaml"
-    echo "Deployed P{{prefill_replicas}} D{{decode_size}} — waiting for pods..."
+    echo "Deployed PR{{prefill_replicas}} PW{{prefill_size}} DR{{decode_replicas}} DW{{decode_size}} — waiting for pods..."
     kubectl rollout status --watch statefulset/wide-ep-lws-nvidia-gpu-vllm-glm-5-2-prefill -n {{NAMESPACE}} --timeout=7200s &
     kubectl rollout status --watch statefulset/wide-ep-lws-nvidia-gpu-vllm-glm-5-2-decode -n {{NAMESPACE}} --timeout=7200s &
     wait
@@ -756,9 +756,9 @@ start-pd prefill_replicas decode_size:
 stop-pd:
     kubectl delete lws wide-ep-lws-nvidia-gpu-vllm-glm-5-2-prefill wide-ep-lws-nvidia-gpu-vllm-glm-5-2-decode -n {{NAMESPACE}} --ignore-not-found
 
-# Sweep concurrency (1..64 powers of 2) for the currently deployed P:D config.
+# Sweep concurrency levels for the currently deployed config.
 # Results go to results_<prefix>_c<N>/ directories.
-# Usage: just sweep-concurrency p2_d1
+# Usage: just sweep-concurrency p2w1_d1w1
 sweep-concurrency prefix="sweep" dest="." duration="900":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -792,9 +792,9 @@ sweep-concurrency prefix="sweep" dest="." duration="900":
         echo "Failed concurrency levels:${FAILED}"
     fi
 
-# Full sweep: deploy each P:D config, run concurrency sweep, tear down.
-# Configs are space-separated P:D pairs.
-# Usage: just sweep results_glm52_run1 "1:2 2:1 2:2"
+# Full sweep: deploy each config, run concurrency sweep, tear down.
+# Format: PR:PW:DR:DW (prefill_replicas:prefill_width:decode_replicas:decode_width)
+# Usage: just sweep results_glm52_run1 "1:1:1:2 2:1:1:1 2:1:2:1"
 sweep outdir configs duration="900":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -802,23 +802,24 @@ sweep outdir configs duration="900":
     mkdir -p "{{outdir}}"
     just wipe
     for cfg in {{configs}}; do
-        IFS=: read -r P D <<< "$cfg"
-        dir="{{outdir}}/results_p${P}_d${D}"
+        IFS=: read -r PR PW DR DW <<< "$cfg"
+        PREFIX="p${PR}w${PW}_d${DR}w${DW}"
+        dir="{{outdir}}/results_${PREFIX}"
         # Skip if all concurrency results already exist
         ALL_DONE=true
         for C in 1 16 64 256; do
-            if [ ! -f "$dir/results_p${P}_d${D}_c${C}/profile_export_aiperf.json" ]; then
+            if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export_aiperf.json" ]; then
                 ALL_DONE=false
                 break
             fi
         done
         if [ "$ALL_DONE" = true ]; then
-            echo "====== P${P}:D${D} — all concurrency levels done, skipping ======"
+            echo "====== ${cfg} — all concurrency levels done, skipping ======"
             continue
         fi
-        echo "====== P${P}:D${D} ======"
+        echo "====== ${cfg} ======"
         just stop-pd
-        just start-pd "$P" "$D"
+        just start-pd "$PR" "$PW" "$DR" "$DW"
         just check
         just warmup
         mkdir -p "$dir"
@@ -830,7 +831,7 @@ sweep outdir configs duration="900":
         kubectl get httproute -n "$NS" -o yaml > "$dir/httproute.yaml" 2>/dev/null || true
         kubectl get configmap wide-ep-lws-epp -n "$NS" -o yaml > "$dir/epp-config.yaml" 2>/dev/null || true
         just vllm-version "$dir"
-        just sweep-concurrency "p${P}_d${D}" "$dir" {{duration}}
+        just sweep-concurrency "${PREFIX}" "$dir" {{duration}}
         just stop-pd
     done
 
@@ -856,7 +857,7 @@ seed-deploy:
     echo "Seed pod ready: $POD"
 
 # Launch a sweep inside the seed pod (detached — safe to disconnect).
-# Usage: just seed results_run1 "1:1 2:2"
+# Usage: just seed results_run1 "1:1:1:1 2:1:2:1"
 seed outdir configs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -900,9 +901,10 @@ seed outdir configs:
     echo "  Results:  just seed-results {{outdir}}"
     echo "  Cleanup:  just seed-clean"
 
-# Launch a sequential sweep inside the seed pod (one P:D config at a time).
+# Launch a sequential sweep inside the seed pod (one config at a time).
 # Each config gets its own namespace, runs all concurrencies, then is torn down.
-# Usage: just seed-sequential results_run1 "3:1 2:2 1:2 2:1 1:1"
+# Format: PR:PW:DR:DW (prefill_replicas:prefill_width:decode_replicas:decode_width)
+# Usage: just seed-sequential results_run1 "1:1:1:1 2:1:1:1 1:2:1:1"
 seed-sequential outdir configs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -933,7 +935,7 @@ seed-sequential outdir configs:
     OUTDIR="{{outdir}}"
     CONFIGS="{{configs}}"
     TMPSCRIPT=$(mktemp)
-    printf '#!/bin/bash\ncd /workspace/agentx-mvp\nfor cfg in %s; do\n  IFS=: read -r P D <<< "$cfg"\n  NS=ecrncevi-dev-p${P}d${D}\n  echo "====== Sequential: P${P}:D${D} in $NS ======"\n  if ! just setup-namespace "$NS"; then\n    echo "FAILED: setup for P${P}:D${D}, skipping"\n    just teardown-namespace "$NS" 2>/dev/null || true\n    continue\n  fi\n  NAMESPACE="$NS" just sweep "%s" "${P}:${D}" || echo "FAILED: sweep for P${P}:D${D}"\n  just snapshot-prometheus "$NS" "%s/results_p${P}_d${D}" || echo "WARNING: snapshot failed for P${P}:D${D}"\n  just teardown-namespace "$NS"\ndone\n' "$CONFIGS" "$OUTDIR" "$OUTDIR" > "$TMPSCRIPT"
+    printf '#!/bin/bash\ncd /workspace/agentx-mvp\nfor cfg in %s; do\n  IFS=: read -r PR PW DR DW <<< "$cfg"\n  NS=ecrncevi-dev-p${PR}w${PW}d${DR}w${DW}\n  echo "====== Sequential: ${cfg} in $NS ======"\n  if ! just setup-namespace "$NS"; then\n    echo "FAILED: setup for ${cfg}, skipping"\n    just teardown-namespace "$NS" 2>/dev/null || true\n    continue\n  fi\n  NAMESPACE="$NS" just sweep "%s" "${cfg}" || echo "FAILED: sweep for ${cfg}"\n  just snapshot-prometheus "$NS" "%s/results_p${PR}w${PW}_d${DR}w${DW}" || echo "WARNING: snapshot failed for ${cfg}"\n  just teardown-namespace "$NS"\ndone\n' "$CONFIGS" "$OUTDIR" "$OUTDIR" > "$TMPSCRIPT"
     kubectl cp "$TMPSCRIPT" "$NS/${POD}:/workspace/run_seed.sh"
     rm -f "$TMPSCRIPT"
     kubectl exec -n "$NS" "$POD" -- chmod +x /workspace/run_seed.sh

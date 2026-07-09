@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Scan results/ for pN_dM deployment configs, extract aiperf metrics,
+Scan results/ for deployment configs, extract aiperf metrics,
 and generate an interactive interactivity-vs-throughput HTML chart.
 
 Usage:
@@ -29,26 +29,30 @@ COLORS = [
 def discover_configs(results_dir):
     """Auto-discover deployment configs and concurrency levels from folder structure.
 
-    Expected layout:
+    Expected layout (PR:PW:DR:DW format):
         results_dir/
-            results_p1_d1/
-                results_p1_d1_c1/profile_export_aiperf.json
-                results_p1_d1_c4/...
-            results_p1_d2/
+            results_p1w1_d1w1/
+                results_p1w1_d1w1_c1/profile_export_aiperf.json
+                results_p1w1_d1w1_c4/...
+            results_p1w1_d1w2/
                 ...
     """
     configs = {}
     metric_units = {}
-    config_pattern = re.compile(r'^results_(p(\d+)_d(\d+))$')
+    config_pattern = re.compile(r'^results_(p(\d+)w(\d+)_d(\d+)w(\d+))$')
 
     for entry in sorted(os.listdir(results_dir)):
         m = config_pattern.match(entry)
         if not m:
             continue
         config_name = m.group(1)
-        n_prefill = int(m.group(2))
-        n_decode = int(m.group(3))
-        decode_gpus = n_decode * GPUS_PER_NODE
+        pr = int(m.group(2))
+        pw = int(m.group(3))
+        dr = int(m.group(4))
+        dw = int(m.group(5))
+        n_prefill_nodes = pr * pw
+        n_decode_nodes = dr * dw
+        decode_gpus = n_decode_nodes * GPUS_PER_NODE
 
         config_dir = os.path.join(results_dir, entry)
         if not os.path.isdir(config_dir):
@@ -108,12 +112,13 @@ def discover_configs(results_dir):
                     with open(ypath) as yf:
                         yamls[yname] = yf.read()
 
-        prefill_gpus = n_prefill * GPUS_PER_NODE
+        prefill_gpus = n_prefill_nodes * GPUS_PER_NODE
+        label = f'{pr}P{"×"+str(pw) if pw > 1 else ""} {dr}D{"×"+str(dw) if dw > 1 else ""}'
         configs[config_name] = {
-            'label': f'{n_prefill}P {n_decode}D',
+            'label': label,
             'decode_gpus': decode_gpus,
             'prefill_gpus': prefill_gpus,
-            'pods': f'{n_prefill} prefill + {n_decode} decode',
+            'pods': f'{pr}×{pw} prefill + {dr}×{dw} decode ({n_prefill_nodes + n_decode_nodes} nodes)',
             'runs': dict(sorted(runs.items())),
             'version': version,
             'yamls': yamls,
@@ -850,7 +855,7 @@ def main():
 
     configs, metric_units = discover_configs(results_dir)
     if not configs:
-        print(f"Error: no results_pN_dM/ directories found in {results_dir}", file=sys.stderr)
+        print(f"Error: no results_p<R>w<W>_d<R>w<W>/ directories found in {results_dir}", file=sys.stderr)
         sys.exit(1)
 
     output_dir = os.path.dirname(os.path.abspath(results_dir))
