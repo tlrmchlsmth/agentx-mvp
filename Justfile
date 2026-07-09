@@ -482,7 +482,7 @@ setup-namespace ns:
             regex: vllm
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_number]
-            regex: '8208'
+            regex: '8200'
             action: keep
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
@@ -506,7 +506,7 @@ setup-namespace ns:
             regex: vllm
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_number]
-            regex: '8208'
+            regex: '8000'
             action: keep
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
@@ -679,7 +679,7 @@ sweep-isolated outdir configs duration="900":
         dir="{{outdir}}/results_${PREFIX}"
         # Skip if all concurrency results already exist
         ALL_DONE=true
-        for C in 1 16 64 256; do
+        for C in {{sweep_concurrencies}}; do
             if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export_aiperf.json" ]; then
                 ALL_DONE=false
                 break
@@ -765,7 +765,7 @@ sweep-concurrency prefix="sweep" dest="." duration="900":
     #!/usr/bin/env bash
     set -uo pipefail
     FAILED=""
-    for C in 1 16 64 256; do
+    for C in {{sweep_concurrencies}}; do
         RDIR="{{dest}}/results_{{prefix}}_c${C}"
         if [ -f "$RDIR/profile_export_aiperf.json" ]; then
             echo "=== concurrency=$C — already exists, skipping ==="
@@ -809,7 +809,7 @@ sweep outdir configs duration="900":
         dir="{{outdir}}/results_${PREFIX}"
         # Skip if all concurrency results already exist
         ALL_DONE=true
-        for C in 1 16 64 256; do
+        for C in {{sweep_concurrencies}}; do
             if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export_aiperf.json" ]; then
                 ALL_DONE=false
                 break
