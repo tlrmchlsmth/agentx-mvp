@@ -482,7 +482,7 @@ setup-namespace ns:
             regex: vllm
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_number]
-            regex: '8200'
+            regex: '820[0-7]'
             action: keep
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
@@ -490,6 +490,8 @@ setup-namespace ns:
             target_label: node
           - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_model]
             target_label: model
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            target_label: rank
         scrape_interval: 1s
         metrics_path: /metrics
       - job_name: 'vllm-prefill'
@@ -506,7 +508,7 @@ setup-namespace ns:
             regex: vllm
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_number]
-            regex: '8000'
+            regex: '800[0-7]'
             action: keep
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
@@ -514,6 +516,8 @@ setup-namespace ns:
             target_label: node
           - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_model]
             target_label: model
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            target_label: rank
         scrape_interval: 1s
         metrics_path: /metrics
       - job_name: 'epp'
