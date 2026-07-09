@@ -459,6 +459,7 @@ setup-namespace ns:
       --set rbac.create=false \
       --set server.persistentVolume.enabled=false \
       --set 'server.extraFlags[0]=web.enable-admin-api' \
+      --set 'server.extraFlags[1]=web.enable-lifecycle' \
       --set serviceAccounts.server.create=true \
       --set serviceAccounts.server.name=prometheus-server \
       --set 'server.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/arch' \
@@ -480,7 +481,7 @@ setup-namespace ns:
             regex: vllm
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_number]
-            regex: '8200'
+            regex: '8208'
             action: keep
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
@@ -504,7 +505,7 @@ setup-namespace ns:
             regex: vllm
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_number]
-            regex: '8000'
+            regex: '8208'
             action: keep
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
