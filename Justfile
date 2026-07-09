@@ -144,15 +144,15 @@ results dest="./results":
     POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{deploy}} -o jsonpath='{.items[0].metadata.name}')
     # kubectl cp often exits non-zero due to a spurious tar stream error; retry individual files if needed
     kubectl cp {{NAMESPACE}}/${POD}:/workspace/artifacts "{{dest}}" 2>/dev/null || true
-    # Verify the critical file arrived; if not, copy it directly
-    if [ ! -f "{{dest}}/profile_export_aiperf.json" ]; then
-        kubectl cp {{NAMESPACE}}/${POD}:/workspace/artifacts/profile_export_aiperf.json "{{dest}}/profile_export_aiperf.json" 2>/dev/null || true
-    fi
+    # Verify critical files arrived; retry individual copies if kubectl cp dropped them
     if [ ! -f "{{dest}}/profile_export.jsonl" ]; then
         kubectl cp {{NAMESPACE}}/${POD}:/workspace/artifacts/profile_export.jsonl "{{dest}}/profile_export.jsonl" 2>/dev/null || true
     fi
     if [ ! -f "{{dest}}/profile_export_aiperf.json" ]; then
-        echo "ERROR: profile_export_aiperf.json not found after copy"
+        kubectl cp {{NAMESPACE}}/${POD}:/workspace/artifacts/profile_export_aiperf.json "{{dest}}/profile_export_aiperf.json" 2>/dev/null || true
+    fi
+    if [ ! -f "{{dest}}/profile_export.jsonl" ]; then
+        echo "ERROR: profile_export.jsonl not found after copy"
         exit 1
     fi
 
@@ -279,7 +279,7 @@ scrape-grafana +dirs:
 report outdir:
     #!/usr/bin/env bash
     set -euo pipefail
-    DIRS=$(find "{{outdir}}" -name "profile_export_aiperf.json" -exec dirname {} \;)
+    DIRS=$(find "{{outdir}}" -name "profile_export.jsonl" -exec dirname {} \;)
     if [ -z "$DIRS" ]; then
         echo "No result directories found in {{outdir}}"
         exit 1
@@ -302,7 +302,7 @@ report outdir:
         GRAFANA_URL="http://grafana.${NS}.svc.cluster.local:80"
         NAME=$(basename "$dir")
         echo "=== $NAME ($NS): scraping Grafana ==="
-        TIMESTAMPS=$(python3 -c "import json; d=json.load(open('$dir/profile_export_aiperf.json')); print(d['min_request_timestamp']['avg']/1e9-60); print(d['max_response_timestamp']['avg']/1e9+60)")
+        TIMESTAMPS=$(python3 extract_timestamps.py "$dir")
         START=$(echo "$TIMESTAMPS" | head -1)
         END=$(echo "$TIMESTAMPS" | tail -1)
         echo "  Time range: $START → $END"
@@ -684,7 +684,7 @@ sweep-isolated outdir configs duration="900":
         # Skip if all concurrency results already exist
         ALL_DONE=true
         for C in {{sweep_concurrencies}}; do
-            if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export_aiperf.json" ]; then
+            if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export.jsonl" ]; then
                 ALL_DONE=false
                 break
             fi
@@ -771,7 +771,7 @@ sweep-concurrency prefix="sweep" dest="." duration="900":
     FAILED=""
     for C in {{sweep_concurrencies}}; do
         RDIR="{{dest}}/results_{{prefix}}_c${C}"
-        if [ -f "$RDIR/profile_export_aiperf.json" ]; then
+        if [ -f "$RDIR/profile_export.jsonl" ]; then
             echo "=== concurrency=$C — already exists, skipping ==="
             continue
         fi
@@ -814,7 +814,7 @@ sweep outdir configs duration="900":
         # Skip if all concurrency results already exist
         ALL_DONE=true
         for C in {{sweep_concurrencies}}; do
-            if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export_aiperf.json" ]; then
+            if [ ! -f "$dir/results_${PREFIX}_c${C}/profile_export.jsonl" ]; then
                 ALL_DONE=false
                 break
             fi
@@ -967,14 +967,18 @@ seed-results outdir:
     NS={{NAMESPACE}}
     POD=$(kubectl get pod -n "$NS" -l app={{seed_deploy}} -o jsonpath='{.items[0].metadata.name}')
     # Copy each result directory individually to avoid kubectl cp dropping files
-    DIRS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -name "profile_export_aiperf.json" -exec dirname {} \; 2>/dev/null)
+    DIRS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -name "profile_export.jsonl" -exec dirname {} \; 2>/dev/null)
     for dir in $DIRS; do
         LOCAL=${dir#/workspace/agentx-mvp/}
         mkdir -p "$LOCAL"
         kubectl cp "$NS/${POD}:${dir}" "$LOCAL" 2>/dev/null || true
+        # Re-copy critical files individually — directory copies truncate large files
+        for f in profile_export.jsonl profile_export_aiperf.json; do
+            kubectl cp "$NS/${POD}:${dir}/${f}" "$LOCAL/$f" 2>/dev/null || true
+        done
     done
     # Also copy non-result files (namespace.txt, yamls, etc.)
-    EXTRAS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -maxdepth 2 \( -name "*.yaml" -o -name "*.txt" -o -name "*.html" \) 2>/dev/null)
+    EXTRAS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -maxdepth 4 \( -name "*.yaml" -o -name "*.txt" -o -name "*.html" \) 2>/dev/null)
     for f in $EXTRAS; do
         LOCAL=${f#/workspace/agentx-mvp/}
         mkdir -p "$(dirname "$LOCAL")"

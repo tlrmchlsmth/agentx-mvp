@@ -17,8 +17,61 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
+
 GPUS_PER_NODE = 8
 STAT_KEYS = ['avg', 'min', 'p50', 'p90', 'p95', 'p99', 'max']
+
+
+def aggregate_jsonl(path):
+    """Compute per-metric stats from profile_export.jsonl (fallback when aiperf JSON is missing)."""
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if r.get('metadata', {}).get('benchmark_phase') != 'profiling':
+                continue
+            records.append(r)
+    if not records:
+        return {}
+    metric_values = {}
+    metric_units_local = {}
+    for r in records:
+        for name, entry in r.get('metrics', {}).items():
+            v = entry['value']
+            if not isinstance(v, (int, float)):
+                continue
+            metric_values.setdefault(name, []).append(v)
+            if name not in metric_units_local:
+                metric_units_local[name] = entry.get('unit', '')
+    result = {}
+    for name, vals in metric_values.items():
+        a = np.array(vals)
+        result[name] = {
+            'avg': float(np.mean(a)), 'min': float(np.min(a)),
+            'p50': float(np.percentile(a, 50)), 'p90': float(np.percentile(a, 90)),
+            'p95': float(np.percentile(a, 95)), 'p99': float(np.percentile(a, 99)),
+            'max': float(np.max(a)), 'unit': metric_units_local.get(name, ''),
+        }
+    ts_start = [r['metadata']['request_start_ns'] for r in records if r['metadata'].get('request_start_ns')]
+    ts_end = [r['metadata']['request_end_ns'] for r in records if r['metadata'].get('request_end_ns')]
+    if ts_start and ts_end:
+        duration_s = (max(ts_end) - min(ts_start)) / 1e9
+        total_out = sum(r['metrics'].get('output_sequence_length', {}).get('value', 0) for r in records)
+        if duration_s > 0:
+            result['output_token_throughput'] = {
+                'avg': total_out / duration_s, 'min': total_out / duration_s,
+                'p50': total_out / duration_s, 'p90': total_out / duration_s,
+                'p95': total_out / duration_s, 'p99': total_out / duration_s,
+                'max': total_out / duration_s, 'unit': 'tokens/sec',
+            }
+    return result
 
 COLORS = [
     '#f97316', '#22d3ee', '#a78bfa', '#34d399', '#f472b6',
@@ -66,10 +119,14 @@ def discover_configs(results_dir):
                 continue
             c_val = int(cm.group(1))
             json_path = os.path.join(config_dir, sub, 'profile_export_aiperf.json')
-            if not os.path.isfile(json_path):
+            jsonl_path = os.path.join(config_dir, sub, 'profile_export.jsonl')
+            if os.path.isfile(json_path):
+                with open(json_path) as f:
+                    d = json.load(f)
+            elif os.path.isfile(jsonl_path):
+                d = aggregate_jsonl(jsonl_path)
+            else:
                 continue
-            with open(json_path) as f:
-                d = json.load(f)
 
             run_data = {}
             for key, val in d.items():
