@@ -1042,6 +1042,8 @@ start-pd prefill_replicas prefill_size decode_replicas decode_size:
         --set router.epp.image.tag=v0.9.0 \
         --set 'router.epp.flags.metrics-endpoint-auth=false' \
         -n {{NAMESPACE}} --version v0.9.0
+    kubectl create secret generic llm-d-hf-token --from-literal=HF_TOKEN=dummy -n {{NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -n {{NAMESPACE}} -k "$ROOT/guides/recipes/gateway/istio/"
     PROVIDER_DIR="$ROOT/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/providers/coreweave"
     export PREFILL_REPLICAS={{prefill_replicas}} PREFILL_SIZE={{prefill_size}} \
            DECODE_REPLICAS={{decode_replicas}} DECODE_SIZE={{decode_size}}
