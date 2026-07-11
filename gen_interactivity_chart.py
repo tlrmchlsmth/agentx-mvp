@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Scan results/ for pN_dM deployment configs, extract aiperf metrics,
+Scan results/ for deployment configs, extract aiperf metrics,
 and generate an interactive interactivity-vs-throughput HTML chart.
 
 Usage:
@@ -18,8 +18,61 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
+
 GPUS_PER_NODE = 8
 STAT_KEYS = ['avg', 'min', 'p50', 'p90', 'p95', 'p99', 'max']
+
+
+def aggregate_jsonl(path):
+    """Compute per-metric stats from profile_export.jsonl (fallback when aiperf JSON is missing)."""
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if r.get('metadata', {}).get('benchmark_phase') != 'profiling':
+                continue
+            records.append(r)
+    if not records:
+        return {}
+    metric_values = {}
+    metric_units_local = {}
+    for r in records:
+        for name, entry in r.get('metrics', {}).items():
+            v = entry['value']
+            if not isinstance(v, (int, float)):
+                continue
+            metric_values.setdefault(name, []).append(v)
+            if name not in metric_units_local:
+                metric_units_local[name] = entry.get('unit', '')
+    result = {}
+    for name, vals in metric_values.items():
+        a = np.array(vals)
+        result[name] = {
+            'avg': float(np.mean(a)), 'min': float(np.min(a)),
+            'p50': float(np.percentile(a, 50)), 'p90': float(np.percentile(a, 90)),
+            'p95': float(np.percentile(a, 95)), 'p99': float(np.percentile(a, 99)),
+            'max': float(np.max(a)), 'unit': metric_units_local.get(name, ''),
+        }
+    ts_start = [r['metadata']['request_start_ns'] for r in records if r['metadata'].get('request_start_ns')]
+    ts_end = [r['metadata']['request_end_ns'] for r in records if r['metadata'].get('request_end_ns')]
+    if ts_start and ts_end:
+        duration_s = (max(ts_end) - min(ts_start)) / 1e9
+        total_out = sum(r['metrics'].get('output_sequence_length', {}).get('value', 0) for r in records)
+        if duration_s > 0:
+            result['output_token_throughput'] = {
+                'avg': total_out / duration_s, 'min': total_out / duration_s,
+                'p50': total_out / duration_s, 'p90': total_out / duration_s,
+                'p95': total_out / duration_s, 'p99': total_out / duration_s,
+                'max': total_out / duration_s, 'unit': 'tokens/sec',
+            }
+    return result
 
 COLORS = [
     '#f97316', '#22d3ee', '#a78bfa', '#34d399', '#f472b6',
@@ -145,18 +198,30 @@ def read_kv_cache_tokens(run_dir):
 def discover_configs(results_dir):
     """Auto-discover deployment configs and concurrency levels from folder structure.
 
-    Expected layout:
+    Expected layout (PR:PW:DR:DW format):
         results_dir/
-            results_<user>-wide-ep/
-                results_<user>-wide-ep_c1/profile_export_aiperf.json
-                results_<user>-wide-ep_c16/...
+            results_p1w1_d1w1/
+                results_p1w1_d1w1_c1/profile_export_aiperf.json
+                results_p1w1_d1w1_c4/...
+            results_p1w1_d1w2/
+                ...
     """
     configs = {}
     metric_units = {}
+    config_pattern = re.compile(r'^results_(p(\d+)w(\d+)_d(\d+)w(\d+))$')
 
     for entry in sorted(os.listdir(results_dir)):
         if not entry.startswith('results_'):
             continue
+        config_name = m.group(1)
+        pr = int(m.group(2))
+        pw = int(m.group(3))
+        dr = int(m.group(4))
+        dw = int(m.group(5))
+        n_prefill_nodes = pr * pw
+        n_decode_nodes = dr * dw
+        decode_gpus = n_decode_nodes * GPUS_PER_NODE
+
         config_dir = os.path.join(results_dir, entry)
         if not os.path.isdir(config_dir):
             continue
@@ -175,10 +240,14 @@ def discover_configs(results_dir):
                 continue
             c_val = int(cm.group(1))
             json_path = os.path.join(config_dir, sub, 'profile_export_aiperf.json')
-            if not os.path.isfile(json_path):
+            jsonl_path = os.path.join(config_dir, sub, 'profile_export.jsonl')
+            if os.path.isfile(json_path):
+                with open(json_path) as f:
+                    d = json.load(f)
+            elif os.path.isfile(jsonl_path):
+                d = aggregate_jsonl(jsonl_path)
+            else:
                 continue
-            with open(json_path) as f:
-                d = json.load(f)
 
             run_data = {}
             for key, val in d.items():
@@ -187,9 +256,20 @@ def discover_configs(results_dir):
                     if key not in metric_units:
                         metric_units[key] = val.get('unit', '')
 
-            kv_cache_tokens = read_kv_cache_tokens(os.path.join(config_dir, sub))
-            if kv_cache_tokens is not None:
-                run_data['_kv_cache_tokens'] = kv_cache_tokens
+            logs_dir = os.path.join(config_dir, sub, 'logs')
+            if os.path.isdir(logs_dir):
+                for role in ('prefill', 'decode'):
+                    for lf in os.listdir(logs_dir):
+                        if role in lf and lf.endswith('.log'):
+                            lpath = os.path.join(logs_dir, lf)
+                            with open(lpath) as lfile:
+                                for line in lfile:
+                                    m_kv = re.search(r'GPU KV cache size:\s*([\d,]+)\s*tokens', line)
+                                    if m_kv:
+                                        run_data[f'_kv_cache_{role}'] = int(m_kv.group(1).replace(',', ''))
+                                        break
+                            if f'_kv_cache_{role}' in run_data:
+                                break
 
             runs[c_val] = run_data
 
@@ -210,13 +290,13 @@ def discover_configs(results_dir):
                     with open(ypath) as yf:
                         yamls[yname] = yf.read()
 
-        label = read_text_file(os.path.join(config_dir, 'config_label.txt'), default_label)
-        pods = read_text_file(os.path.join(config_dir, 'pods.txt'), default_pods)
+        prefill_gpus = n_prefill_nodes * GPUS_PER_NODE
+        label = f'{pr}P{"×"+str(pw) if pw > 1 else ""} {dr}D{"×"+str(dw) if dw > 1 else ""}'
         configs[config_name] = {
             'label': label,
             'decode_gpus': decode_gpus,
             'prefill_gpus': prefill_gpus,
-            'pods': pods,
+            'pods': f'{pr}×{pw} prefill + {dr}×{dw} decode ({n_prefill_nodes + n_decode_nodes} nodes)',
             'runs': dict(sorted(runs.items())),
             'version': version,
             'yamls': yamls,
@@ -980,7 +1060,7 @@ root.appendChild(sec2Wrap);
   table.appendChild(tbody);
 
   const colDefs = [
-    'Config', 'Concurrency', 'Decode GPUs', 'KV Cache (tokens)', 'Output tok/s', 'tok/s/GPU',
+    'Config', 'Concurrency', 'Decode GPUs', 'KV Cache Prefill', 'KV Cache Decode', 'Output tok/s', 'tok/s/GPU',
     'ITL p50 (ms)', 'ITL p99 (ms)', 'Per-user tok/s',
     'TTFT avg (s)', 'TTFT p50 (s)', 'TTFT p99 (s)', 'TTFT min (s)', 'TTFT max (s)',
     '$/M input', '$/M output', '$/M total',
@@ -1015,11 +1095,13 @@ root.appendChild(sec2Wrap);
       tr.dataset.cfg = cfg;
       tr.dataset.conc = c;
 
-      const kvCache = d._kv_cache_tokens;
-      const kvStr = kvCache != null ? kvCache.toLocaleString() : '-';
+      const kvPrefill = d._kv_cache_prefill;
+      const kvDecode = d._kv_cache_decode;
 
       const vals = [
-        meta.label, C_LABELS[c], meta.decodeGPUs, kvStr,
+        meta.label, C_LABELS[c], meta.decodeGPUs,
+        kvPrefill != null ? kvPrefill.toLocaleString() : '-',
+        kvDecode != null ? kvDecode.toLocaleString() : '-',
         out?.avg?.toFixed(1) ?? '-', norm,
         itl?.p50?.toFixed(1) ?? '-', itl?.p99?.toFixed(1) ?? '-',
         otpu?.avg?.toFixed(1) ?? '-',
@@ -1034,7 +1116,7 @@ root.appendChild(sec2Wrap);
         const td = document.createElement('td');
         td.textContent = v;
         if (i === 0) {{ td.style.color = COLORS[cfg]; td.style.fontWeight = '500'; }}
-        if (i === 5) td.className = 'highlight';
+        if (i === 6) td.className = 'highlight';
         tr.appendChild(td);
       }});
 
@@ -1115,7 +1197,7 @@ def main():
 
     configs, metric_units = discover_configs(results_dir)
     if not configs:
-        print(f"Error: no results_<config>/ directories found in {results_dir}", file=sys.stderr)
+        print(f"Error: no results_p<R>w<W>_d<R>w<W>/ directories found in {results_dir}", file=sys.stderr)
         sys.exit(1)
 
     output_dir = os.path.dirname(os.path.abspath(results_dir))

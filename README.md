@@ -1,98 +1,63 @@
 # AgentX-MVP Benchmark
 
-AIPerf AgentX-MVP benchmark harness for llm-d/manifesto deployments with prefill/decode disaggregation.
+AIPerf AgentX-MVP benchmark harness for llm-d optimized-baseline deployments with prefill/decode disaggregation.
 
 ## Prerequisites
 
 - `kubectl` configured for your cluster
-- Kueue installed in the cluster
-- `lustre-pvc-vllm` available in the benchmark namespace
 - `.env` file with:
   ```
-  NAMESPACE=vllm
-  MANIFESTO_ROOT=$HOME/code/llm-manifesto
-  MODEL_SPEC=models/deepseek-v4/1P-EP8-1D-EP8.yaml
-  MANIFESTO_CLUSTER=clusters/oci-gb200.yaml
-  MANIFESTO_USER=$USER
-  KUEUE_QUEUE=nightly-eval
-  LUSTRE_CLAIM=lustre-pvc-vllm
-  LUSTRE_PREFIX=/mnt/lustre/agentx-mvp
+  NAMESPACE=ecrncevi-dev
+  GLM_PD_PREFILL=path/to/prefill.yaml
+  GLM_PD_DECODE=path/to/decode.yaml
   ```
-
-Defaults target `deepseek-ai/DeepSeek-V4-Pro` on the smallest GB200/NVL72 manifesto profile and use only the existing `vllm` namespace.
-
-For report/dashboard collection, the harness reads Grafana and Prometheus from:
-
-```bash
-MONITORING_NAMESPACE=vllm
-PROMETHEUS_NAMESPACE=$MONITORING_NAMESPACE
-GRAFANA_NAMESPACE=$MONITORING_NAMESPACE
-```
-
-Override these only when manifesto installs the monitoring stack somewhere else.
+- Grafana port-forwarded to `localhost:3001` (for dashboard export)
 
 ## Quick start
 
 ```bash
-just setup           # install queue manifests and deploy the orchestrator
+just deploy          # deploy the aiperf runner pod
 just check           # verify the model endpoint is reachable
-just run             # run a Kueue-managed AIPerf Job
+just run             # run benchmark (default: concurrency=64, duration=900s)
 just run 16 900      # override concurrency / duration
-just smoke           # fast Kueue Job plumbing test (~60s, invalid result)
-just orchestrator-run overnight_results 900  # run the sweep from the in-cluster orchestrator
-just logs            # tail orchestrator logs
-just shell           # shell into the orchestrator
-just clean           # delete benchmark jobs and the orchestrator pod
+just smoke           # fast plumbing test (~60s, marks result invalid)
+just results         # copy artifacts to ./results
+just logs            # tail runner logs
+just shell           # shell into the runner
+just clean           # delete the runner pod
 ```
 
-The orchestrator image contains this harness at `/workspace/agentx-mvp` and
-`llm-manifesto` at `/workspace/llm-manifesto`; `just orchestrator-run` does not
-copy source trees into the pod. Build it with `just orchestrator-build`.
+## P/D deployment
 
-## Model Deployment
+Config format: `PR:PW:DR:DW` (prefill_replicas:prefill_width:decode_replicas:decode_width)
 
 ```bash
-just setup-kueue     # install/update the GB200 Kueue queue objects
-just start-model     # deploy the llm-manifesto spec
-just stop-model      # tear down the manifesto deployment
+just start-pd 2 1 1 1  # 2 prefill replicas (1 node each), 1 decode replica (1 node)
+just start-pd 1 2 1 1  # 1 prefill replica spanning 2 nodes (wide EP), 1 decode (1 node)
+just stop-pd            # tear down prefill/decode pods
 ```
-
-Model deployment is Kueue-aware by default. `just start-model` renders the
-configured `llm-manifesto` spec and labels each rendered `LeaderWorkerSet` with
-`kueue.x-k8s.io/queue-name: nightly-eval`. Override with `KUEUE_QUEUE=...`.
-It does not call the `llm-manifesto` `just start` recipe.
-
-## Benchmark Jobs
-
-Benchmarks run as Kueue-managed `batch/v1` Jobs, not as `kubectl exec` commands
-into a long-lived AIPerf pod. Each Job mounts `LUSTRE_CLAIM` at `/mnt/lustre`
-and writes artifacts to:
-
-```bash
-$LUSTRE_PREFIX/$MANIFESTO_USER/<result-directory>
-```
-
-The local or orchestrator-side result directory receives a copy for report generation,
-but the PVC path is the durable source of truth.
 
 ## Sweep
 
-Run the benchmark across concurrency levels (`1`, `16`, `64`, `256`) for the configured manifesto spec:
+Run the full benchmark across multiple configurations and concurrency levels (1, 16, 64, 256):
 
 ```bash
-just sweep results_deepseekv4_nvl72
+# Single config
+just sweep "1:1:1:2"
+
+# Multiple configs — each gets deployed, swept, then torn down
+just sweep "1:1:1:2 2:1:1:1 2:1:2:1"
 
 # Custom duration (default 900s)
-just sweep results_deepseekv4_nvl72 1200
+just sweep "1:1:1:2" 1200
 ```
 
-Each sweep produces result directories like `results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c1/`, `results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c16/`, etc. Each run directory contains:
+Each sweep produces result directories like `results_p1w1_d1w2_c1/`, `results_p1w1_d1w2_c4/`, etc. containing:
 - `profile_export_aiperf.json` — benchmark metrics
 - `profile_export.jsonl` — per-request data
+- `prefill.yaml` / `decode.yaml` — pod specs at time of run
 - `vllm_image.txt` — vLLM container image tag
 - `vllm_fingerprint.txt` — vLLM `system_fingerprint` from the API
-
-The parent config directory contains `manifest.yaml`, the monolithic rendered manifesto manifest used for the run.
 
 ## Grafana dashboard export
 
@@ -100,7 +65,7 @@ Export Grafana dashboards for benchmark result directories. Automatically extrac
 
 ```bash
 # Export dashboards for specific result directories
-just scrape-grafana results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c1
+just scrape-grafana results_p1w1_d1w2_c1 results_p1w1_d1w2_c4
 
 # Or use the script directly for a single time range
 python3 export_dashboard.py single --start now-30m --end now -o report.html
@@ -110,11 +75,11 @@ Each result directory gets a self-contained `dashboard.html` with interactive Pl
 
 ## Dashboard overlay / comparison
 
-Overlay multiple dashboard exports onto the same charts for side-by-side comparison across concurrency levels. X-axis is rebased to relative time (seconds from start) so runs that happened at different absolute times align.
+Overlay multiple dashboard exports onto the same charts for side-by-side comparison (e.g. different concurrency levels or configs). X-axis is rebased to relative time (seconds from start) so runs that happened at different absolute times align.
 
 ```bash
 # Overlay three concurrency levels — auto-labeled from filenames
-python3 overlay_dashboards.py results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c1/dashboard.html results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c16/dashboard.html
+python3 overlay_dashboards.py results_p1w1_d1w2_c1/dashboard.html results_p1w1_d1w2_c4/dashboard.html results_p1w1_d1w2_c16/dashboard.html
 
 # Custom labels
 python3 overlay_dashboards.py c1.html c4.html --label "concurrency=1" --label "concurrency=4"
@@ -127,7 +92,7 @@ Each concurrency level gets a distinct color across all panels.
 Capture the vLLM version from a running deployment:
 
 ```bash
-just vllm-version results_$USER-wide-ep-1p-ep8-1d-ep8
+just vllm-version results_p1w1_d1w2
 ```
 
 This is called automatically during sweeps.
