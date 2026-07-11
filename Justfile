@@ -659,14 +659,7 @@ setup-namespace ns:
       name: prometheus-server
       namespace: {{ns}}
     DCGMRBAC
-    # Copy HF token secret from source namespace, or create a dummy if source is gone
-    if kubectl get secret llm-d-hf-token -n {{NAMESPACE}} -o json 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); d['metadata']={'name':'llm-d-hf-token','namespace':'{{ns}}'}; print(json.dumps(d))" \
-      | kubectl apply -f - 2>/dev/null; then
-        true
-    else
-        kubectl create secret generic llm-d-hf-token --from-literal=HF_TOKEN=dummy -n {{ns}} --dry-run=client -o yaml | kubectl apply -f -
-    fi
+    kubectl create secret generic llm-d-hf-token --from-literal=HF_TOKEN=dummy -n {{ns}} --dry-run=client -o yaml | kubectl apply -f -
     # Service account
     kubectl apply -n {{ns}} -f "$ROOT/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/serviceAccount.yaml"
     # Gateway (configmap + gateway via kustomize)
