@@ -25,8 +25,6 @@ concurrency := "64"
 duration    := "900"
 sweep_concurrencies := "64 128 256"
 
-pd_prefill := env_var('GLM_PD_PREFILL')
-pd_decode  := env_var('GLM_PD_DECODE')
 llm_d_root := env_var('LLM_D_ROOT')
 
 default:
@@ -38,10 +36,20 @@ deploy:
     kubectl rollout status deploy/{{deploy}} -n {{NAMESPACE}} --timeout=300s
 
 # Sanity check: list models served through the llm-d router from inside the runner.
-# (The slim image has no curl, so use python's urllib.)
+# Retries for up to 5 minutes while the gateway/EPP discovers endpoints.
 check:
-    kubectl exec -n {{NAMESPACE}} deploy/{{deploy}} -- \
-      python -c "import urllib.request as u; print(u.urlopen('{{url}}/models', timeout=10).read().decode())"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for attempt in $(seq 1 30); do
+        if kubectl exec -n {{NAMESPACE}} deploy/{{deploy}} -- \
+          python -c "import urllib.request as u; print(u.urlopen('{{url}}/models', timeout=10).read().decode())" 2>/dev/null; then
+            exit 0
+        fi
+        echo "Check attempt $attempt/30 failed, retrying in 10s..."
+        sleep 10
+    done
+    echo "ERROR: gateway not reachable after 5 minutes"
+    exit 1
 
 # Send a single short request to warm up Triton JIT compilation (up to 10min timeout).
 warmup:
@@ -199,11 +207,6 @@ clear-kv-cache:
                 curl -sf -X POST "http://localhost:${port}/reset_prefix_cache?reset_external=true" 2>/dev/null || true
         done
     done
-    for pod in $(kubectl get pods -n "$NS" -l llm-d.ai/role=decode -o jsonpath='{.items[*].metadata.name}'); do
-        echo "Resetting prefix cache on decode $pod..."
-        kubectl exec -n "$NS" "$pod" -c vllm -- \
-            curl -sf -X POST "http://localhost:8200/reset_prefix_cache?reset_external=true" 2>/dev/null || true
-    done
     # Clear NVMe filesystem tier
     for pod in $(kubectl get pods -n "$NS" -l llm-d.ai/role -o jsonpath='{.items[*].metadata.name}'); do
         echo "Clearing NVMe KV cache on $pod..."
@@ -265,6 +268,12 @@ dump-logs dest=".":
         echo "  logs: $pod"
         kubectl logs -n "$NS" "$pod" --all-containers > "{{dest}}/logs/${pod}.log" 2>&1 || true
     done
+    # Pod descriptions (events, exit codes, OOM kills, restart reasons)
+    for pod in $(kubectl get pods -n "$NS" -l llm-d.ai/role -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+        kubectl describe pod -n "$NS" "$pod" > "{{dest}}/logs/${pod}.describe" 2>&1 || true
+    done
+    # Namespace events (sorted by time)
+    kubectl get events -n "$NS" --sort-by='.lastTimestamp' > "{{dest}}/logs/events.txt" 2>&1 || true
     echo "Logs saved to {{dest}}/logs/"
 
 # Export Grafana dashboards for result directories.
@@ -743,11 +752,11 @@ start-pd prefill_replicas prefill_size decode_replicas decode_size:
         --set router.epp.image.tag=v0.9.0 \
         --set 'router.epp.flags.metrics-endpoint-auth=false' \
         -n {{NAMESPACE}} --version v0.9.0
-    # Deploy prefill/decode LWS
-    PREFILL_REPLICAS={{prefill_replicas}} PREFILL_SIZE={{prefill_size}} envsubst '${PREFILL_REPLICAS} ${PREFILL_SIZE}' < {{pd_prefill}} | kubectl apply -n {{NAMESPACE}} -f -
-    DECODE_REPLICAS={{decode_replicas}} DECODE_SIZE={{decode_size}} envsubst '${DECODE_REPLICAS} ${DECODE_SIZE}' < {{pd_decode}} | kubectl apply -n {{NAMESPACE}} -f -
-    # Deploy KV cache evictor for NVMe tier cleanup
-    kubectl apply -n {{NAMESPACE}} -f "$ROOT/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/kv-cache-evictor.yaml"
+    # Deploy prefill/decode LWS + serviceAccount + kv-cache-evictor via coreweave kustomize overlay
+    PROVIDER_DIR="$ROOT/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/providers/coreweave"
+    export PREFILL_REPLICAS={{prefill_replicas}} PREFILL_SIZE={{prefill_size}} \
+           DECODE_REPLICAS={{decode_replicas}} DECODE_SIZE={{decode_size}}
+    kubectl kustomize "$PROVIDER_DIR" | envsubst '${PREFILL_REPLICAS} ${PREFILL_SIZE} ${DECODE_REPLICAS} ${DECODE_SIZE}' | kubectl apply -n {{NAMESPACE}} -f -
     echo "Deployed PR{{prefill_replicas}} PW{{prefill_size}} DR{{decode_replicas}} DW{{decode_size}} — waiting for pods..."
     kubectl rollout status --watch statefulset/wide-ep-lws-nvidia-gpu-vllm-glm-5-2-prefill -n {{NAMESPACE}} --timeout=7200s &
     kubectl rollout status --watch statefulset/wide-ep-lws-nvidia-gpu-vllm-glm-5-2-decode -n {{NAMESPACE}} --timeout=7200s &
@@ -779,8 +788,10 @@ sweep-concurrency prefix="sweep" dest="." duration="900":
         just drain
         just clear-kv-cache
         if ! just warmup || ! just run $C {{duration}}; then
-            echo "FAILED: concurrency=$C, skipping"
+            echo "FAILED: concurrency=$C, dumping logs before cleanup"
             FAILED="${FAILED} c${C}"
+            mkdir -p "$RDIR"
+            just dump-logs "$RDIR"
             just wipe 2>/dev/null || true
             continue
         fi
@@ -890,7 +901,7 @@ seed outdir configs:
     # Write clean .env (no KUBECONFIG — uses ServiceAccount auth)
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
-    printf 'NAMESPACE=%s\nGLM_PD_PREFILL=/workspace/llm-d/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/prefill.yaml\nGLM_PD_DECODE=/workspace/llm-d/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/decode.yaml\nLLM_D_ROOT=/workspace/llm-d\n' "{{NAMESPACE}}" > "$TMPENV"
+    printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\n' "{{NAMESPACE}}" > "$TMPENV"
     kubectl cp "$TMPENV" "$NS/${POD}:/workspace/agentx-mvp/.env"
     echo "=== Launching sweep (detached) ==="
     OUTDIR="{{outdir}}"
@@ -935,7 +946,7 @@ seed-sequential outdir configs:
         'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git pull; else git clone --branch wip-glm https://github.com/elvircrn/llm-d.git /workspace/llm-d; fi'
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
-    printf 'NAMESPACE=%s\nGLM_PD_PREFILL=/workspace/llm-d/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/prefill.yaml\nGLM_PD_DECODE=/workspace/llm-d/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/decode.yaml\nLLM_D_ROOT=/workspace/llm-d\n' "{{NAMESPACE}}" > "$TMPENV"
+    printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\n' "{{NAMESPACE}}" > "$TMPENV"
     kubectl cp "$TMPENV" "$NS/${POD}:/workspace/agentx-mvp/.env"
     echo "=== Launching sequential sweep (detached) ==="
     OUTDIR="{{outdir}}"
