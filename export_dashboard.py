@@ -387,6 +387,9 @@ def generate_html(panel_data, row_order, start, end, dashboard_name):
 <div class="subtitle">{start_str} — {end_str}</div>
 <div id="root"></div>
 <script>
+if (!window.Plotly && window.parent && window.parent.Plotly) {{
+  window.Plotly = window.parent.Plotly;
+}}
 const panels = {panels_json};
 const rows = {rows_json};
 
@@ -449,6 +452,10 @@ const lazyObserver = new IntersectionObserver((entries) => {{
       }}));
       const fmt = UNIT_FMT[p.unit];
       const yTitle = UNIT_LABEL[p.unit] || p.unit || '';
+      if (!window.Plotly) {{
+        plotDiv.innerHTML = '<div class="empty">Plotly unavailable</div>';
+        return;
+      }}
       Plotly.newPlot(plotDiv, traces, {{
         margin: {{ l: 58, r: 16, t: 4, b: 30 }},
         paper_bgcolor: 'transparent',

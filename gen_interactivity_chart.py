@@ -6,8 +6,8 @@ and generate an interactive interactivity-vs-throughput HTML chart.
 Usage:
     python3 gen_interactivity_chart.py [results_dir]
 
-Defaults to ./results if no argument given. Output: interactivity_vs_throughput.html
-in the same directory as this script (or parent of results_dir).
+Defaults to ./results if no argument is given. Output:
+<results_dir>/interactivity_vs_throughput.html.
 """
 
 import base64
@@ -78,22 +78,84 @@ def tokens_from_cache_config_labels(labels):
     return num_gpu_blocks * block_size
 
 
+def classify_kv_role(labels, token_value=None):
+    label_text = ' '.join(str(v).lower() for v in labels.values())
+    if 'prefill' in label_text:
+        return 'prefill'
+    if 'decode' in label_text:
+        return 'decode'
+    # Older AIPerf server-metrics exports collapse endpoint labels to the
+    # gateway. For our WideEP runs the prefill ranks are the smaller cache
+    # entries and decode ranks are the larger cache entries.
+    if token_value is not None:
+        return '_by_size'
+    return None
+
+
+def kv_cache_tokens_from_series(series):
+    by_role = {'prefill': [], 'decode': []}
+    by_size = []
+    for item in series:
+        labels = item.get('labels', {}) if isinstance(item, dict) else {}
+        token_value = tokens_from_cache_config_labels(labels)
+        if token_value is None:
+            continue
+        role = classify_kv_role(labels, token_value)
+        if role in by_role:
+            by_role[role].append(token_value)
+        elif role == '_by_size':
+            by_size.append(token_value)
+
+    if not by_role['prefill'] and not by_role['decode'] and by_size:
+        sizes = sorted(set(by_size))
+        if len(sizes) >= 2:
+            by_role['prefill'] = [v for v in by_size if v == sizes[0]]
+            by_role['decode'] = [v for v in by_size if v == sizes[-1]]
+        else:
+            by_role['decode'] = by_size
+
+    return {
+        'prefill': sum(by_role['prefill']) or None,
+        'decode': sum(by_role['decode']) or None,
+    }
+
+
 def find_kv_cache_tokens_in_json(value):
     if isinstance(value, dict):
-        found = []
-        token_value = tokens_from_cache_config_labels(value)
-        if token_value is not None:
-            found.append(token_value)
+        metric = value.get('vllm:cache_config_info')
+        if isinstance(metric, dict) and isinstance(metric.get('series'), list):
+            tokens = kv_cache_tokens_from_series(metric['series'])
+            if tokens['prefill'] is not None or tokens['decode'] is not None:
+                return tokens
+
+        if isinstance(value.get('series'), list):
+            tokens = kv_cache_tokens_from_series(value['series'])
+            if tokens['prefill'] is not None or tokens['decode'] is not None:
+                return tokens
+
+        totals = {'prefill': 0, 'decode': 0}
+        found = False
         for child in value.values():
             child_value = find_kv_cache_tokens_in_json(child)
-            if child_value is not None:
-                found.append(child_value)
+            if child_value is None:
+                continue
+            found = True
+            for role in totals:
+                totals[role] += child_value.get(role) or 0
         if found:
-            return max(found)
+            return {role: (total or None) for role, total in totals.items()}
     elif isinstance(value, list):
-        found = [v for v in (find_kv_cache_tokens_in_json(child) for child in value) if v is not None]
+        totals = {'prefill': 0, 'decode': 0}
+        found = False
+        for child in value:
+            child_value = find_kv_cache_tokens_in_json(child)
+            if child_value is None:
+                continue
+            found = True
+            for role in totals:
+                totals[role] += child_value.get(role) or 0
         if found:
-            return max(found)
+            return {role: (total or None) for role, total in totals.items()}
     return None
 
 
@@ -102,15 +164,17 @@ def read_kv_cache_tokens_from_cache_config(run_dir):
     if os.path.isfile(json_path):
         try:
             with open(json_path) as f:
-                token_value = find_kv_cache_tokens_in_json(json.load(f))
-            if token_value is not None:
-                return token_value
+                payload = json.load(f)
+                token_values = find_kv_cache_tokens_in_json(payload.get('metrics', payload))
+            if token_values is not None:
+                return token_values
         except (OSError, json.JSONDecodeError):
             pass
 
     csv_path = os.path.join(run_dir, 'server_metrics_export.csv')
     if os.path.isfile(csv_path):
-        found = []
+        by_role = {'prefill': [], 'decode': []}
+        by_size = []
         try:
             with open(csv_path, newline='') as f:
                 reader = csv.reader(row for row in f if not row.startswith('#'))
@@ -129,10 +193,24 @@ def read_kv_cache_tokens_from_cache_config(run_dir):
                     current[label_name] = label_value
                     token_value = tokens_from_cache_config_labels(current)
                     if token_value is not None:
-                        found.append(token_value)
+                        role = classify_kv_role(current, token_value)
+                        if role in by_role:
+                            by_role[role].append(token_value)
+                        else:
+                            by_size.append(token_value)
                         current = {}
-            if found:
-                return max(found)
+            if not by_role['prefill'] and not by_role['decode'] and by_size:
+                sizes = sorted(set(by_size))
+                if len(sizes) >= 2:
+                    by_role['prefill'] = [v for v in by_size if v == sizes[0]]
+                    by_role['decode'] = [v for v in by_size if v == sizes[-1]]
+                else:
+                    by_role['decode'] = by_size
+            if by_role['prefill'] or by_role['decode']:
+                return {
+                    'prefill': sum(by_role['prefill']) or None,
+                    'decode': sum(by_role['decode']) or None,
+                }
         except OSError:
             pass
     return None
@@ -148,8 +226,8 @@ def discover_configs(results_dir):
     Expected layout:
         results_dir/
             results_<user>-wide-ep/
-                results_<user>-wide-ep_c1/profile_export_aiperf.json
-                results_<user>-wide-ep_c16/...
+                results_<user>-wide-ep_c64/profile_export_aiperf.json
+                results_<user>-wide-ep_c256/...
     """
     configs = {}
     metric_units = {}
@@ -733,10 +811,10 @@ function hoverText(cfg, c, d) {{
   const ttft = d.time_to_first_token;
   const norm = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '?';
   return `<b>${{meta.label}} @ c${{C_LABELS[c]}}</b><br>` +
-    `Output: ${{out?.avg?.toFixed(1) ?? '?'}} tok/s (${{norm}} tok/s/GPU)<br>` +
+    `Output: ${{out?.avg?.toFixed(1) ?? '?'}} tok/s (${{norm}} tok/s/decode GPU)<br>` +
     `ITL p50: ${{itl?.p50?.toFixed(1) ?? '?'}} ms · p99: ${{itl?.p99?.toFixed(1) ?? '?'}} ms<br>` +
     `Per-user: ${{otpu?.avg?.toFixed(1) ?? '?'}} tok/s/user<br>` +
-    `TTFT avg: ${{ttft ? (ttft.avg/1000).toFixed(1) : '?'}}s · p50: ${{ttft ? (ttft.p50/1000).toFixed(1) : '?'}}s · p99: ${{ttft ? (ttft.p99/1000).toFixed(1) : '?'}}s`;
+    `TTFT p50: ${{ttft ? (ttft.p50/1000).toFixed(1) : '?'}}s · p99: ${{ttft ? (ttft.p99/1000).toFixed(1) : '?'}}s`;
 }}
 
 const allCharts = [];
@@ -980,10 +1058,13 @@ root.appendChild(sec2Wrap);
   table.appendChild(tbody);
 
   const colDefs = [
-    'Config', 'Concurrency', 'Decode GPUs', 'KV Cache (tokens)', 'Output tok/s', 'tok/s/GPU',
+    'Config', 'Concurrency', 'Prefill GPUs', 'Decode GPUs',
+    'Prefill KV Cache (tokens)', 'Decode KV Cache (tokens)',
+    'Output tok/s', 'Input tok/s', 'Total tok/s',
+    'Output tok/s/GPU', 'Input tok/s/GPU', 'Total tok/s/GPU',
     'ITL p50 (ms)', 'ITL p99 (ms)', 'Per-user tok/s',
-    'TTFT avg (s)', 'TTFT p50 (s)', 'TTFT p99 (s)', 'TTFT min (s)', 'TTFT max (s)',
-    '$/M input', '$/M output', '$/M total',
+    'TTFT p50 (s)', 'TTFT p99 (s)',
+    '$/M input', '$/M output',
   ];
   const headerRow = document.createElement('tr');
   colDefs.forEach((label, i) => {{
@@ -1006,48 +1087,50 @@ root.appendChild(sec2Wrap);
       const d = DATA[cfg][c];
       const out = d.output_token_throughput;
       const inp = d.input_token_throughput;
+      const total = d.total_token_throughput;
       const itl = d.inter_token_latency;
       const otpu = d.output_token_throughput_per_user;
       const ttft = d.time_to_first_token;
-      const norm = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '-';
+      const outPerGpu = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '-';
+      const inpPerGpu = inp ? (inp.avg / meta.prefillGPUs).toFixed(1) : '-';
+      const totalTps = total?.avg ?? ((out?.avg ?? 0) + (inp?.avg ?? 0));
+      const totalPerGpu = totalTps > 0 ? (totalTps / totalGPUs).toFixed(1) : '-';
 
       const tr = document.createElement('tr');
       tr.dataset.cfg = cfg;
       tr.dataset.conc = c;
 
       const kvCache = d._kv_cache_tokens;
-      const kvStr = kvCache != null ? kvCache.toLocaleString() : '-';
+      const prefillKvStr = kvCache?.prefill != null ? kvCache.prefill.toLocaleString() : '-';
+      const decodeKvStr = kvCache?.decode != null ? kvCache.decode.toLocaleString() : '-';
 
       const vals = [
-        meta.label, C_LABELS[c], meta.decodeGPUs, kvStr,
-        out?.avg?.toFixed(1) ?? '-', norm,
+        meta.label, C_LABELS[c], meta.prefillGPUs, meta.decodeGPUs,
+        prefillKvStr, decodeKvStr,
+        out?.avg?.toFixed(1) ?? '-', inp?.avg?.toFixed(1) ?? '-', totalTps > 0 ? totalTps.toFixed(1) : '-',
+        outPerGpu, inpPerGpu, totalPerGpu,
         itl?.p50?.toFixed(1) ?? '-', itl?.p99?.toFixed(1) ?? '-',
         otpu?.avg?.toFixed(1) ?? '-',
-        ttft ? (ttft.avg/1000).toFixed(1) : '-',
         ttft ? (ttft.p50/1000).toFixed(1) : '-',
         ttft ? (ttft.p99/1000).toFixed(1) : '-',
-        ttft ? (ttft.min/1000).toFixed(1) : '-',
-        ttft ? (ttft.max/1000).toFixed(1) : '-',
-        '-', '-', '-',
+        '-', '-',
       ];
       vals.forEach((v, i) => {{
         const td = document.createElement('td');
         td.textContent = v;
         if (i === 0) {{ td.style.color = COLORS[cfg]; td.style.fontWeight = '500'; }}
-        if (i === 5) td.className = 'highlight';
+        if (i >= 9 && i <= 11) td.className = 'highlight';
         tr.appendChild(td);
       }});
 
       const ci = colDefs.length;
       costCells.push({{
-        inpTd: tr.cells[ci-3],
-        outTd: tr.cells[ci-2],
-        totTd: tr.cells[ci-1],
+        inpTd: tr.cells[ci-2],
+        outTd: tr.cells[ci-1],
         inpTps: inp?.avg ?? 0,
         outTps: out?.avg ?? 0,
         prefillGPUs: meta.prefillGPUs,
         decodeGPUs: meta.decodeGPUs,
-        totalGPUs,
       }});
 
       tbody.appendChild(tr);
@@ -1061,7 +1144,6 @@ root.appendChild(sec2Wrap);
     costCells.forEach(cc => {{
       cc.inpTd.textContent = costPerMTok(cc.prefillGPUs, cc.inpTps);
       cc.outTd.textContent = costPerMTok(cc.decodeGPUs, cc.outTps);
-      cc.totTd.textContent = costPerMTok(cc.totalGPUs, cc.inpTps + cc.outTps);
     }});
   }}
   updateCostCols();
@@ -1118,7 +1200,7 @@ def main():
         print(f"Error: no results_<config>/ directories found in {results_dir}", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = os.path.dirname(os.path.abspath(results_dir))
+    output_dir = os.path.abspath(results_dir)
     output_path = os.path.join(output_dir, 'interactivity_vs_throughput.html')
 
     generate_html(configs, output_path, results_dir, metric_units)

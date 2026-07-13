@@ -7,9 +7,9 @@ set export
 #   just setup             # install Kueue objects and deploy the orchestrator
 #   just check             # confirm the model endpoint is reachable
 #   just run               # run the full AgentX-MVP benchmark as a Job
-#   just run 16 900        # override concurrency / duration
+#   just run 256 900       # override concurrency / duration
 #   just smoke             # fast plumbing test (~60s, marks result invalid)
-#   just orchestrator-run outdir 900   # run a detached in-cluster sweep
+#   just orchestrator-run              # run a detached in-cluster sweep
 #   just logs / just shell # inspect the orchestrator
 #   just clean             # delete benchmark Jobs and the orchestrator
 
@@ -17,7 +17,7 @@ NAMESPACE := env_var_or_default('NAMESPACE', 'vllm')
 repo_root := justfile_directory()
 home := env_var_or_default('HOME', '')
 manifesto_root := env_var_or_default('MANIFESTO_ROOT', home + '/code/llm-manifesto')
-manifesto_spec := env_var_or_default('MODEL_SPEC', 'models/deepseek-v4/1P-EP8-1D-EP8.yaml')
+manifesto_spec := env_var_or_default('MODEL_SPEC', 'models/deepseek-v4/3P-EP8-1D-EP8.yaml')
 manifesto_cluster := env_var_or_default('MANIFESTO_CLUSTER', 'clusters/oci-gb200.yaml')
 manifesto_user := env_var_or_default('MANIFESTO_USER', env_var_or_default('USER', 'dev'))
 manifesto_args := env_var_or_default('MANIFESTO_ARGS', '')
@@ -51,6 +51,19 @@ duration    := "900"
 
 default:
     @just --list
+
+_spec-slug:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    spec="$(basename "{{manifesto_spec}}" .yaml)"
+    printf '%s\n' "$spec" | tr '[:upper:]' '[:lower:]'
+
+run-dir duration=duration:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    spec="$(just --quiet _spec-slug)"
+    printf 'results/%s_%s_%s_%ss\n' "$ts" "{{manifesto_user}}" "$spec" "{{duration}}"
 
 # Deploy the in-cluster orchestrator pod.
 deploy:
@@ -475,14 +488,14 @@ dump-logs dest=".":
     echo "Logs saved to {{dest}}/logs/"
 
 # Export Grafana dashboards for result directories.
-# Usage: just scrape-grafana results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c1
+# Usage: just scrape-grafana results/<run>/results_$USER-wide-ep-3p-ep8-1d-ep8/results_$USER-wide-ep-3p-ep8-1d-ep8_c64
 scrape-grafana +dirs:
     python3 export_dashboard.py results {{dirs}}
 
 # Scrape Grafana dashboards and generate interactivity chart.
 # Reads namespace.txt from each result directory to find the right Grafana instance.
 # Runs export_dashboard.py inside the orchestrator pod via kubectl exec (no port-forward needed).
-# Usage: just report results_routing
+# Usage: just report results/<run>
 report outdir:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -553,7 +566,7 @@ report outdir:
             echo "=== Prometheus TSDB snapshot disabled (PROMETHEUS_SNAPSHOT=false) ==="
         fi
     done
-    python3 gen_interactivity_chart.py "$(dirname "{{outdir}}")" 2>/dev/null || true
+    python3 gen_interactivity_chart.py "{{outdir}}" 2>/dev/null || true
 
 
 # Install Kueue objects and deploy the benchmark orchestrator.
@@ -682,7 +695,7 @@ _smoke-interactivity dest concurrency:
     printf '%s\n' "$PREFILL_GPUS" > "$WORK/results_${CONFIG_NAME}/prefill_gpus.txt"
     printf '%s\n' "$PODS" > "$WORK/results_${CONFIG_NAME}/pods.txt"
     python3 gen_interactivity_chart.py "$WORK"
-    mv "$(dirname "$WORK")/interactivity_vs_throughput.html" "$DEST/interactivity_vs_throughput.html"
+    mv "$WORK/interactivity_vs_throughput.html" "$DEST/interactivity_vs_throughput.html"
 
 start-model:
     #!/usr/bin/env bash
@@ -796,7 +809,9 @@ sweep outdir duration="900":
     echo "$PODS" > "$dir/pods.txt"
     echo "{{manifesto_spec}}" > "$dir/manifesto_spec.txt"
     (cd "{{manifesto_root}}" && uv run manifesto instance-id "{{manifesto_spec}}" --user "{{manifesto_user}}") > "$dir/manifesto_instance.txt"
-    [ -f "rendered-manifests/${CONFIG_NAME}.yaml" ] && cp "rendered-manifests/${CONFIG_NAME}.yaml" "$dir/manifest.yaml"
+    (cd "{{manifesto_root}}" && uv run manifesto render "{{manifesto_spec}}" --cluster "{{manifesto_cluster}}" --namespace "{{NAMESPACE}}" --user "{{manifesto_user}}" {{manifesto_args}}) \
+        | uv run python "{{repo_root}}/inject_kueue_queue.py" --queue "{{kueue_queue}}" \
+        > "$dir/manifest.yaml"
     just vllm-version "$dir"
     just sweep-concurrency "$CONFIG_NAME" "$dir" {{duration}}
     just stop-model
@@ -857,9 +872,13 @@ orchestrator-deploy:
     POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
     echo "Orchestrator pod ready: $POD"
 
-orchestrator-run outdir duration="900":
+orchestrator-run outdir="" duration="900":
     #!/usr/bin/env bash
     set -euo pipefail
+    OUTDIR="{{outdir}}"
+    if [ -z "$OUTDIR" ]; then
+        OUTDIR=$(just --quiet run-dir "{{duration}}")
+    fi
     just orchestrator-deploy
     NS={{NAMESPACE}}
     POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
@@ -873,10 +892,12 @@ orchestrator-run outdir duration="900":
       MANIFESTO_ARGS="{{manifesto_args}}" \
       KUEUE_QUEUE="{{kueue_queue}}" \
       MAX_CONTEXT_LENGTH="{{max_context_length}}" \
-      SWEEP_OUTDIR="{{outdir}}" \
+      SWEEP_OUTDIR="$OUTDIR" \
       SWEEP_DURATION="{{duration}}" \
       bash -lc 'set -euo pipefail; set -a; [ -f /workspace/benchmark-sweep.env ] && . /workspace/benchmark-sweep.env; set +a; cd /workspace/agentx-mvp; rm -f /workspace/orchestrator-sweep.exit_code; : > /workspace/orchestrator-sweep.log; nohup bash -lc '"'"'just sweep "$SWEEP_OUTDIR" "$SWEEP_DURATION" > /workspace/orchestrator-sweep.log 2>&1; code=$?; echo "$code" > /workspace/orchestrator-sweep.exit_code; rm -f /workspace/orchestrator-sweep.pid; exit "$code"'"'"' </dev/null >/dev/null 2>&1 & pid=$!; echo "$pid" > /workspace/orchestrator-sweep.pid; echo "Launched PID $pid"'
-    echo "Sweep running detached. Monitor: just orchestrator-logs"
+    echo "Sweep running detached: $OUTDIR"
+    echo "Monitor: just orchestrator-logs"
+    echo "Copy results: just orchestrator-results $OUTDIR"
 
 orchestrator-logs:
     POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')

@@ -11,7 +11,7 @@ AIPerf AgentX-MVP benchmark harness for llm-d/manifesto deployments with prefill
   ```
   NAMESPACE=vllm
   MANIFESTO_ROOT=$HOME/code/llm-manifesto
-  MODEL_SPEC=models/deepseek-v4/1P-EP8-1D-EP8.yaml
+  MODEL_SPEC=models/deepseek-v4/3P-EP8-1D-EP8.yaml
   MANIFESTO_CLUSTER=clusters/oci-gb200.yaml
   MANIFESTO_USER=$USER
   KUEUE_QUEUE=nightly-eval
@@ -37,9 +37,9 @@ Override these only when manifesto installs the monitoring stack somewhere else.
 just setup           # install queue manifests and deploy the orchestrator
 just check           # verify the model endpoint is reachable
 just run             # run a Kueue-managed AIPerf Job
-just run 16 900      # override concurrency / duration
+just run 256 900     # override concurrency / duration
 just smoke           # fast Kueue Job plumbing test (~60s, invalid result)
-just orchestrator-run overnight_results 900  # run the sweep from the in-cluster orchestrator
+just orchestrator-run      # run the sweep from the in-cluster orchestrator
 just logs            # tail orchestrator logs
 just shell           # shell into the orchestrator
 just clean           # delete benchmark jobs and the orchestrator pod
@@ -75,18 +75,36 @@ $LUSTRE_PREFIX/$MANIFESTO_USER/<result-directory>
 The local or orchestrator-side result directory receives a copy for report generation,
 but the PVC path is the durable source of truth.
 
-## Sweep
+## Result Directories
 
-Run the benchmark across concurrency levels (`1`, `16`, `64`, `256`) for the configured manifesto spec:
+By default, orchestrated sweeps write under:
 
 ```bash
-just sweep results_deepseekv4_nvl72
-
-# Custom duration (default 900s)
-just sweep results_deepseekv4_nvl72 1200
+results/<UTC timestamp>_<manifesto user>_<spec slug>_<duration>s/
 ```
 
-Each sweep produces result directories like `results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c1/`, `results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c16/`, etc. Each run directory contains:
+For example:
+
+```bash
+results/20260713T210000Z_tms_3p-ep8-1d-ep8_900s/
+```
+
+Inside that run root, each config gets `results_<instance>/`, and each
+concurrency level gets `results_<instance>_c<concurrency>/`. The run root also
+contains `interactivity_vs_throughput.html`.
+
+## Sweep
+
+Run the benchmark across concurrency levels for the configured manifesto spec:
+
+```bash
+just sweep "$(just --quiet run-dir 900)"
+
+# Custom duration (default 900s)
+just sweep "$(just --quiet run-dir 1200)" 1200
+```
+
+Each sweep produces result directories like `results/<run>/results_$USER-wide-ep-3p-ep8-1d-ep8/results_$USER-wide-ep-3p-ep8-1d-ep8_c64/`, `results/<run>/results_$USER-wide-ep-3p-ep8-1d-ep8/results_$USER-wide-ep-3p-ep8-1d-ep8_c256/`, etc. Each run directory contains:
 - `profile_export_aiperf.json` — benchmark metrics
 - `profile_export.jsonl` — per-request data
 - `vllm_image.txt` — vLLM container image tag
@@ -100,7 +118,7 @@ Export Grafana dashboards for benchmark result directories. Automatically extrac
 
 ```bash
 # Export dashboards for specific result directories
-just scrape-grafana results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c1
+just scrape-grafana results/<run>/results_$USER-wide-ep-3p-ep8-1d-ep8/results_$USER-wide-ep-3p-ep8-1d-ep8_c64
 
 # Or use the script directly for a single time range
 python3 export_dashboard.py single --start now-30m --end now -o report.html
@@ -114,10 +132,10 @@ Overlay multiple dashboard exports onto the same charts for side-by-side compari
 
 ```bash
 # Overlay three concurrency levels — auto-labeled from filenames
-python3 overlay_dashboards.py results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c1/dashboard.html results_$USER-wide-ep-1p-ep8-1d-ep8/results_$USER-wide-ep-1p-ep8-1d-ep8_c16/dashboard.html
+python3 overlay_dashboards.py results/<run>/results_$USER-wide-ep-3p-ep8-1d-ep8/results_$USER-wide-ep-3p-ep8-1d-ep8_c64/dashboard.html results/<run>/results_$USER-wide-ep-3p-ep8-1d-ep8/results_$USER-wide-ep-3p-ep8-1d-ep8_c256/dashboard.html
 
 # Custom labels
-python3 overlay_dashboards.py c1.html c4.html --label "concurrency=1" --label "concurrency=4"
+python3 overlay_dashboards.py c64.html c256.html --label "concurrency=64" --label "concurrency=256"
 ```
 
 Each concurrency level gets a distinct color across all panels.
@@ -127,7 +145,7 @@ Each concurrency level gets a distinct color across all panels.
 Capture the vLLM version from a running deployment:
 
 ```bash
-just vllm-version results_$USER-wide-ep-1p-ep8-1d-ep8
+just vllm-version results/<run>/results_$USER-wide-ep-3p-ep8-1d-ep8
 ```
 
 This is called automatically during sweeps.
