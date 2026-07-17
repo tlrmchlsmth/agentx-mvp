@@ -50,9 +50,11 @@ grafana_namespace := env_var_or_default('GRAFANA_NAMESPACE', monitoring_namespac
 grafana_service := env_var_or_default('GRAFANA_SERVICE', 'grafana')
 concurrency := "64"
 duration    := "900"
-sweep_concurrencies := env_var_or_default('SWEEP_CONCURRENCIES', '16 32 64 128 256')
+sweep_concurrencies := env_var_or_default('SWEEP_CONCURRENCIES', '32 64 128 256')
 
 llm_d_root := env_var('LLM_D_ROOT')
+llm_d_repo := env_var_or_default('LLM_D_REPO', 'https://github.com/elvircrn/llm-d.git')
+llm_d_branch := env_var_or_default('LLM_D_BRANCH', 'wip-glm')
 
 default:
     @just --list
@@ -1304,7 +1306,7 @@ seed outdir configs:
         kubectl cp "$f" "$NS/${POD}:/workspace/agentx-mvp/$f"
     done
     kubectl exec -n "$NS" "$POD" -- bash -c \
-        'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git pull; else git clone --branch wip-glm https://github.com/elvircrn/llm-d.git /workspace/llm-d; fi'
+        'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git fetch origin && git checkout {{llm_d_branch}} && git pull; else git clone --branch {{llm_d_branch}} {{llm_d_repo}} /workspace/llm-d; fi'
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
     printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\nMODEL=%s\nMODEL_LABEL=%s\n' "{{NAMESPACE}}" "{{model}}" "{{model_label}}" > "$TMPENV"
@@ -1347,7 +1349,7 @@ seed-sequential outdir configs:
         kubectl cp "$f" "$NS/${POD}:/workspace/agentx-mvp/$f"
     done
     kubectl exec -n "$NS" "$POD" -- bash -c \
-        'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git pull; else git clone --branch wip-glm https://github.com/elvircrn/llm-d.git /workspace/llm-d; fi'
+        'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git fetch origin && git checkout {{llm_d_branch}} && git pull; else git clone --branch {{llm_d_branch}} {{llm_d_repo}} /workspace/llm-d; fi'
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
     printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\nMODEL=%s\nMODEL_LABEL=%s\n' "{{NAMESPACE}}" "{{model}}" "{{model_label}}" > "$TMPENV"
