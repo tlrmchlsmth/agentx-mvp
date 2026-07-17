@@ -34,14 +34,13 @@ orchestrator_deploy := "benchmark-orchestrator"
 orchestrator_spec_configmap := "benchmark-orchestrator-spec"
 seed_image := env_var_or_default('SEED_IMAGE', 'quay.io/tms/benchmark-seed:amd64')
 seed_deploy := env_var_or_default('SEED_DEPLOY', 'benchmark-seed')
-model     := env_var_or_default('MODEL', 'deepseek-ai/DeepSeek-V4-Pro')
-model_label := env_var_or_default('MODEL_LABEL', 'DeepSeek-V4-Pro')
+model     := env_var_or_default('MODEL', 'zai-org/GLM-5.2-FP8')
+model_label := env_var_or_default('MODEL_LABEL', 'GLM-5.2-FP8')
 max_context_length := env_var_or_default('MAX_CONTEXT_LENGTH', '128000')
 url       := env_var_or_default('URL', 'http://llm-d-inference-gateway-istio:80/v1')
 server_metrics_url := env_var_or_default('SERVER_METRICS_URL', '')
 gpu_telemetry_urls := env_var_or_default('GPU_TELEMETRY_URLS', '')
 benchmark_retries := env_var_or_default('BENCHMARK_RETRIES', '3')
-benchmark_concurrencies := env_var_or_default('BENCHMARK_CONCURRENCIES', '64 256')
 pod_start_timeout := env_var_or_default('POD_START_TIMEOUT', '900')
 monitoring_namespace := env_var_or_default('MONITORING_NAMESPACE', NAMESPACE)
 prometheus_namespace := env_var_or_default('PROMETHEUS_NAMESPACE', monitoring_namespace)
@@ -51,7 +50,7 @@ grafana_namespace := env_var_or_default('GRAFANA_NAMESPACE', monitoring_namespac
 grafana_service := env_var_or_default('GRAFANA_SERVICE', 'grafana')
 concurrency := "64"
 duration    := "900"
-sweep_concurrencies := "64 128 256"
+sweep_concurrencies := env_var_or_default('SWEEP_CONCURRENCIES', '16 32 64 128 256')
 
 llm_d_root := env_var('LLM_D_ROOT')
 
@@ -121,6 +120,13 @@ _run-job concurrency duration dest unsafe_args attempt:
     TIMEOUT=$(({{duration}} + 7200))
     TMP=$(mktemp)
     trap "rm -f $TMP" EXIT
+    if kubectl api-resources --api-group=kueue.x-k8s.io 2>/dev/null | grep -q localqueue; then
+      HAS_KUEUE=true
+      SUSPEND="true"
+    else
+      HAS_KUEUE=false
+      SUSPEND="false"
+    fi
     cat > "$TMP" <<EOF
     apiVersion: batch/v1
     kind: Job
@@ -128,9 +134,8 @@ _run-job concurrency duration dest unsafe_args attempt:
       name: ${JOB}
       labels:
         app: agentx-aiperf
-        kueue.x-k8s.io/queue-name: {{kueue_queue}}
     spec:
-      suspend: true
+      suspend: ${SUSPEND}
       backoffLimit: 0
       activeDeadlineSeconds: ${TIMEOUT}
       template:
@@ -235,6 +240,9 @@ _run-job concurrency duration dest unsafe_args attempt:
               persistentVolumeClaim:
                 claimName: {{lustre_claim}}
     EOF
+    if $HAS_KUEUE; then
+      sed -i'' '/app: agentx-aiperf/a\        kueue.x-k8s.io/queue-name: {{kueue_queue}}' "$TMP"
+    fi
     kubectl apply -n "$NS" -f "$TMP"
     echo "Benchmark job submitted: $JOB"
     echo "Attempt artifacts: $ARTIFACT_DIR"
@@ -301,15 +309,24 @@ _run-job concurrency duration dest unsafe_args attempt:
         fi
         sleep 10
     done
-    SELECTOR=$(just --quiet _pod-selector prefill)
-    PVC_POD=$(kubectl get pod -n "$NS" -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}')
-    kubectl exec -n "$NS" "$PVC_POD" -c vllm -- test -f "${CANONICAL_ARTIFACT_DIR}/profile_export_aiperf.json" || {
+    mkdir -p "{{dest}}/logs"
+    # Spawn a short-lived pod to copy results from the lustre PVC
+    PVC_READER="pvc-reader-${JOB}"
+    kubectl run "$PVC_READER" -n "$NS" --image=busybox --restart=Never \
+      --overrides="{\"spec\":{\"containers\":[{\"name\":\"reader\",\"image\":\"busybox\",\"command\":[\"sleep\",\"300\"],\"volumeMounts\":[{\"name\":\"lustre\",\"mountPath\":\"{{lustre_mount}}\"}]}],\"volumes\":[{\"name\":\"lustre\",\"persistentVolumeClaim\":{\"claimName\":\"{{lustre_claim}}\"}}]}}" \
+      2>/dev/null
+    kubectl wait --for=condition=Ready pod/"$PVC_READER" -n "$NS" --timeout=60s
+    kubectl exec -n "$NS" "$PVC_READER" -- test -f "${CANONICAL_ARTIFACT_DIR}/profile_export_aiperf.json" || {
         echo "ERROR: profile_export_aiperf.json missing from canonical PVC path after job completion"
-        kubectl exec -n "$NS" "$PVC_POD" -c vllm -- find "$CANONICAL_ARTIFACT_DIR" -maxdepth 2 -type f 2>/dev/null || true
+        kubectl exec -n "$NS" "$PVC_READER" -- find "${CANONICAL_ARTIFACT_DIR}" -maxdepth 2 -type f 2>/dev/null || true
+        kubectl delete pod "$PVC_READER" -n "$NS" --ignore-not-found 2>/dev/null || true
         exit 1
     }
-    mkdir -p "{{dest}}/logs"
-    kubectl cp -c vllm "$NS/${PVC_POD}:${CANONICAL_ARTIFACT_DIR}/." "{{dest}}"
+    kubectl cp "$NS/${PVC_READER}:${CANONICAL_ARTIFACT_DIR}/." "{{dest}}"
+    for f in profile_export.jsonl profile_export_aiperf.json profile_export_aiperf.csv server_metrics_export.json server_metrics_export.csv profile_export_console.txt; do
+        kubectl cp "$NS/${PVC_READER}:${CANONICAL_ARTIFACT_DIR}/$f" "{{dest}}/$f" 2>/dev/null || true
+    done
+    kubectl delete pod "$PVC_READER" -n "$NS" --ignore-not-found 2>/dev/null || true
     printf '%s\n' "$JOB" > "{{dest}}/job_name.txt"
     printf '%s\n' "$CANONICAL_ARTIFACT_DIR" > "{{dest}}/remote_artifact_dir.txt"
     printf '%s\n' "$ARTIFACT_DIR" > "{{dest}}/remote_attempt_artifact_dir.txt"
@@ -442,12 +459,12 @@ vllm-version dest=".":
     #!/usr/bin/env bash
     set -euo pipefail
     NS={{NAMESPACE}}
-    PREFILL_SELECTOR=$(just --quiet _pod-selector prefill)
+    SELECTOR="llm-d.ai/role=prefill"
     # Image tag
-    kubectl get pod -n "$NS" -l "$PREFILL_SELECTOR" -o jsonpath='{.items[0].spec.containers[0].image}' > "{{dest}}/vllm_image.txt"
+    kubectl get pod -n "$NS" -l "$SELECTOR" -o jsonpath='{.items[0].spec.containers[0].image}' > "{{dest}}/vllm_image.txt"
     echo "" >> "{{dest}}/vllm_image.txt"
     # vLLM version from prefill pod startup logs
-    POD=$(kubectl get pod -n "$NS" -l "$PREFILL_SELECTOR" -o jsonpath='{.items[0].metadata.name}')
+    POD=$(kubectl get pod -n "$NS" -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}')
     kubectl logs -n "$NS" "$POD" --all-containers 2>/dev/null \
       | sed -n 's/.*version \([^ ]*\).*/\1/p' | head -1 > "{{dest}}/vllm_version.txt" || true
     echo "vllm version saved to {{dest}}/"
@@ -460,7 +477,7 @@ dump-logs dest=".":
     set -euo pipefail
     NS={{NAMESPACE}}
     WORKER_SELECTOR=$(just --quiet _pod-selector)
-    INSTANCE=$(just --quiet _manifesto-info | sed -n 's/^instance=//p')
+    INSTANCE="wide-ep-lws"
     mkdir -p "{{dest}}/logs"
     for pod in $(kubectl get pods -n "$NS" -l "$WORKER_SELECTOR" -o jsonpath='{.items[*].metadata.name}'); do
         echo "  logs: $pod"
@@ -511,7 +528,14 @@ report outdir:
         fi
         # Copy script to pod once per namespace
         if ! echo "$SETUP_NAMESPACES" | grep -q "|${NS}|"; then
-            POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
+            POD=$(kubectl get pod -n "$NS" -l app={{deploy}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [ -z "$POD" ]; then
+                POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            fi
+            if [ -z "$POD" ]; then
+                echo "WARNING: no orchestrator pod found in $NS, skipping dashboard export for $dir"
+                continue
+            fi
             kubectl cp export_dashboard.py "$NS/${POD}:/workspace/export_dashboard.py"
             SETUP_NAMESPACES="${SETUP_NAMESPACES}|${NS}|${POD}|"
         fi
@@ -660,6 +684,22 @@ setup-namespace ns:
       namespace: {{ns}}
     DCGMRBAC
     kubectl create secret generic llm-d-hf-token --from-literal=HF_TOKEN=dummy -n {{ns}} --dry-run=client -o yaml | kubectl apply -f -
+    # Kueue local queue (so benchmark jobs get admitted)
+    kubectl apply -n {{ns}} -f kueue/local-queue.yaml 2>/dev/null || echo "Kueue CRDs not installed, skipping local queue"
+    # Shared storage for benchmark artifacts
+    kubectl apply -n {{ns}} -f - <<'PVCEOF'
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: {{lustre_claim}}
+    spec:
+      accessModes:
+      - ReadWriteMany
+      resources:
+        requests:
+          storage: 20Gi
+      storageClassName: shared-vast
+    PVCEOF
     # Service account
     kubectl apply -n {{ns}} -f "$ROOT/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/serviceAccount.yaml"
     # Gateway (configmap + gateway via kustomize)
@@ -895,8 +935,7 @@ _gpu-telemetry-args:
         printf -- '--gpu-telemetry %s\n' "{{gpu_telemetry_urls}}"
         exit 0
     fi
-    INFO=$(just --quiet _manifesto-info)
-    INSTANCE=$(printf '%s\n' "$INFO" | sed -n 's/^instance=//p')
+    INSTANCE="wide-ep-lws"
     URLS=$(kubectl get pod -n "{{NAMESPACE}}" \
         -l "app.kubernetes.io/instance=${INSTANCE},llm-d.ai/role" \
         -o jsonpath='{range .items[*]}http://{.status.podIP}:9400/metrics{" "}{end}' 2>/dev/null \
@@ -910,12 +949,10 @@ _gpu-telemetry-args:
 _pod-selector role="":
     #!/usr/bin/env bash
     set -euo pipefail
-    INFO=$(just --quiet _manifesto-info)
-    INSTANCE=$(printf '%s\n' "$INFO" | sed -n 's/^instance=//p')
     if [ -n "{{role}}" ]; then
-        printf 'app.kubernetes.io/instance=%s,llm-d.ai/role=%s\n' "$INSTANCE" "{{role}}"
+        printf 'llm-d.ai/role=%s\n' "{{role}}"
     else
-        printf 'app.kubernetes.io/instance=%s,llm-d.ai/role\n' "$INSTANCE"
+        printf 'llm-d.ai/role\n'
     fi
 
 # Free GPUs in a namespace by removing model serving, but keep prometheus/grafana alive.
@@ -1052,6 +1089,8 @@ start-pd prefill_replicas prefill_size decode_replicas decode_size:
     kubectl rollout status --watch statefulset/wide-ep-lws-nvidia-gpu-vllm-glm-5-2-prefill -n {{NAMESPACE}} --timeout=7200s &
     kubectl rollout status --watch statefulset/wide-ep-lws-nvidia-gpu-vllm-glm-5-2-decode -n {{NAMESPACE}} --timeout=7200s &
     wait
+    echo "Waiting for all containers to be ready..."
+    kubectl wait --for=condition=Ready pod -l llm-d.ai/role -n {{NAMESPACE}} --timeout=7200s
     for pod in $(kubectl get pods -n {{NAMESPACE}} -l llm-d.ai/role -o jsonpath='{.items[*].metadata.name}'); do
         kubectl exec -n {{NAMESPACE}} "$pod" -c vllm -- find /dev/shm -name 'vllm_offload*' -delete 2>/dev/null || true
     done
@@ -1099,7 +1138,7 @@ sweep-concurrency prefix="sweep" dest="." duration="900":
         echo "=== concurrency=$C ({{duration}}s) ==="
         just drain
         just clear-kv-cache
-        if ! just warmup || ! just run $C {{duration}}; then
+        if ! just warmup || ! just run $C {{duration}} "$RDIR"; then
             echo "FAILED: concurrency=$C, dumping logs before cleanup"
             FAILED="${FAILED} c${C}"
             mkdir -p "$RDIR"
@@ -1150,6 +1189,7 @@ sweep outdir configs duration="900":
         just warmup
         mkdir -p "$dir"
         echo "$NS" > "$dir/namespace.txt"
+        kubectl get pod -n "$NS" -l llm-d.ai/role -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | paste -sd'|' - > "$dir/pods.txt"
         kubectl get pod -n "$NS" -l llm-d.ai/role=prefill -o yaml > "$dir/prefill.yaml"
         kubectl get pod -n "$NS" -l llm-d.ai/role=decode -o yaml > "$dir/decode.yaml"
         kubectl get pod -n "$NS" -l llm-d-router-gateway=wide-ep-lws-epp -o yaml > "$dir/epp.yaml" 2>/dev/null || true
@@ -1174,7 +1214,7 @@ orchestrator-spec-config:
     TMP=$(mktemp)
     trap "rm -f $TMP" EXIT
     {
-        printf "BENCHMARK_CONCURRENCIES='%s'\n" "{{benchmark_concurrencies}}"
+        printf "BENCHMARK_CONCURRENCIES='%s'\n" "{{sweep_concurrencies}}"
         printf "BENCHMARK_RETRIES='%s'\n" "{{benchmark_retries}}"
         printf "POD_START_TIMEOUT='%s'\n" "{{pod_start_timeout}}"
     } > "$TMP"
@@ -1267,7 +1307,7 @@ seed outdir configs:
         'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git pull; else git clone --branch wip-glm https://github.com/elvircrn/llm-d.git /workspace/llm-d; fi'
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
-    printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\n' "{{NAMESPACE}}" > "$TMPENV"
+    printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\nMODEL=%s\nMODEL_LABEL=%s\n' "{{NAMESPACE}}" "{{model}}" "{{model_label}}" > "$TMPENV"
     kubectl cp "$TMPENV" "$NS/${POD}:/workspace/agentx-mvp/.env"
     echo "=== Launching sweep (detached) ==="
     OUTDIR="{{outdir}}"
@@ -1310,13 +1350,13 @@ seed-sequential outdir configs:
         'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git pull; else git clone --branch wip-glm https://github.com/elvircrn/llm-d.git /workspace/llm-d; fi'
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
-    printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\n' "{{NAMESPACE}}" > "$TMPENV"
+    printf 'NAMESPACE=%s\nLLM_D_ROOT=/workspace/llm-d\nMODEL=%s\nMODEL_LABEL=%s\n' "{{NAMESPACE}}" "{{model}}" "{{model_label}}" > "$TMPENV"
     kubectl cp "$TMPENV" "$NS/${POD}:/workspace/agentx-mvp/.env"
     echo "=== Launching sequential sweep (detached) ==="
     OUTDIR="{{outdir}}"
     CONFIGS="{{configs}}"
     TMPSCRIPT=$(mktemp)
-    printf '#!/bin/bash\ncd /workspace/agentx-mvp\nfor cfg in %s; do\n  IFS=: read -r PR PW DR DW <<< "$cfg"\n  NS=ecrncevi-dev-p${PR}w${PW}d${DR}w${DW}\n  echo "====== Sequential: ${cfg} in $NS ======"\n  if ! just setup-namespace "$NS"; then\n    echo "FAILED: setup for ${cfg}, skipping"\n    just teardown-namespace "$NS" 2>/dev/null || true\n    continue\n  fi\n  NAMESPACE="$NS" just sweep "%s" "${cfg}" || echo "FAILED: sweep for ${cfg}"\n  just snapshot-prometheus "$NS" "%s/results_p${PR}w${PW}_d${DR}w${DW}" || echo "WARNING: snapshot failed for ${cfg}"\n  just teardown-namespace "$NS"\ndone\n' "$CONFIGS" "$OUTDIR" "$OUTDIR" > "$TMPSCRIPT"
+    printf '#!/bin/bash\ncd /workspace/agentx-mvp\nfor cfg in %s; do\n  IFS=: read -r PR PW DR DW <<< "$cfg"\n  NS=ecrncevi-dev-p${PR}w${PW}d${DR}w${DW}\n  echo "====== Sequential: ${cfg} in $NS ======"\n  if ! NAMESPACE="$NS" just setup-namespace "$NS"; then\n    echo "FAILED: setup for ${cfg}, skipping"\n    NAMESPACE="$NS" just teardown-namespace "$NS" 2>/dev/null || true\n    continue\n  fi\n  sed -i "s/^NAMESPACE=.*/NAMESPACE=$NS/" /workspace/agentx-mvp/.env\n  just sweep "%s" "${cfg}" || echo "FAILED: sweep for ${cfg}"\n  just snapshot-prometheus "$NS" "%s/results_p${PR}w${PW}_d${DR}w${DW}" || echo "WARNING: snapshot failed for ${cfg}"\n  NAMESPACE="$NS" just teardown-namespace "$NS"\ndone\n' "$CONFIGS" "$OUTDIR" "$OUTDIR" > "$TMPSCRIPT"
     kubectl cp "$TMPSCRIPT" "$NS/${POD}:/workspace/run_seed.sh"
     rm -f "$TMPSCRIPT"
     kubectl exec -n "$NS" "$POD" -- chmod +x /workspace/run_seed.sh
@@ -1334,55 +1374,49 @@ seed-logs:
     POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{seed_deploy}} -o jsonpath='{.items[0].metadata.name}')
     kubectl exec -n {{NAMESPACE}} "$POD" -- tail -f /workspace/seed-sweep.log
 
-# Copy results from the seed pod to local.
+# Copy results from the seed pod to local (uses tar pipe for robustness).
+# Downloads per-concurrency-level and skips already-downloaded results.
 # Usage: just seed-results results_run1
 seed-results outdir:
     #!/usr/bin/env bash
     set -euo pipefail
     NS={{NAMESPACE}}
     POD=$(kubectl get pod -n "$NS" -l app={{seed_deploy}} -o jsonpath='{.items[0].metadata.name}')
-    DIRS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -name "profile_export.jsonl" -exec dirname {} \; 2>/dev/null)
-    for dir in $DIRS; do
-        LOCAL=${dir#/workspace/agentx-mvp/}
-        mkdir -p "$LOCAL"
-        kubectl cp "$NS/${POD}:${dir}" "$LOCAL" 2>/dev/null || true
-        # Re-copy critical files individually — directory copies truncate large files
-        for f in profile_export.jsonl profile_export_aiperf.json; do
-            kubectl cp "$NS/${POD}:${dir}/${f}" "$LOCAL/$f" 2>/dev/null || true
-        done
+    # Build remote file manifest (path + size) in one kubectl call
+    MANIFEST=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -type f -printf '%p\t%s\n' 2>/dev/null)
+    if [ -z "$MANIFEST" ]; then echo "No results found in {{outdir}}"; exit 0; fi
+    DOWNLOADED=0; SKIPPED=0; SYNCED=0
+    # Pass 1: full tar download for new result dirs
+    RESULT_DIRS=$(echo "$MANIFEST" | grep 'profile_export\.jsonl' | cut -f1 | xargs -I{} dirname {})
+    for rdir in $RESULT_DIRS; do
+        REL=${rdir#/workspace/agentx-mvp/}
+        if [ -f "$REL/profile_export.jsonl" ]; then
+            SKIPPED=$((SKIPPED + 1)); continue
+        fi
+        echo "  new: ${REL}"
+        mkdir -p "$REL"
+        if kubectl exec -n "$NS" "$POD" -- tar czf - -C /workspace/agentx-mvp "$REL" 2>/dev/null | tar xzf - -C . 2>/dev/null; then
+            DOWNLOADED=$((DOWNLOADED + 1))
+        else
+            echo "  tar failed for ${REL}, falling back to per-file sync"
+            TARFAIL=$((${TARFAIL:-0} + 1))
+        fi
     done
-    # Also copy non-result files (namespace.txt, yamls, etc.)
-    EXTRAS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -maxdepth 4 \( -name "*.yaml" -o -name "*.txt" -o -name "*.html" \) 2>/dev/null)
-    for f in $EXTRAS; do
-        LOCAL=${f#/workspace/agentx-mvp/}
-        mkdir -p "$(dirname "$LOCAL")"
-        kubectl cp "$NS/${POD}:${f}" "$LOCAL" 2>/dev/null || true
-    done
-    # Snapshot and download Prometheus TSDB from each benchmark namespace
-    SNAPPED=""
-    for dir in $DIRS; do
-        PARENT=$(dirname "$dir")
-        NS_FILE=$(kubectl exec -n "$NS" "$POD" -- cat "${PARENT}/namespace.txt" 2>/dev/null) || continue
-        if echo "$SNAPPED" | grep -q "|${NS_FILE}|"; then continue; fi
-        SNAPPED="${SNAPPED}|${NS_FILE}|"
-        PROM_POD=$(kubectl get pod -n "$NS_FILE" -l app.kubernetes.io/name=prometheus,app.kubernetes.io/component=server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || continue
-        echo "=== $NS_FILE: snapshotting Prometheus TSDB ==="
-        SNAP_NAME=$(kubectl exec -n "$NS_FILE" "$PROM_POD" -c prometheus-server -- \
-            wget -qO- --post-data= http://localhost:9090/api/v1/admin/tsdb/snapshot 2>/dev/null \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['name'])" 2>/dev/null) || {
-            echo "  WARNING: snapshot failed for $NS_FILE, skipping"
-            continue
-        }
-        LOCAL_PARENT=${PARENT#/workspace/agentx-mvp/}
-        SNAP_DIR="${LOCAL_PARENT}/prometheus_snapshot"
-        mkdir -p "$SNAP_DIR"
-        kubectl cp "$NS_FILE/${PROM_POD}:/data/snapshots/${SNAP_NAME}" "$SNAP_DIR" -c prometheus-server 2>/dev/null || {
-            echo "  WARNING: snapshot copy failed for $NS_FILE"
-            continue
-        }
-        kubectl exec -n "$NS_FILE" "$PROM_POD" -c prometheus-server -- rm -rf "/data/snapshots/${SNAP_NAME}" 2>/dev/null || true
-        echo "  Saved to $SNAP_DIR"
-    done
+    # Pass 2: sync missing files in already-downloaded dirs
+    SYNCED=0
+    while IFS=$'\t' read -r rpath rsize; do
+        REL=${rpath#/workspace/agentx-mvp/}
+        [ -f "$REL" ] && continue
+        mkdir -p "$(dirname "$REL")"
+        if kubectl exec -n "$NS" "$POD" -- cat "$rpath" > "$REL" 2>/dev/null; then
+            echo "  sync: ${REL}"
+            SYNCED=$((SYNCED + 1))
+        else
+            rm -f "$REL"
+            echo "  WARN: failed to sync ${REL}"
+        fi
+    done <<< "$MANIFEST"
+    echo "Downloaded $DOWNLOADED new dirs, skipped $SKIPPED, synced $SYNCED missing files"
     echo "Results copied to {{outdir}}/"
     python3 gen_interactivity_chart.py "{{outdir}}" 2>/dev/null || true
 

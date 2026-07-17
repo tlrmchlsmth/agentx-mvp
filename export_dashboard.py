@@ -136,7 +136,7 @@ def convert_scenes_to_classic(dashboard):
     return panels
 
 
-def substitute_vars(expr, deployment):
+def substitute_vars(expr, deployment, range_seconds=None):
     expr = expr.replace("${deployment}", deployment)
     expr = expr.replace("$deployment", deployment)
     expr = expr.replace("${DS_PROMETHEUS}", "PBFA97CFB590B2093")
@@ -146,6 +146,8 @@ def substitute_vars(expr, deployment):
     expr = expr.replace("$namespace", ".*")
     expr = expr.replace("${namespace}", ".*")
     expr = expr.replace("$__rate_interval", "15s")
+    if range_seconds is not None:
+        expr = expr.replace("$__range", f"{int(range_seconds)}s")
     return expr
 
 
@@ -305,7 +307,7 @@ def export(args):
             expr = target.get("expr", "")
             if not expr:
                 continue
-            expr = substitute_vars(expr, args.deployment)
+            expr = substitute_vars(expr, args.deployment, range_seconds)
             expr = scope_promql_expr(expr, pod_regex)
             legend = target.get("legendFormat", "")
             result = query_prometheus(args.grafana_url, args.auth, ds_id, expr, start, end, step)

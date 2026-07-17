@@ -4,10 +4,11 @@ Scan results/ for deployment configs, extract aiperf metrics,
 and generate an interactive interactivity-vs-throughput HTML chart.
 
 Usage:
-    python3 gen_interactivity_chart.py [results_dir]
+    python3 gen_interactivity_chart.py [results_dir ...]
 
-Defaults to ./results if no argument given. Output: interactivity_vs_throughput.html
-in the same directory as this script (or parent of results_dir).
+Defaults to ./results if no argument given. Multiple directories can be
+specified to consolidate all configs into a single report, with the
+folder name prefixed to each config label for differentiation.
 """
 
 import base64
@@ -65,18 +66,35 @@ def aggregate_jsonl(path):
     if ts_start and ts_end:
         duration_s = (max(ts_end) - min(ts_start)) / 1e9
         total_out = sum(r['metrics'].get('output_sequence_length', {}).get('value', 0) for r in records)
+        total_in = sum(r['metrics'].get('input_sequence_length', {}).get('value', 0) for r in records)
+        num_requests = len(records)
         if duration_s > 0:
-            result['output_token_throughput'] = {
-                'avg': total_out / duration_s, 'min': total_out / duration_s,
-                'p50': total_out / duration_s, 'p90': total_out / duration_s,
-                'p95': total_out / duration_s, 'p99': total_out / duration_s,
-                'max': total_out / duration_s, 'unit': 'tokens/sec',
+            out_tps = total_out / duration_s
+            in_tps = total_in / duration_s
+            rps = num_requests / duration_s
+            for name, val, unit in [
+                ('output_token_throughput', out_tps, 'tokens/sec'),
+                ('input_token_throughput', in_tps, 'tokens/sec'),
+                ('total_token_throughput', out_tps + in_tps, 'tokens/sec'),
+                ('request_throughput', rps, 'req/sec'),
+            ]:
+                result[name] = {
+                    'avg': val, 'min': val, 'p50': val,
+                    'p90': val, 'p95': val, 'p99': val,
+                    'max': val, 'unit': unit,
+                }
+            result['request_count'] = {
+                'avg': num_requests, 'min': num_requests, 'p50': num_requests,
+                'p90': num_requests, 'p95': num_requests, 'p99': num_requests,
+                'max': num_requests, 'unit': 'count',
             }
     return result
 
 COLORS = [
-    '#f97316', '#22d3ee', '#a78bfa', '#34d399', '#f472b6',
-    '#facc15', '#fb923c', '#38bdf8', '#c084fc', '#4ade80',
+    '#ff3333', '#00ccff', '#ffdd00', '#aa44ff', '#00ee77',
+    '#ff7700', '#3388ff', '#ff55aa', '#00ffcc', '#dddd00',
+    '#cc33ff', '#33ff33', '#ff4477', '#0088ff', '#ffaa00',
+    '#77ddff', '#ff0066', '#44ffaa', '#bb88ff', '#88ff00',
 ]
 
 
@@ -88,7 +106,7 @@ def read_model_label(results_dir):
             label = path.read_text().strip()
             if label:
                 return label
-    return os.environ.get('MODEL_LABEL', 'DeepSeek-V4-Pro')
+    return os.environ.get('MODEL_LABEL', 'GLM-5.2-FP8')
 
 
 def read_text_file(path, default=''):
@@ -213,6 +231,9 @@ def discover_configs(results_dir):
     for entry in sorted(os.listdir(results_dir)):
         if not entry.startswith('results_'):
             continue
+        m = config_pattern.match(entry)
+        if not m:
+            continue
         config_name = m.group(1)
         pr = int(m.group(2))
         pw = int(m.group(3))
@@ -227,8 +248,8 @@ def discover_configs(results_dir):
             continue
 
         config_name = entry[len('results_'):]
-        decode_gpus = read_int_file(os.path.join(config_dir, 'decode_gpus.txt'), GPUS_PER_NODE)
-        prefill_gpus = read_int_file(os.path.join(config_dir, 'prefill_gpus.txt'), GPUS_PER_NODE)
+        decode_gpus = read_int_file(os.path.join(config_dir, 'decode_gpus.txt'), n_decode_nodes * GPUS_PER_NODE)
+        prefill_gpus = read_int_file(os.path.join(config_dir, 'prefill_gpus.txt'), n_prefill_nodes * GPUS_PER_NODE)
         default_label = config_name
         default_pods = read_text_file(os.path.join(config_dir, 'pods.txt'), config_name)
 
@@ -255,6 +276,10 @@ def discover_configs(results_dir):
                     run_data[key] = {s: val[s] for s in STAT_KEYS if s in val}
                     if key not in metric_units:
                         metric_units[key] = val.get('unit', '')
+
+            error_summary = d.get('error_summary', [])
+            error_count = sum(e.get('count', 0) for e in error_summary) if error_summary else 0
+            run_data['_error_count'] = error_count
 
             logs_dir = os.path.join(config_dir, sub, 'logs')
             if os.path.isdir(logs_dir):
@@ -290,8 +315,9 @@ def discover_configs(results_dir):
                     with open(ypath) as yf:
                         yamls[yname] = yf.read()
 
-        prefill_gpus = n_prefill_nodes * GPUS_PER_NODE
-        label = f'{pr}P{"×"+str(pw) if pw > 1 else ""} {dr}D{"×"+str(dw) if dw > 1 else ""}'
+        def _role_label(replicas, width, letter):
+            return f'{replicas} x {letter} (EP {width * GPUS_PER_NODE})'
+        label = f'{_role_label(pr, pw, "P")} | {_role_label(dr, dw, "D")}'
         configs[config_name] = {
             'label': label,
             'decode_gpus': decode_gpus,
@@ -346,15 +372,32 @@ def generate_html(configs, output_path, results_dir, metric_units):
     for i, cfg in enumerate(sorted(configs.keys())):
         color_map[cfg] = COLORS[i % len(COLORS)]
 
+    MARKER_SHAPES = [
+        'circle', 'square', 'diamond', 'triangle-up', 'cross',
+        'star', 'hexagon', 'triangle-down', 'pentagon', 'hourglass',
+    ]
+    folder_set = []
+    for cfg in sorted(configs.keys()):
+        folder = cfg.rsplit('/', 1)[0] if '/' in cfg else ''
+        if folder not in folder_set:
+            folder_set.append(folder)
+    folder_shape_map = {f: MARKER_SHAPES[i % len(MARKER_SHAPES)] for i, f in enumerate(folder_set)}
+    shape_map = {}
+    for cfg in sorted(configs.keys()):
+        folder = cfg.rsplit('/', 1)[0] if '/' in cfg else ''
+        shape_map[cfg] = folder_shape_map[folder]
+
     configs_js = {}
     data_js = {}
     concurrencies = set()
     for cfg, meta in configs.items():
+        folder = cfg.rsplit('/', 1)[0] if '/' in cfg else ''
         configs_js[cfg] = {
             'label': meta['label'],
             'decodeGPUs': meta['decode_gpus'],
             'prefillGPUs': meta['prefill_gpus'],
             'pods': meta['pods'],
+            'folder': folder,
         }
         data_js[cfg] = {}
         for c_val, metrics in meta['runs'].items():
@@ -369,6 +412,7 @@ def generate_html(configs, output_path, results_dir, metric_units):
     metrics_js = {k: {'unit': v} for k, v in sorted(metric_units.items())}
     x_axis_metrics = [
         'output_token_throughput_per_user',
+        'e2e_output_token_throughput',
         'inter_token_latency',
         'time_to_first_token',
         'time_to_second_token',
@@ -461,10 +505,12 @@ def generate_html(configs, output_path, results_dir, metric_units):
 
     results_dir = os.path.abspath(results_dir)
     embedded_dashboards = {}
-    for cfg in configs:
-        for c_val in configs[cfg]['runs']:
+    for cfg, meta in configs.items():
+        cfg_results_dir = meta.get('_results_dir', results_dir)
+        raw_cfg = cfg.split('/', 1)[-1] if '/' in cfg else cfg
+        for c_val in meta['runs']:
             key = f'c{c_val}'
-            dash_path = os.path.join(results_dir, f'results_{cfg}', f'results_{cfg}_{key}', 'dashboard.html')
+            dash_path = os.path.join(cfg_results_dir, f'results_{raw_cfg}', f'results_{raw_cfg}_{key}', 'dashboard.html')
             if os.path.isfile(dash_path):
                 with open(dash_path, 'rb') as df:
                     embedded_dashboards[f'{cfg}_{key}'] = base64.b64encode(df.read()).decode('ascii')
@@ -500,74 +546,101 @@ def generate_html(configs, output_path, results_dir, metric_units):
 <title>{model_label} — Interactivity vs Throughput — vLLM {version_str}</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
+  :root {{
+    --bg: #111217; --bg2: #181b1f; --bg3: #0d1117; --border: #2a2a2e; --border2: #1e1e22;
+    --fg: #ececec; --fg2: #c0c0c0; --fg3: #8e8e8e; --hover-bg: #1e2127;
+    --highlight: #58a6ff; --overlay: rgba(0,0,0,0.4);
+    --input-bg: #181b1f; --input-fg: #d8d9da; --input-border: #2a2a2e;
+  }}
+  html.light {{
+    --bg: #f5f6f8; --bg2: #ffffff; --bg3: #f0f1f3; --border: #d4d6db; --border2: #e4e6ea;
+    --fg: #1a1a1a; --fg2: #444; --fg3: #666; --hover-bg: #eef0f4;
+    --highlight: #0969da; --overlay: rgba(0,0,0,0.15);
+    --input-bg: #ffffff; --input-fg: #1a1a1a; --input-border: #c8cacd;
+  }}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #111217; color: #d8d9da; font-family: Inter, -apple-system, sans-serif; padding: 16px; }}
-  h1 {{ font-size: 20px; font-weight: 500; margin-bottom: 4px; }}
-  .subtitle {{ font-size: 13px; color: #8e8e8e; margin-bottom: 20px; }}
-  .row-header {{ font-size: 15px; font-weight: 500; color: #d8d9da; padding: 10px 0 6px 4px;
-                 border-bottom: 1px solid #2a2a2e; margin: 16px 0 8px 0; cursor: pointer; user-select: none; }}
-  .row-header:hover {{ color: #fff; }}
+  body {{ background: var(--bg); color: var(--fg); font-family: Inter, -apple-system, sans-serif; padding: 16px;
+         transition: background .2s, color .2s; }}
+  h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 4px; }}
+  .subtitle {{ font-size: 13px; color: var(--fg3); margin-bottom: 20px; }}
+  .row-header {{ font-size: 15px; font-weight: 600; color: var(--fg); padding: 10px 0 6px 4px;
+                 border-bottom: 1px solid var(--border); margin: 16px 0 8px 0; cursor: pointer; user-select: none; }}
+  .row-header:hover {{ opacity: 0.8; }}
   .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
   .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 8px; }}
-  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 0;
+  .panel {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 0;
              overflow: hidden; resize: both; min-width: 400px; min-height: 300px; }}
   .panel::-webkit-resizable {{ background: transparent; }}
-  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; }}
+  .panel-title {{ font-size: 13px; font-weight: 600; padding: 8px 12px; color: var(--fg); }}
   .panel .plot {{ width: 100%; height: calc(100% - 36px); min-height: 250px; }}
   .panel .plot .nsewdrag {{ cursor: pointer !important; }}
-  .summary {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 16px; margin-bottom: 16px; overflow-x: auto; }}
+  .summary {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; overflow-x: auto; }}
   .summary table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 900px; }}
-  .summary th {{ text-align: left; padding: 6px 8px; color: #8e8e8e; border-bottom: 1px solid #2a2a2e; font-weight: 500;
+  .summary th {{ text-align: left; padding: 6px 8px; color: var(--fg3); border-bottom: 1px solid var(--border); font-weight: 600;
                  cursor: pointer; user-select: none; white-space: nowrap; }}
-  .summary th:hover {{ color: #d8d9da; }}
+  .summary th:hover {{ color: var(--fg); }}
   .chart-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }}
   @media (max-width: 1200px) {{ .chart-row {{ grid-template-columns: 1fr; }} }}
   .chart-col {{ display: flex; flex-direction: column; gap: 4px; }}
   .chart-col .panel {{ min-width: 0; }}
   .axis-controls {{ display: flex; gap: 10px; align-items: center; padding: 6px 4px; flex-wrap: wrap; }}
-  .axis-controls label {{ color: #8e8e8e; font-size: 12px; display: flex; align-items: center; gap: 4px; }}
-  .axis-controls select {{ background: #181b1f; color: #d8d9da; border: 1px solid #2a2a2e; border-radius: 4px;
+  .axis-controls label {{ color: var(--fg3); font-size: 12px; display: flex; align-items: center; gap: 4px; }}
+  .axis-controls select {{ background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border); border-radius: 4px;
                            padding: 4px 6px; font-size: 11px; font-family: inherit; max-width: 300px; }}
-  .summary td {{ padding: 6px 8px; border-bottom: 1px solid #1e1e22; }}
-  .summary tr:hover {{ background: #1e2127; }}
-  .highlight {{ color: #58a6ff; font-weight: 500; }}
+  .summary td {{ padding: 6px 8px; border-bottom: 1px solid var(--border2); }}
+  .summary tr:hover {{ background: var(--hover-bg); }}
+  .highlight {{ color: var(--highlight); font-weight: 600; }}
   .hidden {{ display: none; }}
+  .slo-fail {{ opacity: 0.25; text-decoration: line-through; }}
   .yaml-section {{ margin-bottom: 8px; }}
-  .yaml-toggle {{ background: none; border: 1px solid #2a2a2e; color: #8e8e8e; border-radius: 4px;
+  .yaml-toggle {{ background: none; border: 1px solid var(--border); color: var(--fg3); border-radius: 4px;
                    padding: 6px 14px; cursor: pointer; font-size: 12px; font-family: inherit; }}
-  .yaml-toggle:hover {{ color: #d8d9da; border-color: #3a3a3e; }}
-  .yaml-block {{ background: #0d1117; border: 1px solid #2a2a2e; border-radius: 4px; padding: 16px;
+  .yaml-toggle:hover {{ color: var(--fg); border-color: var(--fg3); }}
+  .yaml-block {{ background: var(--bg3); border: 1px solid var(--border); border-radius: 4px; padding: 16px;
                   margin-top: 8px; overflow-x: auto; display: none; }}
   .yaml-block.open {{ display: block; }}
   .yaml-block pre {{ font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: 12px;
-                      line-height: 1.5; color: #d8d9da; white-space: pre; margin: 0; }}
+                      line-height: 1.5; color: var(--fg); white-space: pre; margin: 0; }}
   .yaml-block .yk {{ color: #7ee787; }}
   .yaml-block .yv {{ color: #d2a8ff; }}
   .yaml-block .ys {{ color: #a5d6ff; }}
   .yaml-block .yc {{ color: #8b949e; font-style: italic; }}
   .yaml-block .yn {{ color: #79c0ff; }}
-  .side-panel {{ position: fixed; top: 0; right: 0; width: 55vw; height: 100vh; background: #111217;
-                 border-left: 2px solid #2a2a2e; z-index: 1000; transform: translateX(100%);
+  html.light .yaml-block .yk {{ color: #116329; }}
+  html.light .yaml-block .yv {{ color: #6f42c1; }}
+  html.light .yaml-block .ys {{ color: #0550ae; }}
+  html.light .yaml-block .yc {{ color: #6a737d; }}
+  html.light .yaml-block .yn {{ color: #0550ae; }}
+  .side-panel {{ position: fixed; top: 0; right: 0; width: 55vw; height: 100vh; background: var(--bg);
+                 border-left: 2px solid var(--border); z-index: 1000; transform: translateX(100%);
                  transition: transform .25s ease; display: flex; flex-direction: column; }}
   .side-panel.open {{ transform: translateX(0); }}
   .side-panel-header {{ display: flex; align-items: center; justify-content: space-between;
-                        padding: 10px 16px; border-bottom: 1px solid #2a2a2e; flex-shrink: 0; }}
-  .side-panel-header span {{ font-size: 14px; font-weight: 500; color: #d8d9da; }}
-  .side-panel-close {{ background: none; border: 1px solid #3a3a3e; color: #d8d9da; border-radius: 4px;
+                        padding: 10px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; }}
+  .side-panel-header span {{ font-size: 14px; font-weight: 600; color: var(--fg); }}
+  .side-panel-close {{ background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px;
                        padding: 4px 12px; cursor: pointer; font-size: 13px; }}
-  .side-panel-close:hover {{ background: #2a2a2e; }}
+  .side-panel-close:hover {{ background: var(--hover-bg); }}
   .side-panel iframe {{ flex: 1; border: none; width: 100%; }}
   .side-panel-resize {{ position: absolute; left: -4px; top: 0; width: 8px; height: 100%;
                         cursor: col-resize; z-index: 1001; }}
-  .side-overlay {{ position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 999;
+  .side-overlay {{ position: fixed; inset: 0; background: var(--overlay); z-index: 999;
                    display: none; cursor: pointer; }}
   .side-overlay.open {{ display: block; }}
+  .theme-toggle {{ background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px;
+                   padding: 5px 12px; cursor: pointer; font-size: 18px; line-height: 1; }}
+  .theme-toggle:hover {{ background: var(--hover-bg); }}
 </style>
 </head>
 <body>
-<h1>{model_label} Disaggregated Serving — Interactivity vs Throughput</h1>
-<div class="subtitle">vLLM {version_str} &middot; {len(configs)} deployment configs &middot; {len(sorted_conc)} concurrency levels</div>
+<div id="titleBar" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; padding:8px 0 12px; border-bottom:1px solid var(--border); margin-bottom:12px;">
+  <div>
+    <h1 style="margin:0">{model_label} Disaggregated Serving</h1>
+    <div class="subtitle" style="margin:0">vLLM {version_str}</div>
+  </div>
+  <div id="controlsBar" style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;"></div>
+</div>
 
 <div id="root"></div>
 <div class="side-overlay" id="overlay"></div>
@@ -581,19 +654,39 @@ def generate_html(configs, output_path, results_dir, metric_units):
 </div>
 
 <script>
-const LAYOUT_DEFAULTS = {{
-  paper_bgcolor: '#181b1f',
-  plot_bgcolor: '#181b1f',
-  font: {{ family: 'Inter, -apple-system, sans-serif', size: 12, color: '#d8d9da' }},
-  margin: {{ t: 40, r: 30, b: 60, l: 70 }},
-  xaxis: {{ gridcolor: '#2a2a2e', zerolinecolor: '#2a2a2e', linecolor: '#2a2a2e' }},
-  yaxis: {{ gridcolor: '#2a2a2e', zerolinecolor: '#2a2a2e', linecolor: '#2a2a2e' }},
-  legend: {{ bgcolor: 'rgba(0,0,0,0)', font: {{ size: 11 }} }},
-  hoverlabel: {{ bgcolor: '#23262b', bordercolor: '#3a3a3e', font: {{ size: 12, color: '#ffffff' }} }},
-  hovermode: 'closest',
+let isDark = true;
+const THEMES = {{
+  dark: {{
+    paper: '#181b1f', plot: '#181b1f', fg: '#ececec', fg2: '#c0c0c0', fg3: '#ffffff',
+    grid: '#242429', legend: 'rgba(0,0,0,0.35)', legendBorder: '#333',
+    hover: '#1a1d22', hoverBorder: '#555',
+  }},
+  light: {{
+    paper: '#ffffff', plot: '#ffffff', fg: '#1a1a1a', fg2: '#444', fg3: '#1a1a1a',
+    grid: '#e0e0e0', legend: 'rgba(255,255,255,0.85)', legendBorder: '#ccc',
+    hover: '#ffffff', hoverBorder: '#aaa',
+  }},
 }};
 
+function getLayoutDefaults() {{
+  const t = isDark ? THEMES.dark : THEMES.light;
+  return {{
+    paper_bgcolor: t.paper, plot_bgcolor: t.plot,
+    font: {{ family: 'Inter, -apple-system, sans-serif', size: 13, color: t.fg }},
+    margin: {{ t: 44, r: 30, b: 64, l: 76 }},
+    xaxis: {{ gridcolor: t.grid, zerolinecolor: t.grid, linecolor: t.grid, gridwidth: 1,
+              title: {{ font: {{ size: 13, color: t.fg3 }} }}, tickfont: {{ size: 12, color: t.fg2 }} }},
+    yaxis: {{ gridcolor: t.grid, zerolinecolor: t.grid, linecolor: t.grid, gridwidth: 1,
+              title: {{ font: {{ size: 13, color: t.fg3 }} }}, tickfont: {{ size: 12, color: t.fg2 }} }},
+    legend: {{ bgcolor: t.legend, font: {{ size: 12, color: t.fg }}, bordercolor: t.legendBorder, borderwidth: 1 }},
+    hoverlabel: {{ bgcolor: t.hover, bordercolor: t.hoverBorder, font: {{ size: 13, color: t.fg }} }},
+    hovermode: 'closest',
+  }};
+}}
+let LAYOUT_DEFAULTS = getLayoutDefaults();
+
 const COLORS = {json.dumps(color_map)};
+const SHAPES = {json.dumps(shape_map)};
 const CONFIGS = {json.dumps(configs_js)};
 const CONCURRENCIES = {json.dumps(conc_list_js)};
 const C_LABELS = {json.dumps(c_labels_js)};
@@ -727,6 +820,38 @@ function metricLabel(key) {{
 }}
 
 let gpuCostPerHour = 0;
+let sloTTFT = null;
+let sloTTFTStat = 'p99';
+let sloITL = null;
+let sloITLStat = 'p99';
+let sloTokGPU = null;
+let sloTokUser = null;
+let sloTokUserStat = 'avg';
+let maxConcurrency = null;
+
+function passesSLO(cfg, c) {{
+  if (maxConcurrency != null && C_LABELS[c] > maxConcurrency) return false;
+  const d = DATA[cfg]?.[c];
+  if (!d) return true;
+  const meta = CONFIGS[cfg];
+  if (sloTTFT != null) {{
+    const v = d.time_to_first_token?.[sloTTFTStat];
+    if (v != null && v / 1000 > sloTTFT) return false;
+  }}
+  if (sloITL != null) {{
+    const v = d.inter_token_latency?.[sloITLStat];
+    if (v != null && v > sloITL) return false;
+  }}
+  if (sloTokGPU != null) {{
+    const v = d.output_token_throughput?.avg;
+    if (v != null && v / meta.decodeGPUs < sloTokGPU) return false;
+  }}
+  if (sloTokUser != null) {{
+    const v = d.output_token_throughput_per_user?.[sloTokUserStat];
+    if (v != null && v < sloTokUser) return false;
+  }}
+  return true;
+}}
 
 function applyNorm(val, norm, meta) {{
   if (val == null) return null;
@@ -932,22 +1057,24 @@ function createChart(container, defaults) {{
       const validConcs = CONCURRENCIES.filter(c => DATA[cfg] && DATA[cfg][c]);
       return {{
         x: validConcs.map(c => {{
+          if (!passesSLO(cfg, c)) return null;
           const m = DATA[cfg][c][state.xMetric];
           return m ? applyNorm(m[state.xStat], state.xNorm, meta) : null;
         }}),
         y: validConcs.map(c => {{
+          if (!passesSLO(cfg, c)) return null;
           const m = DATA[cfg][c][state.yMetric];
           return m ? applyNorm(m[state.yStat], state.yNorm, meta) : null;
         }}),
-        text: validConcs.map(c => hoverText(cfg, c, DATA[cfg][c])),
+        text: validConcs.map(c => passesSLO(cfg, c) ? hoverText(cfg, c, DATA[cfg][c]) : ''),
         hoverinfo: 'text',
         mode: 'lines+markers+text',
         textposition: 'top center',
-        textfont: {{ size: 10, color: COLORS[cfg] }},
-        texttemplate: validConcs.map(c => `c${{C_LABELS[c]}}`),
+        textfont: {{ size: 11, color: COLORS[cfg], family: 'Inter, -apple-system, sans-serif', weight: 600 }},
+        texttemplate: validConcs.map(c => passesSLO(cfg, c) ? `c${{C_LABELS[c]}}` : ''),
         name: `${{meta.label}} (${{meta.decodeGPUs}} decode GPUs)`,
-        line: {{ color: COLORS[cfg], width: 2.5 }},
-        marker: {{ size: 10, color: COLORS[cfg] }},
+        line: {{ color: COLORS[cfg], width: 1.5 }},
+        marker: {{ size: 10, color: COLORS[cfg], symbol: SHAPES[cfg] || 'circle', line: {{ color: 'rgba(0,0,0,0.4)', width: 0.5 }} }},
       }};
     }});
   }}
@@ -994,16 +1121,6 @@ function createChart(container, defaults) {{
   return chart;
 }}
 
-// ── Top bar: hint + cost input ──
-const topBar = document.createElement('div');
-topBar.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:12px 4px 8px; flex-wrap:wrap; gap:8px;';
-const hint = document.createElement('span');
-hint.style.cssText = 'color:#ffffff; font-size:15px;';
-hint.textContent = 'Click any data point to open its Prometheus dashboard.';
-topBar.appendChild(hint);
-
-root.appendChild(topBar);
-
 // ── Charts: two side by side ──
 const chartRow = document.createElement('div');
 chartRow.className = 'chart-row';
@@ -1017,11 +1134,16 @@ chartRow.appendChild(chartCol1);
 chartRow.appendChild(chartCol2);
 
 createChart(chartCol1, {{ xMetric: 'output_token_throughput_per_user', yMetric: 'output_token_throughput', yNorm: 'decode' }});
-createChart(chartCol2, {{ xMetric: 'inter_token_latency', xStat: 'p99', yMetric: 'output_token_throughput', yNorm: 'decode' }});
+createChart(chartCol2, {{ xMetric: 'e2e_output_token_throughput', yMetric: 'output_token_throughput', yNorm: 'decode' }});
 
-// ── Cost input ──
+// ── Controls: cost + SLO filters (in title bar) ──
+const sloBar = document.getElementById('controlsBar');
+
+const inputStyle = 'background:var(--input-bg); color:var(--input-fg); border:1px solid var(--input-border); border-radius:4px; padding:6px 10px; font-size:15px; width:80px; font-family:inherit;';
+
+// Cost input
 const costWrap = document.createElement('label');
-costWrap.style.cssText = 'color:#8e8e8e; font-size:13px; display:flex; align-items:center; gap:6px; padding:12px 4px 4px;';
+costWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
 costWrap.textContent = '$/node/hr:';
 const costInput = document.createElement('input');
 costInput.type = 'number';
@@ -1029,7 +1151,7 @@ costInput.step = '0.01';
 costInput.min = '0';
 costInput.value = '21.68';
 costInput.placeholder = '21.68';
-costInput.style.cssText = 'background:#181b1f; color:#d8d9da; border:1px solid #2a2a2e; border-radius:4px; padding:4px 8px; font-size:12px; width:80px; font-family:inherit;';
+costInput.style.cssText = inputStyle + ' width:90px;';
 costInput.addEventListener('input', () => {{
   gpuCostPerHour = (parseFloat(costInput.value) || 0) / {GPUS_PER_NODE};
   allCharts.forEach(ch => {{
@@ -1038,16 +1160,119 @@ costInput.addEventListener('input', () => {{
 }});
 gpuCostPerHour = (parseFloat(costInput.value) || 0) / {GPUS_PER_NODE};
 costWrap.appendChild(costInput);
-root.appendChild(costWrap);
+sloBar.appendChild(costWrap);
+const selStyle = 'background:var(--input-bg); color:var(--input-fg); border:1px solid var(--input-border); border-radius:4px; padding:6px 8px; font-size:15px; font-family:inherit;';
 
-// ── Section 2: Sortable summary table ──
-const sec2Hdr = document.createElement('div');
-sec2Hdr.className = 'row-header';
-sec2Hdr.innerHTML = '<span class="arrow">&#9660;</span> Data Summary';
+function makeSLOStatSel(defaultVal) {{
+  const sel = document.createElement('select');
+  sel.style.cssText = selStyle;
+  ['p50','p90','p95','p99','avg','max'].forEach(s => {{
+    const o = document.createElement('option');
+    o.value = s; o.textContent = s;
+    sel.appendChild(o);
+  }});
+  sel.value = defaultVal;
+  return sel;
+}}
+
+// TTFT SLO
+const ttftWrap = document.createElement('label');
+ttftWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+ttftWrap.textContent = 'TTFT SLO (s):';
+const ttftStatSel = makeSLOStatSel('p99');
+const ttftInput = document.createElement('input');
+ttftInput.type = 'number'; ttftInput.step = '0.1'; ttftInput.min = '0';
+ttftInput.value = ''; ttftInput.placeholder = 'off';
+ttftInput.style.cssText = inputStyle;
+ttftWrap.appendChild(ttftStatSel);
+ttftWrap.appendChild(ttftInput);
+sloBar.appendChild(ttftWrap);
+
+// ITL SLO
+const itlWrap = document.createElement('label');
+itlWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+itlWrap.textContent = 'ITL SLO (ms):';
+const itlStatSel = makeSLOStatSel('p99');
+const itlInput = document.createElement('input');
+itlInput.type = 'number'; itlInput.step = '1'; itlInput.min = '0';
+itlInput.value = ''; itlInput.placeholder = 'off';
+itlInput.style.cssText = inputStyle;
+itlWrap.appendChild(itlStatSel);
+itlWrap.appendChild(itlInput);
+sloBar.appendChild(itlWrap);
+
+// tok/s/decode GPU SLO (minimum)
+const tokWrap = document.createElement('label');
+tokWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+tokWrap.textContent = 'Min tok/s/decode GPU:';
+const tokInput = document.createElement('input');
+tokInput.type = 'number'; tokInput.step = '1'; tokInput.min = '0';
+tokInput.value = ''; tokInput.placeholder = 'off';
+tokInput.style.cssText = inputStyle;
+tokWrap.appendChild(tokInput);
+sloBar.appendChild(tokWrap);
+
+// Min tok/s/user SLO
+const tokUserWrap = document.createElement('label');
+tokUserWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+tokUserWrap.textContent = 'Min tok/s/user:';
+const tokUserStatSel = makeSLOStatSel('avg');
+const tokUserInput = document.createElement('input');
+tokUserInput.type = 'number'; tokUserInput.step = '1'; tokUserInput.min = '0';
+tokUserInput.value = ''; tokUserInput.placeholder = 'off';
+tokUserInput.style.cssText = inputStyle;
+tokUserWrap.appendChild(tokUserStatSel);
+tokUserWrap.appendChild(tokUserInput);
+sloBar.appendChild(tokUserWrap);
+
+// Max concurrency filter
+const concWrap = document.createElement('label');
+concWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+concWrap.textContent = 'Max concurrency:';
+const concInput = document.createElement('input');
+concInput.type = 'number'; concInput.step = '1'; concInput.min = '1';
+concInput.value = ''; concInput.placeholder = 'all';
+concInput.style.cssText = inputStyle;
+concWrap.appendChild(concInput);
+sloBar.appendChild(concWrap);
+
+// Theme toggle
+const themeBtn = document.createElement('button');
+themeBtn.className = 'theme-toggle';
+themeBtn.textContent = '\\u263E';
+themeBtn.title = 'Toggle light/dark mode';
+themeBtn.addEventListener('click', () => {{
+  isDark = !isDark;
+  document.documentElement.classList.toggle('light', !isDark);
+  themeBtn.textContent = isDark ? '\\u263E' : '\\u2600';
+  LAYOUT_DEFAULTS = getLayoutDefaults();
+  allCharts.forEach(ch => ch.update());
+}});
+sloBar.appendChild(themeBtn);
+
+function applySLOFilter() {{
+  sloTTFT = parseFloat(ttftInput.value) || null;
+  sloTTFTStat = ttftStatSel.value;
+  sloITL = parseFloat(itlInput.value) || null;
+  sloITLStat = itlStatSel.value;
+  sloTokGPU = parseFloat(tokInput.value) || null;
+  sloTokUser = parseFloat(tokUserInput.value) || null;
+  sloTokUserStat = tokUserStatSel.value;
+  maxConcurrency = parseFloat(concInput.value) || null;
+  allCharts.forEach(ch => ch.update());
+  document.querySelectorAll('tr[data-cfg]').forEach(tr => {{
+    const cfg = tr.dataset.cfg;
+    const c = tr.dataset.conc;
+    tr.classList.toggle('slo-fail', !passesSLO(cfg, c));
+  }});
+}}
+
+[ttftInput, itlInput, tokInput, tokUserInput, concInput].forEach(el => el.addEventListener('input', applySLOFilter));
+[ttftStatSel, itlStatSel, tokUserStatSel].forEach(el => el.addEventListener('change', applySLOFilter));
+
+// ── Section 2: Summary table ──
 const sec2Wrap = document.createElement('div');
 sec2Wrap.id = 'sec-table';
-sec2Hdr.addEventListener('click', () => {{ sec2Hdr.classList.toggle('collapsed'); sec2Wrap.classList.toggle('hidden'); }});
-root.appendChild(sec2Hdr);
 root.appendChild(sec2Wrap);
 
 (function() {{
@@ -1060,7 +1285,7 @@ root.appendChild(sec2Wrap);
   table.appendChild(tbody);
 
   const colDefs = [
-    'Config', 'Concurrency', 'Decode GPUs', 'KV Cache Prefill', 'KV Cache Decode', 'Output tok/s', 'tok/s/GPU',
+    'Config', 'Concurrency', 'Errors', 'Decode GPUs', 'KV Cache Prefill', 'KV Cache Decode', 'Input tok/s', 'Output tok/s', 'tok/s/GPU',
     'ITL p50 (ms)', 'ITL p99 (ms)', 'Per-user tok/s',
     'TTFT avg (s)', 'TTFT p50 (s)', 'TTFT p99 (s)', 'TTFT min (s)', 'TTFT max (s)',
     '$/M input', '$/M output', '$/M total',
@@ -1098,10 +1323,13 @@ root.appendChild(sec2Wrap);
       const kvPrefill = d._kv_cache_prefill;
       const kvDecode = d._kv_cache_decode;
 
+      const errCount = d._error_count || 0;
+
       const vals = [
-        meta.label, C_LABELS[c], meta.decodeGPUs,
+        meta.label, C_LABELS[c], errCount, meta.decodeGPUs,
         kvPrefill != null ? kvPrefill.toLocaleString() : '-',
         kvDecode != null ? kvDecode.toLocaleString() : '-',
+        inp?.avg?.toFixed(1) ?? '-',
         out?.avg?.toFixed(1) ?? '-', norm,
         itl?.p50?.toFixed(1) ?? '-', itl?.p99?.toFixed(1) ?? '-',
         otpu?.avg?.toFixed(1) ?? '-',
@@ -1116,7 +1344,8 @@ root.appendChild(sec2Wrap);
         const td = document.createElement('td');
         td.textContent = v;
         if (i === 0) {{ td.style.color = COLORS[cfg]; td.style.fontWeight = '500'; }}
-        if (i === 6) td.className = 'highlight';
+        if (i === 2 && errCount > 0) {{ td.style.color = '#f44336'; td.style.fontWeight = '600'; }}
+        if (i === 8) td.className = 'highlight';
         tr.appendChild(td);
       }});
 
@@ -1187,26 +1416,45 @@ root.appendChild(sec2Wrap);
 
 def main():
     if len(sys.argv) > 1:
-        results_dir = sys.argv[1]
+        results_dirs = sys.argv[1:]
     else:
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
+        results_dirs = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')]
 
-    if not os.path.isdir(results_dir):
-        print(f"Error: {results_dir} not found", file=sys.stderr)
+    all_configs = {}
+    all_metric_units = {}
+    first_results_dir = results_dirs[0]
+    multi = len(results_dirs) > 1
+
+    for results_dir in results_dirs:
+        if not os.path.isdir(results_dir):
+            print(f"Warning: {results_dir} not found, skipping", file=sys.stderr)
+            continue
+        configs, metric_units = discover_configs(results_dir)
+        if not configs:
+            print(f"Warning: no configs found in {results_dir}, skipping", file=sys.stderr)
+            continue
+        all_metric_units.update(metric_units)
+        folder_name = os.path.basename(os.path.abspath(results_dir))
+        for cfg, meta in configs.items():
+            if multi:
+                key = f'{folder_name}/{cfg}'
+                meta['label'] = f'[{folder_name}] {meta["label"]}'
+            else:
+                key = cfg
+            meta['_results_dir'] = os.path.abspath(results_dir)
+            all_configs[key] = meta
+
+    if not all_configs:
+        print("Error: no configs discovered in any directory", file=sys.stderr)
         sys.exit(1)
 
-    configs, metric_units = discover_configs(results_dir)
-    if not configs:
-        print(f"Error: no results_p<R>w<W>_d<R>w<W>/ directories found in {results_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    output_dir = os.path.dirname(os.path.abspath(results_dir))
+    output_dir = os.path.dirname(os.path.abspath(first_results_dir))
     output_path = os.path.join(output_dir, 'interactivity_vs_throughput.html')
 
-    generate_html(configs, output_path, results_dir, metric_units)
+    generate_html(all_configs, output_path, first_results_dir, all_metric_units)
 
-    print(f"Discovered {len(configs)} configs:")
-    for cfg, meta in sorted(configs.items()):
+    print(f"Discovered {len(all_configs)} configs:")
+    for cfg, meta in sorted(all_configs.items()):
         concs = sorted(meta['runs'].keys())
         print(f"  {cfg}: {meta['label']} ({meta['decode_gpus']} decode GPUs) — c{',c'.join(str(c) for c in concs)}")
     print(f"\nGenerated: {output_path}")
