@@ -13,7 +13,8 @@ set export
 #   just logs / just shell # inspect the orchestrator
 #   just clean             # delete benchmark Jobs and the orchestrator
 
-NAMESPACE := env_var_or_default('NAMESPACE', 'vllm')
+_ns_default := if env_var_or_default('FIXED_NS', '') != '' { env_var_or_default('FIXED_NS', '') } else { 'vllm' }
+NAMESPACE := env_var_or_default('NAMESPACE', _ns_default)
 deploy    := env_var_or_default('DEPLOY', 'aiperf-agentx')
 repo_root := justfile_directory()
 home := env_var_or_default('HOME', '')
@@ -36,7 +37,7 @@ seed_image := env_var_or_default('SEED_IMAGE', 'quay.io/tms/benchmark-seed:amd64
 seed_deploy := env_var_or_default('SEED_DEPLOY', 'benchmark-seed')
 model     := env_var_or_default('MODEL', 'zai-org/GLM-5.2-FP8')
 model_label := env_var_or_default('MODEL_LABEL', 'GLM-5.2-FP8')
-max_context_length := env_var_or_default('MAX_CONTEXT_LENGTH', '128000')
+max_context_length := env_var_or_default('MAX_CONTEXT_LENGTH', '10000000')
 url       := env_var_or_default('URL', 'http://llm-d-inference-gateway-istio:80/v1')
 server_metrics_url := env_var_or_default('SERVER_METRICS_URL', '')
 gpu_telemetry_urls := env_var_or_default('GPU_TELEMETRY_URLS', '')
@@ -50,11 +51,12 @@ grafana_namespace := env_var_or_default('GRAFANA_NAMESPACE', monitoring_namespac
 grafana_service := env_var_or_default('GRAFANA_SERVICE', 'grafana')
 concurrency := "64"
 duration    := "900"
-sweep_concurrencies := env_var_or_default('SWEEP_CONCURRENCIES', '32 64 128 256')
+sweep_concurrencies := env_var_or_default('SWEEP_CONCURRENCIES', '16 32 64 128')
 
 llm_d_root := env_var('LLM_D_ROOT')
 llm_d_repo := env_var_or_default('LLM_D_REPO', 'https://github.com/elvircrn/llm-d.git')
-llm_d_branch := env_var_or_default('LLM_D_BRANCH', 'wip-glm')
+llm_d_branch := env_var_or_default('LLM_D_BRANCH', 'wip-glm-blog')
+fixed_ns := env_var_or_default('FIXED_NS', '')
 
 default:
     @just --list
@@ -123,11 +125,11 @@ _run-job concurrency duration dest unsafe_args attempt:
     TMP=$(mktemp)
     trap "rm -f $TMP" EXIT
     if kubectl api-resources --api-group=kueue.x-k8s.io 2>/dev/null | grep -q localqueue; then
-      HAS_KUEUE=true
       SUSPEND="true"
+      KUEUE_LABEL=$'\n    kueue.x-k8s.io/queue-name: {{kueue_queue}}'
     else
-      HAS_KUEUE=false
       SUSPEND="false"
+      KUEUE_LABEL=""
     fi
     cat > "$TMP" <<EOF
     apiVersion: batch/v1
@@ -135,7 +137,7 @@ _run-job concurrency duration dest unsafe_args attempt:
     metadata:
       name: ${JOB}
       labels:
-        app: agentx-aiperf
+        app: agentx-aiperf${KUEUE_LABEL}
     spec:
       suspend: ${SUSPEND}
       backoffLimit: 0
@@ -242,9 +244,6 @@ _run-job concurrency duration dest unsafe_args attempt:
               persistentVolumeClaim:
                 claimName: {{lustre_claim}}
     EOF
-    if $HAS_KUEUE; then
-      sed -i'' '/app: agentx-aiperf/a\        kueue.x-k8s.io/queue-name: {{kueue_queue}}' "$TMP"
-    fi
     kubectl apply -n "$NS" -f "$TMP"
     echo "Benchmark job submitted: $JOB"
     echo "Attempt artifacts: $ARTIFACT_DIR"
@@ -885,6 +884,247 @@ setup-namespace ns:
     kubectl rollout status deploy/{{deploy}} -n {{ns}} --timeout=300s
     echo "=== Namespace {{ns}} ready ==="
 
+# Like setup-namespace but for clusters where you can't create namespaces or cluster-scoped RBAC.
+# Skips: namespace creation, ClusterRole/ClusterRoleBinding for dcgm-exporter scraping.
+setup-fixed-namespace ns:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT={{llm_d_root}}
+    echo "=== Setting up fixed namespace {{ns}} ==="
+    # RBAC for prometheus and grafana sidecars
+    kubectl apply -n {{ns}} -f - <<'RBACEOF'
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: prometheus-server
+    rules:
+    - apiGroups: [""]
+      resources: [pods, services, endpoints]
+      verbs: [get, list, watch]
+    - apiGroups: [""]
+      resources: [configmaps]
+      verbs: [get]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: prometheus-server
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: prometheus-server
+    subjects:
+    - kind: ServiceAccount
+      name: prometheus-server
+      namespace: {{ns}}
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: grafana-sidecar
+    rules:
+    - apiGroups: [""]
+      resources: [configmaps, secrets]
+      verbs: [get, list, watch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: grafana-sidecar
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: grafana-sidecar
+    subjects:
+    - kind: ServiceAccount
+      name: grafana
+      namespace: {{ns}}
+    RBACEOF
+    kubectl create secret generic llm-d-hf-token --from-literal=HF_TOKEN=dummy -n {{ns}} --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -n {{ns}} -f kueue/local-queue.yaml 2>/dev/null || echo "Kueue CRDs not installed, skipping local queue"
+    kubectl apply -n {{ns}} -f - <<'PVCEOF'
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: {{lustre_claim}}
+    spec:
+      accessModes:
+      - ReadWriteMany
+      resources:
+        requests:
+          storage: 20Gi
+      storageClassName: shared-vast
+    PVCEOF
+    kubectl apply -n {{ns}} -f "$ROOT/guides/wide-ep-lws/modelserver/gpu/vllm-glm-5.2/base/serviceAccount.yaml"
+    kubectl kustomize "$ROOT/guides/recipes/gateway/istio/" | kubectl apply -n {{ns}} -f -
+    kubectl apply -n {{ns}} -f - <<EOF
+    apiVersion: inference.networking.x-k8s.io/v1alpha2
+    kind: InferenceModel
+    metadata:
+      name: glm-5-2-fp8
+    spec:
+      criticality: Critical
+      modelName: zai-org/GLM-5.2-FP8
+      poolRef:
+        name: wide-ep-lws
+    EOF
+    helm upgrade --install prometheus prometheus-community/prometheus \
+      -n {{ns}} --version 29.13.0 \
+      --set alertmanager.enabled=false \
+      --set kube-state-metrics.enabled=false \
+      --set prometheus-node-exporter.enabled=false \
+      --set prometheus-pushgateway.enabled=false \
+      --set rbac.create=false \
+      --set server.persistentVolume.enabled=false \
+      --set 'server.extraFlags[0]=web.enable-admin-api' \
+      --set 'server.extraFlags[1]=web.enable-lifecycle' \
+      --set serviceAccounts.server.create=true \
+      --set serviceAccounts.server.name=prometheus-server \
+      --set 'server.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/arch' \
+      --set 'server.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In' \
+      --set 'server.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=amd64' \
+      -f - <<PROMEOF
+    extraScrapeConfigs: |
+      - job_name: 'vllm-decode'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ns}}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_role]
+            regex: decode
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            regex: vllm
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            regex: '820[0-7]'
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_model]
+            target_label: model
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            target_label: rank
+        scrape_interval: 1s
+        metrics_path: /metrics
+      - job_name: 'vllm-prefill'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ns}}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_role]
+            regex: prefill
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            regex: vllm
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            regex: '800[0-7]'
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_model]
+            target_label: model
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            target_label: rank
+        scrape_interval: 1s
+        metrics_path: /metrics
+      - job_name: 'epp'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ns}}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_router_gateway]
+            regex: .+
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: '\${1}:9090'
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_router_gateway]
+            target_label: inferencepool
+        scrape_interval: 1s
+        metrics_path: /metrics
+      - job_name: 'node-exporter'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ns}}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            regex: node-exporter
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            regex: '9100'
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_role]
+            target_label: role
+        scrape_interval: 5s
+        metrics_path: /metrics
+    PROMEOF
+    helm upgrade --install grafana grafana/grafana \
+      -n {{ns}} --version 10.5.15 \
+      --set adminPassword=admin \
+      --set persistence.enabled=false \
+      --set rbac.create=false \
+      --set sidecar.dashboards.enabled=true \
+      --set sidecar.dashboards.label=grafana_dashboard \
+      --set sidecar.dashboards.searchNamespace={{ns}} \
+      --set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/arch' \
+      --set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In' \
+      --set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=amd64' \
+      -f - <<GRAFEOF
+    datasources:
+      datasources.yaml:
+        apiVersion: 1
+        datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://prometheus-server.{{ns}}.svc.cluster.local
+          access: proxy
+          isDefault: true
+    GRAFEOF
+    kubectl create configmap wideep-overview-dashboard \
+        --from-file=wideep-overview.json=dashboards/grafana-wideep-overview.json \
+        -n {{ns}} --dry-run=client -o yaml \
+      | kubectl label --local -f - grafana_dashboard=1 -o yaml \
+      | kubectl apply -f -
+    kubectl create configmap aggregate-overview-dashboard \
+        --from-file=aggregate-overview.json=dashboards/grafana-aggregate.json \
+        -n {{ns}} --dry-run=client -o yaml \
+      | kubectl label --local -f - grafana_dashboard=1 -o yaml \
+      | kubectl apply -f -
+    kubectl apply -f agentx.yaml -n {{ns}}
+    kubectl rollout status deploy/{{deploy}} -n {{ns}} --timeout=300s
+    echo "=== Fixed namespace {{ns}} ready ==="
+
+# Tear down workloads in a fixed namespace without deleting the namespace itself.
+teardown-fixed-namespace ns:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Cleaning up fixed namespace {{ns}} ==="
+    kubectl delete lws wide-ep-lws-nvidia-gpu-vllm-glm-5-2-prefill wide-ep-lws-nvidia-gpu-vllm-glm-5-2-decode -n {{ns}} --ignore-not-found 2>/dev/null || true
+    helm uninstall wide-ep-lws -n {{ns}} 2>/dev/null || true
+    helm uninstall prometheus -n {{ns}} 2>/dev/null || true
+    helm uninstall grafana -n {{ns}} 2>/dev/null || true
+    echo "=== Fixed namespace {{ns}} cleaned up (namespace preserved) ==="
+
 _manifesto-info:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1276,7 +1516,12 @@ seed-build:
 seed-deploy:
     #!/usr/bin/env bash
     set -euo pipefail
-    sed "s/NAMESPACE_PLACEHOLDER/{{NAMESPACE}}/" seed.yaml | kubectl apply -n {{NAMESPACE}} -f -
+    if [ -n "{{fixed_ns}}" ]; then
+      echo "Fixed-NS mode: using namespaced RoleBinding (no cluster-admin)"
+      sed "s/NAMESPACE_PLACEHOLDER/{{NAMESPACE}}/" seed-fixed-ns.yaml | kubectl apply -n {{NAMESPACE}} -f -
+    else
+      sed "s/NAMESPACE_PLACEHOLDER/{{NAMESPACE}}/" seed.yaml | kubectl apply -n {{NAMESPACE}} -f -
+    fi
     kubectl rollout status deploy/{{seed_deploy}} -n {{NAMESPACE}} --timeout=300s
     POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{seed_deploy}} -o jsonpath='{.items[0].metadata.name}')
     echo "Adding helm repos..."
@@ -1358,7 +1603,12 @@ seed-sequential outdir configs:
     OUTDIR="{{outdir}}"
     CONFIGS="{{configs}}"
     TMPSCRIPT=$(mktemp)
-    printf '#!/bin/bash\ncd /workspace/agentx-mvp\nfor cfg in %s; do\n  IFS=: read -r PR PW DR DW <<< "$cfg"\n  NS=ecrncevi-dev-p${PR}w${PW}d${DR}w${DW}\n  echo "====== Sequential: ${cfg} in $NS ======"\n  if ! NAMESPACE="$NS" just setup-namespace "$NS"; then\n    echo "FAILED: setup for ${cfg}, skipping"\n    NAMESPACE="$NS" just teardown-namespace "$NS" 2>/dev/null || true\n    continue\n  fi\n  sed -i "s/^NAMESPACE=.*/NAMESPACE=$NS/" /workspace/agentx-mvp/.env\n  just sweep "%s" "${cfg}" || echo "FAILED: sweep for ${cfg}"\n  just snapshot-prometheus "$NS" "%s/results_p${PR}w${PW}_d${DR}w${DW}" || echo "WARNING: snapshot failed for ${cfg}"\n  NAMESPACE="$NS" just teardown-namespace "$NS"\ndone\n' "$CONFIGS" "$OUTDIR" "$OUTDIR" > "$TMPSCRIPT"
+    FIXED_NS="{{fixed_ns}}"
+    if [ -n "$FIXED_NS" ]; then
+      printf '#!/bin/bash\nset -euo pipefail\ncd /workspace/agentx-mvp\nFIXED_NS=%s\necho "====== Setting up fixed namespace $FIXED_NS ======"\nNAMESPACE="$FIXED_NS" just setup-fixed-namespace "$FIXED_NS" || { echo "FAILED: setup-fixed-namespace"; exit 1; }\nfor cfg in %s; do\n  IFS=: read -r PR PW DR DW <<< "$cfg"\n  echo "====== Sequential: ${cfg} in $FIXED_NS (fixed) ======"\n  sed -i "s/^NAMESPACE=.*/NAMESPACE=$FIXED_NS/" /workspace/agentx-mvp/.env\n  NAMESPACE="$FIXED_NS" just sweep "%s" "${cfg}" || echo "FAILED: sweep for ${cfg}"\n  NAMESPACE="$FIXED_NS" just snapshot-prometheus "$FIXED_NS" "%s/results_p${PR}w${PW}_d${DR}w${DW}" || echo "WARNING: snapshot failed for ${cfg}"\n  NAMESPACE="$FIXED_NS" just stop-pd 2>/dev/null || true\ndone\necho "====== Tearing down fixed namespace $FIXED_NS ======"\nNAMESPACE="$FIXED_NS" just teardown-fixed-namespace "$FIXED_NS" 2>/dev/null || true\n' "$FIXED_NS" "$CONFIGS" "$OUTDIR" "$OUTDIR" > "$TMPSCRIPT"
+    else
+      printf '#!/bin/bash\ncd /workspace/agentx-mvp\nfor cfg in %s; do\n  IFS=: read -r PR PW DR DW <<< "$cfg"\n  NS=ecrncevi-dev-p${PR}w${PW}d${DR}w${DW}\n  echo "====== Sequential: ${cfg} in $NS ======"\n  if ! NAMESPACE="$NS" just setup-namespace "$NS"; then\n    echo "FAILED: setup for ${cfg}, skipping"\n    NAMESPACE="$NS" just teardown-namespace "$NS" 2>/dev/null || true\n    continue\n  fi\n  sed -i "s/^NAMESPACE=.*/NAMESPACE=$NS/" /workspace/agentx-mvp/.env\n  just sweep "%s" "${cfg}" || echo "FAILED: sweep for ${cfg}"\n  just snapshot-prometheus "$NS" "%s/results_p${PR}w${PW}_d${DR}w${DW}" || echo "WARNING: snapshot failed for ${cfg}"\n  NAMESPACE="$NS" just teardown-namespace "$NS"\ndone\n' "$CONFIGS" "$OUTDIR" "$OUTDIR" > "$TMPSCRIPT"
+    fi
     kubectl cp "$TMPSCRIPT" "$NS/${POD}:/workspace/run_seed.sh"
     rm -f "$TMPSCRIPT"
     kubectl exec -n "$NS" "$POD" -- chmod +x /workspace/run_seed.sh
@@ -1447,6 +1697,10 @@ seed-clean:
     #!/usr/bin/env bash
     set -euo pipefail
     kubectl delete deploy {{seed_deploy}} -n {{NAMESPACE}} --ignore-not-found
-    kubectl delete clusterrolebinding benchmark-orchestrator --ignore-not-found
+    if [ -z "{{fixed_ns}}" ]; then
+      kubectl delete clusterrolebinding benchmark-orchestrator --ignore-not-found
+    else
+      kubectl delete rolebinding benchmark-orchestrator -n {{NAMESPACE}} --ignore-not-found
+    fi
     kubectl delete sa benchmark-orchestrator -n {{NAMESPACE}} --ignore-not-found
     echo "Orchestrator pod cleaned up."

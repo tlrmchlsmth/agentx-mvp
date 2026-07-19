@@ -366,6 +366,143 @@ def highlight_yaml(text):
     return '\n'.join(out)
 
 
+DASHBOARD_AGG_INLINE = r"""
+// ── Aggregation dropdown injection ──
+(function() {
+  function _isLight() { return document.documentElement.classList.contains('light'); }
+  function _tFg() { return _isLight() ? '#333' : '#8e8e8e'; }
+  function _tGrid() { return _isLight() ? '#ddd' : '#2a2a2e'; }
+  function _selStyle() {
+    return _isLight()
+      ? 'float:right;background:#f5f5f5;color:#222;border:1px solid #ccc;border-radius:3px;padding:2px 6px;font-size:11px;cursor:pointer;'
+      : 'float:right;background:#111;color:#ccc;border:1px solid #2a2a2e;border-radius:3px;padding:2px 6px;font-size:11px;cursor:pointer;';
+  }
+  const _origRenderPanel = renderPanel;
+
+  function _aggSeries(allSeries, mode) {
+    const tsMap = new Map();
+    allSeries.forEach(function(x) {
+      x.s.values.forEach(function(v) {
+        const val = parseFloat(v[1]);
+        if (isNaN(val)) return;
+        if (!tsMap.has(v[0])) tsMap.set(v[0], []);
+        tsMap.get(v[0]).push(val);
+      });
+    });
+    const sorted = Array.from(tsMap.entries()).sort(function(a, b) { return a[0] - b[0]; });
+    return {
+      x: sorted.map(function(e) { return new Date(e[0] * 1000); }),
+      y: sorted.map(function(e) {
+        var vals = e[1].slice().sort(function(a, b) { return a - b; });
+        var s = vals.reduce(function(a, b) { return a + b; }, 0);
+        if (mode === 'sum') return s;
+        if (mode === 'avg') return s / vals.length;
+        if (mode === 'min') return vals[0];
+        if (mode === 'max') return vals[vals.length - 1];
+        var mid = Math.floor(vals.length / 2);
+        return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+      }),
+    };
+  }
+
+  function _replotPanel(div, mode, filter) {
+    var p = div._panelData;
+    var plotDiv = div.querySelector('.plot');
+    if (!plotDiv || !p) return;
+    var allSeries = p.queries.flatMap(function(q) { return q.series.map(function(s) { return {q:q, s:s}; }); });
+    var hasSeries = allSeries.filter(function(x) { return x.s.values.length > 0; });
+    if (filter && filter !== 'all') {
+      hasSeries = hasSeries.filter(function(x) {
+        var lbl = seriesLabel(x.q, x.s).toLowerCase();
+        return lbl.indexOf(filter) !== -1;
+      });
+    }
+    if (!hasSeries.length) return;
+
+    var traces;
+    if (mode === 'all') {
+      traces = hasSeries.map(function(x, i) {
+        return {
+          x: x.s.values.map(function(v) { return new Date(v[0] * 1000); }),
+          y: x.s.values.map(function(v) { return parseFloat(v[1]); }),
+          name: seriesLabel(x.q, x.s),
+          type: 'scatter', mode: 'lines',
+          line: { width: 1.5, color: COLORS[i % COLORS.length] },
+          hovertemplate: '%{y}<extra>%{fullData.name}</extra>',
+        };
+      });
+    } else {
+      var agg = _aggSeries(hasSeries, mode);
+      traces = [{
+        x: agg.x, y: agg.y,
+        name: {sum:'Sum',avg:'Average',min:'Min',max:'Max',median:'Median'}[mode],
+        type: 'scatter', mode: 'lines',
+        line: { width: 2, color: '#58a6ff' },
+        hovertemplate: '%{y}<extra>' + {sum:'Sum',avg:'Avg',min:'Min',max:'Max',median:'Median'}[mode] + '</extra>',
+      }];
+    }
+    var fmt = (typeof UNIT_FMT !== 'undefined') ? UNIT_FMT[p.unit] : undefined;
+    var yTitle = ((typeof UNIT_LABEL !== 'undefined') ? UNIT_LABEL[p.unit] : '') || p.unit || '';
+    Plotly.react(plotDiv, traces, {
+      margin: { l: 58, r: 16, t: 4, b: 30 },
+      paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+      font: { color: _tFg(), size: 10 },
+      xaxis: { gridcolor: _tGrid(), linecolor: _tGrid(), tickformat: '%H:%M' },
+      yaxis: { gridcolor: _tGrid(), linecolor: _tGrid(),
+               title: yTitle ? { text: yTitle, font: { size: 10 } } : undefined,
+               tickformat: fmt ? undefined : '.3s', hoverformat: '.4g' },
+      legend: { font: { size: 9 }, orientation: 'h', y: -0.3 },
+      showlegend: traces.length > 1,
+      hovermode: 'x unified',
+    }, { responsive: true, displayModeBar: false });
+  }
+
+  renderPanel = function(container, p) {
+    _origRenderPanel(container, p);
+    var div = container.lastElementChild;
+    if (!div || !div._panelData) return;
+    var titleEl = div.querySelector('.panel-title');
+    if (!titleEl) return;
+    var sel = document.createElement('select');
+    sel.style.cssText = _selStyle();
+    [['all','All Series'],['sum','Sum'],['avg','Average'],['min','Min'],['max','Max'],['median','Median']].forEach(function(pair) {
+      var o = document.createElement('option');
+      o.value = pair[0];
+      o.textContent = pair[1];
+      sel.appendChild(o);
+    });
+    var filterSel = document.createElement('select');
+    filterSel.style.cssText = _selStyle() + 'margin-right:4px;';
+    [['all','All Engines'],['prefill','Prefill Only'],['decode','Decode Only']].forEach(function(pair) {
+      var o = document.createElement('option');
+      o.value = pair[0];
+      o.textContent = pair[1];
+      filterSel.appendChild(o);
+    });
+    sel.addEventListener('change', function() { _replotPanel(div, sel.value, filterSel.value); });
+    filterSel.addEventListener('change', function() { _replotPanel(div, sel.value, filterSel.value); });
+    titleEl.appendChild(filterSel);
+    titleEl.appendChild(sel);
+  };
+})();
+"""
+
+DASHBOARD_AGG_INLINE_WRAPPED = '<script>' + DASHBOARD_AGG_INLINE + '</script>'
+
+
+def inject_dashboard_aggregation(content):
+    if isinstance(content, bytes):
+        text = content.decode('utf-8', errors='replace')
+    else:
+        text = content
+    inject_target = 'if (rows.length === 0) {'
+    if inject_target in text:
+        text = text.replace(inject_target, DASHBOARD_AGG_INLINE + '\n' + inject_target, 1)
+    else:
+        text = text.replace('</body>', DASHBOARD_AGG_INLINE_WRAPPED + '\n</body>', 1)
+    return text.encode('utf-8') if isinstance(content, bytes) else text
+
+
 def generate_html(configs, output_path, results_dir, metric_units):
     model_label = read_model_label(results_dir)
     color_map = {}
@@ -513,7 +650,9 @@ def generate_html(configs, output_path, results_dir, metric_units):
             dash_path = os.path.join(cfg_results_dir, f'results_{raw_cfg}', f'results_{raw_cfg}_{key}', 'dashboard.html')
             if os.path.isfile(dash_path):
                 with open(dash_path, 'rb') as df:
-                    embedded_dashboards[f'{cfg}_{key}'] = base64.b64encode(df.read()).decode('ascii')
+                    content = df.read()
+                content = inject_dashboard_aggregation(content)
+                embedded_dashboards[f'{cfg}_{key}'] = base64.b64encode(content).decode('ascii')
 
     yaml_parts = []
     configs_with_yamls = {cfg: meta for cfg, meta in sorted(configs.items()) if meta.get('yamls')}
@@ -673,7 +812,7 @@ function getLayoutDefaults() {{
   return {{
     paper_bgcolor: t.paper, plot_bgcolor: t.plot,
     font: {{ family: 'Inter, -apple-system, sans-serif', size: 13, color: t.fg }},
-    margin: {{ t: 44, r: 30, b: 64, l: 76 }},
+    margin: {{ t: 44, r: 30, b: 120, l: 76 }},
     xaxis: {{ gridcolor: t.grid, zerolinecolor: t.grid, linecolor: t.grid, gridwidth: 1,
               title: {{ font: {{ size: 13, color: t.fg3 }} }}, tickfont: {{ size: 12, color: t.fg2 }} }},
     yaxis: {{ gridcolor: t.grid, zerolinecolor: t.grid, linecolor: t.grid, gridwidth: 1,
@@ -729,10 +868,8 @@ function openDashboard(cfg, conc) {{
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     blobCache[key] = URL.createObjectURL(new Blob([bytes], {{ type: 'text/html;charset=utf-8' }}));
   }}
-  sidePanelTitle.textContent = `${{CONFIGS[cfg].label}} @ c${{C_LABELS[conc]}} — Dashboard`;
-  sidePanelFrame.src = blobCache[key];
-  sidePanel.classList.add('open');
-  overlay.classList.add('open');
+  const title = `${{CONFIGS[cfg].label}} @ c${{C_LABELS[conc]}}`;
+  window.open(blobCache[key], '_blank', 'width=1200,height=800,menubar=no,toolbar=no');
 }}
 
 function closeDashboard() {{
@@ -984,7 +1121,7 @@ function createChart(container, defaults) {{
   // X row
   const xDiv = document.createElement('div');
   xDiv.className = 'axis-controls';
-  xDiv.style.borderBottom = '1px solid #2a2a2e';
+  xDiv.style.borderBottom = '1px solid var(--border)';
   function mkSelIn(parent, label, options, value, onChange) {{
     const lbl = document.createElement('label');
     lbl.textContent = label;
@@ -1084,10 +1221,10 @@ function createChart(container, defaults) {{
     if (!state.yNorm.startsWith('cost')) yAxis.rangemode = 'tozero';
     return {{
       ...LAYOUT_DEFAULTS,
-      title: {{ text: `${{metricLabel(state.yMetric)}} vs ${{metricLabel(state.xMetric)}}`, font: {{ size: 13, color: '#d8d9da' }} }},
+      title: {{ text: `${{metricLabel(state.yMetric)}} vs ${{metricLabel(state.xMetric)}}`, font: {{ size: 13, color: LAYOUT_DEFAULTS.font.color }} }},
       xaxis: {{ ...LAYOUT_DEFAULTS.xaxis, title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 11 }} }} }},
       yaxis: yAxis,
-      legend: {{ ...LAYOUT_DEFAULTS.legend, x: 0.99, y: 0.99, xanchor: 'right', yanchor: 'top' }},
+      legend: {{ ...LAYOUT_DEFAULTS.legend, orientation: 'h', x: 0.5, y: -0.15, xanchor: 'center', yanchor: 'top' }},
     }};
   }}
 
@@ -1104,7 +1241,42 @@ function createChart(container, defaults) {{
   Plotly.newPlot(state.el, buildTraces(), getLayout(), {{ responsive: true, edits: {{ legendPosition: true }} }});
   attachClickHandler(state.el);
 
-  // Legend sync → table
+  // Filter buttons
+  const btnBar = document.createElement('div');
+  btnBar.style.cssText = 'display:flex;gap:6px;margin:4px 0;';
+  const btnStyle = 'background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-border);border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;font-family:inherit;';
+
+  const keepSelBtn = document.createElement('button');
+  keepSelBtn.textContent = 'Keep Selected Only';
+  keepSelBtn.style.cssText = btnStyle;
+  keepSelBtn.addEventListener('click', () => {{
+    const showlegend = state.el.data.map(t => t.visible !== 'legendonly' && t.visible !== false);
+    Plotly.restyle(state.el, {{ showlegend }});
+    showAllBtn.style.display = '';
+  }});
+
+  const showAllBtn = document.createElement('button');
+  showAllBtn.textContent = 'Show All';
+  showAllBtn.style.cssText = btnStyle + 'display:none;';
+  showAllBtn.addEventListener('click', () => {{
+    Plotly.restyle(state.el, {{ visible: state.el.data.map(() => true), showlegend: state.el.data.map(() => true) }});
+    showAllBtn.style.display = 'none';
+  }});
+
+  btnBar.appendChild(keepSelBtn);
+  btnBar.appendChild(showAllBtn);
+  container.appendChild(btnBar);
+
+  // Legend sync → table + button visibility
+  function syncBtnVisibility() {{
+    const allVisible = state.el.data.every(t => t.visible !== 'legendonly' && t.visible !== false);
+    const anyLegendHidden = state.el.data.some(t => !t.showlegend);
+    btnBar.style.display = (allVisible && !anyLegendHidden) ? 'none' : '';
+    keepSelBtn.style.display = allVisible ? 'none' : '';
+    showAllBtn.style.display = anyLegendHidden ? '' : 'none';
+  }}
+  syncBtnVisibility();
+
   state.el.on('plotly_restyle', function() {{
     CONFIG_KEYS.forEach((cfg, i) => {{
       if (!state.el.data[i]) return;
@@ -1114,6 +1286,7 @@ function createChart(container, defaults) {{
         r.style.display = show ? '' : 'none';
       }});
     }});
+    syncBtnVisibility();
   }});
 
   const chart = {{ state, update }};
@@ -1133,8 +1306,8 @@ chartCol2.className = 'chart-col';
 chartRow.appendChild(chartCol1);
 chartRow.appendChild(chartCol2);
 
-createChart(chartCol1, {{ xMetric: 'output_token_throughput_per_user', yMetric: 'output_token_throughput', yNorm: 'decode' }});
-createChart(chartCol2, {{ xMetric: 'e2e_output_token_throughput', yMetric: 'output_token_throughput', yNorm: 'decode' }});
+createChart(chartCol1, {{ xMetric: 'e2e_output_token_throughput', yMetric: 'output_token_throughput', yNorm: 'decode' }});
+createChart(chartCol2, {{ xMetric: 'e2e_output_token_throughput', yMetric: 'input_token_throughput', yNorm: 'prefill' }});
 
 // ── Controls: cost + SLO filters (in title bar) ──
 const sloBar = document.getElementById('controlsBar');
@@ -1414,6 +1587,440 @@ root.appendChild(sec2Wrap);
     return output_path
 
 
+def generate_3d_html(configs, output_path, results_dir, metric_units):
+    model_label = read_model_label(results_dir)
+    color_map = {}
+    for i, cfg in enumerate(sorted(configs.keys())):
+        color_map[cfg] = COLORS[i % len(COLORS)]
+
+    MARKER_SHAPES_3D = [
+        'circle', 'square', 'diamond', 'cross', 'x',
+        'circle-open', 'square-open', 'diamond-open',
+    ]
+    folder_set = []
+    for cfg in sorted(configs.keys()):
+        folder = cfg.rsplit('/', 1)[0] if '/' in cfg else ''
+        if folder not in folder_set:
+            folder_set.append(folder)
+    folder_shape_map = {f: MARKER_SHAPES_3D[i % len(MARKER_SHAPES_3D)] for i, f in enumerate(folder_set)}
+    shape_map = {}
+    for cfg in sorted(configs.keys()):
+        folder = cfg.rsplit('/', 1)[0] if '/' in cfg else ''
+        shape_map[cfg] = folder_shape_map[folder]
+
+    configs_js = {}
+    data_js = {}
+    concurrencies = set()
+    for cfg, meta in configs.items():
+        configs_js[cfg] = {
+            'label': meta['label'],
+            'decodeGPUs': meta['decode_gpus'],
+            'prefillGPUs': meta['prefill_gpus'],
+        }
+        data_js[cfg] = {}
+        for c_val, metrics in meta['runs'].items():
+            key = f'c{c_val}'
+            concurrencies.add(c_val)
+            data_js[cfg][key] = metrics
+
+    sorted_conc = sorted(concurrencies)
+    conc_list_js = [f'c{c}' for c in sorted_conc]
+    c_labels_js = {f'c{c}': c for c in sorted_conc}
+    metrics_js = {k: {'unit': v} for k, v in sorted(metric_units.items())}
+
+    all_metrics = [
+        'output_token_throughput', 'output_token_throughput_per_user',
+        'e2e_output_token_throughput', 'input_token_throughput',
+        'total_token_throughput', 'effective_decode_throughput',
+        'effective_prefill_throughput', 'effective_total_throughput',
+        'active_decode_throughput', 'active_prefill_throughput',
+        'active_total_throughput', 'request_throughput',
+        'inter_token_latency', 'time_to_first_token', 'time_to_second_token',
+        'request_latency', 'effective_latency', 'credit_to_start_latency',
+        'request_count', 'total_output_tokens',
+    ]
+    decode_normalized_metrics = [
+        'output_token_throughput', 'e2e_output_token_throughput',
+        'effective_decode_throughput', 'active_decode_throughput',
+    ]
+    prefill_normalized_metrics = [
+        'input_token_throughput', 'effective_prefill_throughput',
+        'active_prefill_throughput',
+    ]
+    total_normalized_metrics = [
+        'total_token_throughput', 'effective_total_throughput',
+        'active_total_throughput',
+    ]
+    metric_labels = {
+        'active_decode_throughput': 'Active decode throughput',
+        'active_prefill_throughput': 'Active prefill throughput',
+        'active_total_throughput': 'Active total throughput',
+        'credit_to_start_latency': 'Credit-to-start latency',
+        'e2e_output_token_throughput': 'E2E output token throughput',
+        'effective_decode_throughput': 'Effective decode throughput',
+        'effective_latency': 'Effective latency',
+        'effective_prefill_throughput': 'Effective prefill throughput',
+        'effective_total_throughput': 'Effective total throughput',
+        'input_token_throughput': 'Input token throughput',
+        'inter_token_latency': 'Inter-token latency',
+        'output_token_throughput': 'Output token throughput',
+        'output_token_throughput_per_user': 'Output token throughput/user',
+        'request_count': 'Request count',
+        'request_latency': 'Request latency',
+        'request_throughput': 'Request throughput',
+        'time_to_first_token': 'Time to first token',
+        'time_to_second_token': 'Time to second token',
+        'total_output_tokens': 'Total output tokens',
+        'total_token_throughput': 'Total token throughput',
+    }
+
+    versions = set(meta['version'] for meta in configs.values() if meta['version'])
+    version_str = ', '.join(sorted(versions)) if versions else 'unknown'
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{model_label} — 3D Cost Explorer — vLLM {version_str}</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {{
+    --bg: #111217; --bg2: #181b1f; --border: #2a2a2e;
+    --fg: #ececec; --fg2: #c0c0c0; --fg3: #8e8e8e;
+    --input-bg: #181b1f; --input-fg: #d8d9da; --input-border: #2a2a2e;
+    --hover-bg: #1e2127;
+  }}
+  html.light {{
+    --bg: #f5f6f8; --bg2: #ffffff; --border: #d4d6db;
+    --fg: #1a1a1a; --fg2: #444; --fg3: #666;
+    --input-bg: #ffffff; --input-fg: #1a1a1a; --input-border: #c8cacd;
+    --hover-bg: #eef0f4;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: var(--bg); color: var(--fg); font-family: Inter, -apple-system, sans-serif; padding: 16px;
+         transition: background .2s, color .2s; }}
+  h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 4px; }}
+  .subtitle {{ font-size: 13px; color: var(--fg3); }}
+  .controls {{ display: flex; gap: 10px; align-items: center; padding: 4px 0; flex-wrap: wrap; }}
+  .controls label {{ color: var(--fg3); font-size: 12px; display: flex; align-items: center; gap: 4px; }}
+  .controls select {{ background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border);
+                      border-radius: 4px; padding: 4px 6px; font-size: 11px; font-family: inherit; max-width: 260px; }}
+  .controls input {{ background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border);
+                     border-radius: 4px; padding: 4px 8px; font-size: 12px; font-family: inherit; width: 80px; }}
+  .chart-col {{ flex: 1; min-width: 0; }}
+  .chart-col h2 {{ font-size: 15px; font-weight: 600; margin-bottom: 4px; color: var(--fg); }}
+  .plot-wrap {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
+  .plot3d {{ width: 100%; height: calc(50vh - 80px); min-height: 380px; }}
+  .theme-toggle {{ background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px;
+                   padding: 5px 12px; cursor: pointer; font-size: 18px; line-height: 1; }}
+  .theme-toggle:hover {{ background: var(--hover-bg); }}
+  .btn {{ background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border);
+          border-radius: 4px; padding: 4px 12px; font-size: 11px; cursor: pointer; font-family: inherit; }}
+  .btn:hover {{ background: var(--hover-bg); }}
+  .btn-bar {{ display: none; gap: 6px; margin: 4px 0; }}
+  .charts-grid {{ display: flex; gap: 16px; margin-top: 8px; }}
+  @media (max-width: 1200px) {{ .charts-grid {{ flex-direction: column; }} .plot3d {{ height: 50vh; }} }}
+</style>
+</head>
+<body>
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding-bottom:8px;border-bottom:1px solid var(--border);margin-bottom:8px;">
+  <div>
+    <h1>{model_label} — 3D Cost Explorer</h1>
+    <div class="subtitle">vLLM {version_str}</div>
+  </div>
+  <div style="display:flex;gap:10px;align-items:center;">
+    <label style="color:var(--fg3);font-size:13px;display:flex;align-items:center;gap:6px;">
+      $/node/hr: <input type="number" id="costInput" step="0.01" min="0" value="21.68" placeholder="21.68"
+                        style="background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-border);border-radius:4px;padding:6px 10px;font-size:13px;width:90px;">
+    </label>
+    <button class="theme-toggle" id="themeBtn" title="Toggle light/dark mode">&#9790;</button>
+  </div>
+</div>
+
+<div class="charts-grid">
+  <div class="chart-col" id="outputCol">
+    <h2>Output Throughput vs Cost</h2>
+    <div id="outputControls"></div>
+    <div class="btn-bar" id="outputBtnBar"></div>
+    <div class="plot-wrap"><div class="plot3d" id="outputPlot"></div></div>
+  </div>
+  <div class="chart-col" id="inputCol">
+    <h2>Input Throughput vs Cost</h2>
+    <div id="inputControls"></div>
+    <div class="btn-bar" id="inputBtnBar"></div>
+    <div class="plot-wrap"><div class="plot3d" id="inputPlot"></div></div>
+  </div>
+</div>
+
+<script>
+const COLORS = {json.dumps(color_map)};
+const SHAPES = {json.dumps(shape_map)};
+const CONFIGS = {json.dumps(configs_js)};
+const CONCURRENCIES = {json.dumps(conc_list_js)};
+const C_LABELS = {json.dumps(c_labels_js)};
+const DATA = {json.dumps(data_js)};
+const METRICS = {json.dumps(metrics_js)};
+const ALL_METRICS = {json.dumps(all_metrics)};
+const DECODE_NORM = new Set({json.dumps(decode_normalized_metrics)});
+const PREFILL_NORM = new Set({json.dumps(prefill_normalized_metrics)});
+const TOTAL_NORM = new Set({json.dumps(total_normalized_metrics)});
+const METRIC_LABELS = {json.dumps(metric_labels)};
+const STAT_KEYS = {json.dumps(STAT_KEYS)};
+const CONFIG_KEYS = Object.keys(CONFIGS);
+const GPUS_PER_NODE = {GPUS_PER_NODE};
+
+let isDark = true;
+let gpuCostPerHour = (parseFloat(document.getElementById('costInput').value) || 0) / GPUS_PER_NODE;
+const charts = [];
+
+function getTheme() {{
+  return isDark
+    ? {{ paper: '#181b1f', fg: '#ececec', fg2: '#c0c0c0', grid: '#242429', legend: 'rgba(0,0,0,0.35)', legendBorder: '#333' }}
+    : {{ paper: '#ffffff', fg: '#1a1a1a', fg2: '#444', grid: '#e0e0e0', legend: 'rgba(255,255,255,0.85)', legendBorder: '#ccc' }};
+}}
+
+function metricLabel(k) {{ return METRIC_LABELS[k] || k.replace(/_/g, ' '); }}
+
+function metricOptions() {{
+  return ALL_METRICS.filter(k => METRICS[k]).map(k => ({{
+    value: k, text: metricLabel(k) + (METRICS[k].unit ? ` (${{METRICS[k].unit}})` : '')
+  }}));
+}}
+
+function metricSample(metric) {{
+  for (const cfg of CONFIG_KEYS)
+    for (const c of CONCURRENCIES) {{
+      const s = DATA[cfg]?.[c]?.[metric];
+      if (s) return s;
+    }}
+  return null;
+}}
+
+function statOptions(metric) {{
+  const s = metricSample(metric);
+  const keys = s ? STAT_KEYS.filter(k => Object.prototype.hasOwnProperty.call(s, k)) : ['avg'];
+  return (keys.length ? keys : ['avg']).map(k => ({{ value: k, text: k }}));
+}}
+
+function normOptions(metric) {{
+  const opts = [{{ value: 'none', text: 'none' }}];
+  if (DECODE_NORM.has(metric)) {{
+    opts.push({{ value: 'decode', text: '/ decode GPUs' }});
+    opts.push({{ value: 'total', text: '/ total GPUs' }});
+  }}
+  if (PREFILL_NORM.has(metric)) {{
+    opts.push({{ value: 'prefill', text: '/ prefill GPUs' }});
+    opts.push({{ value: 'total', text: '/ total GPUs' }});
+  }}
+  if (TOTAL_NORM.has(metric)) {{
+    opts.push({{ value: 'total', text: '/ total GPUs' }});
+  }}
+  return opts;
+}}
+
+function applyNorm(val, norm, meta) {{
+  if (val == null || val === 0) return null;
+  if (norm === 'decode') return val / meta.decodeGPUs;
+  if (norm === 'prefill') return val / meta.prefillGPUs;
+  if (norm === 'total') return val / (meta.decodeGPUs + meta.prefillGPUs);
+  return val;
+}}
+
+function normSuffix(norm) {{
+  if (norm === 'decode') return ' / decode GPU';
+  if (norm === 'prefill') return ' / prefill GPU';
+  if (norm === 'total') return ' / total GPU';
+  return '';
+}}
+
+function setSelectOpts(sel, options, value) {{
+  sel.replaceChildren();
+  options.forEach(o => {{
+    const opt = document.createElement('option');
+    opt.value = o.value; opt.textContent = o.text;
+    sel.appendChild(opt);
+  }});
+  const vals = new Set(options.map(o => o.value));
+  sel.value = vals.has(value) ? value : options[0]?.value;
+  return sel.value;
+}}
+
+function costGpuKey(metric) {{
+  if (DECODE_NORM.has(metric)) return 'decode';
+  if (PREFILL_NORM.has(metric)) return 'prefill';
+  if (TOTAL_NORM.has(metric)) return 'total';
+  return 'total';
+}}
+
+function costPerMTok(tps, gpuKey, meta) {{
+  if (tps == null || tps <= 0 || gpuCostPerHour <= 0) return null;
+  const gpus = gpuKey === 'decode' ? meta.decodeGPUs : gpuKey === 'prefill' ? meta.prefillGPUs : (meta.decodeGPUs + meta.prefillGPUs);
+  return (gpus * gpuCostPerHour * 1e6) / (tps * 3600);
+}}
+
+function zLabel(yMetric) {{
+  const gk = costGpuKey(yMetric);
+  const prefix = gk === 'decode' ? 'output' : gk === 'prefill' ? 'input' : 'total';
+  return `$/M ${{prefix}} tokens (${{gk}} GPUs)`;
+}}
+
+function axisTitle(metric, stat, norm) {{
+  const name = metricLabel(metric);
+  const unit = METRICS[metric]?.unit || '';
+  const ss = stat === 'avg' ? '' : ` (${{stat}})`;
+  const ns = normSuffix(norm);
+  return `${{name}}${{ss}}${{ns}} (${{unit}})`;
+}}
+
+const mOpts = metricOptions();
+
+function createChart(plotId, ctrlId, btnBarId, defaults, showLegend) {{
+  const state = {{ ...defaults }};
+  const plotEl = document.getElementById(plotId);
+  const ctrlDiv = document.getElementById(ctrlId);
+  const btnBar = document.getElementById(btnBarId);
+
+  function mkAxisRow(label, metric, stat, norm, onChange) {{
+    const row = document.createElement('div');
+    row.className = 'controls';
+    function mkSel(lbl, opts, val, cb) {{
+      const l = document.createElement('label');
+      l.textContent = lbl;
+      const s = document.createElement('select');
+      opts.forEach(o => {{ const op = document.createElement('option'); op.value = o.value; op.textContent = o.text; s.appendChild(op); }});
+      s.value = val;
+      s.addEventListener('change', () => cb(s.value));
+      l.appendChild(s);
+      row.appendChild(l);
+      return s;
+    }}
+    const mSel = mkSel(label, mOpts, metric, v => {{ onChange('metric', v); onChange('stat', setSelectOpts(sSel, statOptions(v), sSel.value)); onChange('norm', setSelectOpts(nSel, normOptions(v), nSel.value)); update(); }});
+    const sSel = mkSel('stat:', statOptions(metric), stat, v => {{ onChange('stat', v); update(); }});
+    const nSel = mkSel('norm:', normOptions(metric), norm, v => {{ onChange('norm', v); update(); }});
+    ctrlDiv.appendChild(row);
+  }}
+
+  mkAxisRow('X:', state.xMetric, state.xStat, state.xNorm, (k, v) => {{ if (k==='metric') state.xMetric=v; if (k==='stat') state.xStat=v; if (k==='norm') state.xNorm=v; }});
+  mkAxisRow('Y:', state.yMetric, state.yStat, state.yNorm, (k, v) => {{ if (k==='metric') state.yMetric=v; if (k==='stat') state.yStat=v; if (k==='norm') state.yNorm=v; }});
+
+  function buildTraces() {{
+    const gk = costGpuKey(state.yMetric);
+    return CONFIG_KEYS.map(cfg => {{
+      const meta = CONFIGS[cfg];
+      const validConcs = CONCURRENCIES.filter(c => DATA[cfg] && DATA[cfg][c]);
+      return {{
+        x: validConcs.map(c => {{ const m = DATA[cfg][c][state.xMetric]; return m ? applyNorm(m[state.xStat], state.xNorm, meta) : null; }}),
+        y: validConcs.map(c => {{ const m = DATA[cfg][c][state.yMetric]; return m ? applyNorm(m[state.yStat], state.yNorm, meta) : null; }}),
+        z: validConcs.map(c => {{ const m = DATA[cfg][c][state.yMetric]; return m ? costPerMTok(m[state.yStat], gk, meta) : null; }}),
+        text: validConcs.map(c => {{
+          const d = DATA[cfg][c];
+          const m = d[state.yMetric];
+          const cost = m ? costPerMTok(m[state.yStat], gk, meta) : null;
+          return `${{meta.label}}<br>c${{C_LABELS[c]}}<br>${{metricLabel(state.yMetric)}}: ${{m?.[state.yStat]?.toFixed(1) ?? '?'}}<br>$/M tok: ${{cost?.toFixed(2) ?? '?'}}`;
+        }}),
+        hoverinfo: 'text',
+        mode: 'lines+markers',
+        type: 'scatter3d',
+        name: `${{meta.label}} (${{meta.decodeGPUs}} dGPU)`,
+        showlegend: showLegend,
+        line: {{ color: COLORS[cfg], width: 3 }},
+        marker: {{ size: 5, color: COLORS[cfg], symbol: SHAPES[cfg] || 'circle' }},
+      }};
+    }});
+  }}
+
+  function getLayout() {{
+    const t = getTheme();
+    return {{
+      paper_bgcolor: t.paper, scene: {{
+        bgcolor: t.paper,
+        xaxis: {{ title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 11, color: t.fg }} }},
+                 gridcolor: t.grid, zerolinecolor: t.grid, tickfont: {{ color: t.fg2, size: 10 }} }},
+        yaxis: {{ title: {{ text: axisTitle(state.yMetric, state.yStat, state.yNorm), font: {{ size: 11, color: t.fg }} }},
+                 gridcolor: t.grid, zerolinecolor: t.grid, tickfont: {{ color: t.fg2, size: 10 }} }},
+        zaxis: {{ title: {{ text: zLabel(state.yMetric), font: {{ size: 11, color: t.fg }} }},
+                 gridcolor: t.grid, zerolinecolor: t.grid, tickfont: {{ color: t.fg2, size: 10 }} }},
+      }},
+      font: {{ family: 'Inter, -apple-system, sans-serif', size: 12, color: t.fg }},
+      margin: {{ t: 10, r: 10, b: 10, l: 10 }},
+      legend: {{ bgcolor: t.legend, font: {{ size: 10, color: t.fg }}, bordercolor: t.legendBorder, borderwidth: 1,
+                orientation: 'h', x: 0.5, y: -0.02, xanchor: 'center', yanchor: 'top' }},
+      hoverlabel: {{ font: {{ size: 12 }} }},
+    }};
+  }}
+
+  function update() {{
+    const traces = buildTraces();
+    if (plotEl.data) {{
+      plotEl.data.forEach((old, i) => {{
+        if (traces[i] && old.visible === 'legendonly') traces[i].visible = 'legendonly';
+      }});
+    }}
+    Plotly.react(plotEl, traces, getLayout(), {{ responsive: true }});
+  }}
+
+  Plotly.newPlot(plotEl, buildTraces(), getLayout(), {{ responsive: true }});
+
+  const keepBtn = document.createElement('button');
+  keepBtn.className = 'btn'; keepBtn.textContent = 'Keep Selected Only';
+  keepBtn.addEventListener('click', () => {{
+    Plotly.restyle(plotEl, {{ showlegend: plotEl.data.map(t => t.visible !== 'legendonly' && t.visible !== false) }});
+    showBtn.style.display = '';
+  }});
+  const showBtn = document.createElement('button');
+  showBtn.className = 'btn'; showBtn.textContent = 'Show All'; showBtn.style.display = 'none';
+  showBtn.addEventListener('click', () => {{
+    Plotly.restyle(plotEl, {{ visible: plotEl.data.map(() => true), showlegend: plotEl.data.map(() => true) }});
+    showBtn.style.display = 'none';
+  }});
+  btnBar.appendChild(keepBtn); btnBar.appendChild(showBtn);
+
+  plotEl.on('plotly_restyle', function() {{
+    const allVis = plotEl.data.every(t => t.visible !== 'legendonly' && t.visible !== false);
+    const anyHiddenLegend = plotEl.data.some(t => !t.showlegend);
+    btnBar.style.display = (allVis && !anyHiddenLegend) ? 'none' : 'flex';
+    keepBtn.style.display = allVis ? 'none' : '';
+    showBtn.style.display = anyHiddenLegend ? '' : 'none';
+  }});
+
+  new ResizeObserver(() => Plotly.Plots.resize(plotEl)).observe(plotEl);
+
+  return {{ update, plotEl }};
+}}
+
+const outputChart = createChart('outputPlot', 'outputControls', 'outputBtnBar', {{
+  xMetric: 'e2e_output_token_throughput', xStat: 'avg', xNorm: 'none',
+  yMetric: 'output_token_throughput', yStat: 'avg', yNorm: 'decode',
+}}, true);
+
+const inputChart = createChart('inputPlot', 'inputControls', 'inputBtnBar', {{
+  xMetric: 'time_to_first_token', xStat: 'avg', xNorm: 'none',
+  yMetric: 'input_token_throughput', yStat: 'avg', yNorm: 'prefill',
+}}, true);
+
+charts.push(outputChart, inputChart);
+
+document.getElementById('costInput').addEventListener('input', function() {{
+  gpuCostPerHour = (parseFloat(this.value) || 0) / GPUS_PER_NODE;
+  charts.forEach(c => c.update());
+}});
+
+const themeBtn = document.getElementById('themeBtn');
+themeBtn.addEventListener('click', () => {{
+  isDark = !isDark;
+  document.documentElement.classList.toggle('light', !isDark);
+  themeBtn.textContent = isDark ? '\\u263E' : '\\u2600';
+  charts.forEach(c => c.update());
+}});
+</script>
+</body>
+</html>"""
+
+    with open(output_path, 'w') as f:
+        f.write(html)
+    return output_path
+
+
 def main():
     if len(sys.argv) > 1:
         results_dirs = sys.argv[1:]
@@ -1453,11 +2060,15 @@ def main():
 
     generate_html(all_configs, output_path, first_results_dir, all_metric_units)
 
+    output_3d_path = os.path.join(output_dir, 'interactivity_vs_throughput_3d.html')
+    generate_3d_html(all_configs, output_3d_path, first_results_dir, all_metric_units)
+
     print(f"Discovered {len(all_configs)} configs:")
     for cfg, meta in sorted(all_configs.items()):
         concs = sorted(meta['runs'].keys())
         print(f"  {cfg}: {meta['label']} ({meta['decode_gpus']} decode GPUs) — c{',c'.join(str(c) for c in concs)}")
     print(f"\nGenerated: {output_path}")
+    print(f"Generated: {output_3d_path}")
 
 
 if __name__ == '__main__':

@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: benchmark-orchestrator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: benchmark-orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin
+subjects:
+  - kind: ServiceAccount
+    name: benchmark-orchestrator
+    namespace: NAMESPACE_PLACEHOLDER
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchmark-seed
+  labels:
+    app: benchmark-seed
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: benchmark-seed
+  template:
+    metadata:
+      labels:
+        app: benchmark-seed
+    spec:
+      serviceAccountName: benchmark-orchestrator
+      restartPolicy: Always
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+      containers:
+        - name: seed
+          image: quay.io/rh-ee-ecrncevi/benchmark-seed:amd64
+          imagePullPolicy: Always
+          command: ["sleep", "infinity"]
+          workingDir: /workspace
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+              ephemeral-storage: 10Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: 10Gi
