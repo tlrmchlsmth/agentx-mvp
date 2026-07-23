@@ -46,8 +46,10 @@ just clean           # delete benchmark jobs and the orchestrator pod
 ```
 
 The orchestrator image contains this harness at `/workspace/agentx-mvp` and
-`llm-manifesto` at `/workspace/llm-manifesto`; `just orchestrator-run` does not
-copy source trees into the pod. Build it with `just orchestrator-build`.
+`llm-manifesto` at `/workspace/llm-manifesto`. `just orchestrator-run` syncs your local
+`MANIFESTO_ROOT/models/` and `clusters/` plus the agentx-mvp `Justfile` into the pod
+before starting the sweep. Rebuild the image only when manifesto Python/templates change.
+Override with `ORCHESTRATOR_FORCE_SYNC=true`. Build the image with `just orchestrator-build`.
 
 ## Model Deployment
 
@@ -114,6 +116,12 @@ The parent config directory contains `manifest.yaml`, the monolithic rendered ma
 
 ## Grafana dashboard export
 
+Browse live dashboards during a run:
+
+```bash
+just grafana    # background port-forward to http://localhost:3000
+```
+
 Export Grafana dashboards for benchmark result directories. Automatically extracts the exact time range each run executed (from `profile_export_aiperf.json` timestamps) and queries Prometheus for that window.
 
 ```bash
@@ -139,6 +147,28 @@ python3 overlay_dashboards.py c64.html c256.html --label "concurrency=64" --labe
 ```
 
 Each concurrency level gets a distinct color across all panels.
+
+## Crash log recovery
+
+`just dump-logs` only captures `kubectl logs` for each pod's *current*
+container instance. When a pod crashloops, that only shows the fresh
+post-restart run — the log from the run that actually crashed is gone from
+`kubectl logs` by the time you go looking.
+
+vLLM's launch script (llm-manifesto `manifesto/launch.py`) also tees every
+run's stdout into its own timestamped file on the shared Lustre PVC
+(`$(cd $MANIFESTO_ROOT && uv run manifesto log-path <spec> --role <role>)/${HOSTNAME}_<timestamp>.log`),
+so those never get lost on restart. `just dump-crash-logs` reads that
+directory back through a tiny dedicated pod (`just logs-dev-up`) that only
+mounts `lustre-pvc-vllm` at `/mnt/lustre` — no RBAC, no GPU, and no
+dependency on decode/prefill pods being up or the benchmark-orchestrator
+Deployment's redeploy lifecycle:
+
+```bash
+just dump-crash-logs results/<run>   # auto-deploys the log-reader pod if needed;
+                                      # writes results/<run>/lustre-logs/{decode,prefill}/
+just logs-dev-down                   # tear down the log-reader pod when done
+```
 
 ## vLLM version capture
 

@@ -157,9 +157,14 @@ def regex_literal(s):
     return re.escape(s).replace(r"\-", "-")
 
 
-def parse_wide_ep_deployment(deployment):
+def parse_mixed_ep_deployment(deployment):
+    # Matches both the "wide-ep" release naming (deepseek-v4) and the "ix"
+    # release naming (deepseek-v4-ix), e.g. "<user>-wide-ep-1p-ep8-1d-ep8"
+    # or "<user>-ix-1p-ep8-1d-ep12". Prefill and decode can use different
+    # EP widths, which also means different pod-name prefixes, so callers
+    # need both widths to build a pod regex that matches real pod names.
     m = re.match(
-        r"^(?P<user>[^-]+)-wide-ep-"
+        r"^(?P<user>[^-]+)-(?:wide-ep|ix)-"
         r"(?P<prefill>\d+)p-ep(?P<prefill_ep>\d+)-"
         r"(?P<decode>\d+)d-ep(?P<decode_ep>\d+)$",
         deployment,
@@ -179,13 +184,13 @@ def derive_pod_regex(deployment, pod_regex):
     for part in re.split(r"[\s,|]+", pod_regex or ""):
         add(part)
 
-    wide_ep = parse_wide_ep_deployment(deployment)
-    if wide_ep:
-        user = wide_ep["user"]
+    mixed_ep = parse_mixed_ep_deployment(deployment)
+    if mixed_ep:
+        user = mixed_ep["user"]
         release = deployment[len(user) + 1:]
         add(regex_literal(deployment) + ".*")
         add(regex_literal(release) + ".*")
-        for ep in sorted({wide_ep["prefill_ep"], wide_ep["decode_ep"]}):
+        for ep in sorted({mixed_ep["prefill_ep"], mixed_ep["decode_ep"]}):
             add(regex_literal(f"{user}-vllm-ep{ep}") + "-.*")
 
     if not parts:

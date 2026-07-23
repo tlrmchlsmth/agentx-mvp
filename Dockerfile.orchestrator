@@ -46,4 +46,6 @@ RUN git clone --depth 1 "${MANIFESTO_REPO}" /workspace/llm-manifesto \
       /workspace/llm-manifesto/.pytest_cache \
       /workspace/llm-manifesto/__pycache__
 
+ENV MANIFESTO_ROOT=/workspace/llm-manifesto
+
 CMD ["sleep", "infinity"]
