@@ -446,14 +446,18 @@ const lazyObserver = new IntersectionObserver((entries) => {{
       const p = div._panelData;
       const allSeries = p.queries.flatMap(q => q.series.map(s => ({{q, s}})));
       const plotDiv = div.querySelector('.plot');
+      // Grafana's percentunit stores 0.0-1.0 but displays it x100 as a percentage;
+      // percent is already 0-100. Scale here so the plotted line matches Grafana.
+      const isPct = p.unit === 'percentunit' || p.unit === 'percent';
+      const scale = p.unit === 'percentunit' ? 100 : 1;
       const traces = allSeries.filter(x => x.s.values.length > 0).map((x, i) => ({{
         x: x.s.values.map(v => new Date(v[0] * 1000)),
-        y: x.s.values.map(v => parseFloat(v[1])),
+        y: x.s.values.map(v => parseFloat(v[1]) * scale),
         name: seriesLabel(x.q, x.s),
         type: 'scatter',
         mode: 'lines',
         line: {{ width: 1.5, color: COLORS[i % COLORS.length] }},
-        hovertemplate: '%{{y}}<extra>%{{fullData.name}}</extra>',
+        hovertemplate: (isPct ? '%{{y:.1f}}%' : '%{{y}}') + '<extra>%{{fullData.name}}</extra>',
       }}));
       const fmt = UNIT_FMT[p.unit];
       const yTitle = UNIT_LABEL[p.unit] || p.unit || '';
@@ -469,7 +473,8 @@ const lazyObserver = new IntersectionObserver((entries) => {{
         xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: '%H:%M' }},
         yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e',
                   title: yTitle ? {{ text: yTitle, font: {{ size: 10 }} }} : undefined,
-                  tickformat: fmt ? undefined : '.3s',
+                  tickformat: isPct ? '.1f' : (fmt ? undefined : '.3s'),
+                  ticksuffix: isPct ? '%' : undefined,
                   hoverformat: '.4g' }},
         legend: {{ font: {{ size: 9 }}, orientation: 'h', y: -0.3 }},
         showlegend: traces.length > 1,
@@ -548,10 +553,14 @@ def export_results(args):
         with open(json_path) as f:
             data = json.load(f)
 
-        start_ns = data["min_request_timestamp"]["avg"]
-        end_ns = data["max_response_timestamp"]["avg"]
-        start = start_ns / 1e9 - args.pad
-        end = end_ns / 1e9 + args.pad
+        def _parse_ts(s):
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+
+        start = _parse_ts(data["start_time"]) - args.pad
+        end = _parse_ts(data["end_time"]) + args.pad
 
         out_path = os.path.join(d, "dashboard.html")
         name = os.path.basename(d)

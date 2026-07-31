@@ -9,7 +9,9 @@ set export
 #   just run               # run the full AgentX-MVP benchmark as a Job
 #   just run 256 900       # override concurrency / duration
 #   just smoke             # fast plumbing test (~60s, marks result invalid)
+#   just sweep outdir 900 true            # keep model up (skip stop/start/warmup)
 #   just orchestrator-run              # run a detached in-cluster sweep
+#   just orchestrator-run '' 900 false true   # keep model, skip orchestrator redeploy
 #   just logs / just shell # inspect the orchestrator
 #   just clean             # delete benchmark Jobs and the orchestrator
 
@@ -23,7 +25,7 @@ manifesto_user := env_var_or_default('MANIFESTO_USER', env_var_or_default('USER'
 manifesto_args := env_var_or_default('MANIFESTO_ARGS', '')
 manifesto_gateway := env_var_or_default('MANIFESTO_GATEWAY_COMPONENT', 'gateway-istio')
 kueue_queue := env_var_or_default('KUEUE_QUEUE', 'nightly-eval')
-aiperf_image := env_var_or_default('AIPERF_IMAGE', 'quay.io/rh-ee-imarkov/aiperf:agentx-v0.11.0')
+aiperf_image := env_var_or_default('AIPERF_IMAGE', 'quay.io/rh-ee-imarkov/aiperf:agentx-v0.11.1')
 lustre_claim := env_var_or_default('LUSTRE_CLAIM', 'lustre-pvc-vllm')
 lustre_mount := env_var_or_default('LUSTRE_MOUNT', '/mnt/lustre')
 lustre_prefix := env_var_or_default('LUSTRE_PREFIX', '/mnt/lustre/agentx-mvp')
@@ -41,22 +43,27 @@ url       := env_var_or_default('URL', '')
 server_metrics_url := env_var_or_default('SERVER_METRICS_URL', '')
 gpu_telemetry_urls := env_var_or_default('GPU_TELEMETRY_URLS', '')
 # AIPerf profile flags aligned with InferenceX build_replay_cmd (benchmark_lib.sh).
-# Excluded from IX parity by design: MAX_CONTEXT_LENGTH, public-dataset loader,
-# gpu telemetry, AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING (N/A for llm-d gateway).
 aiperf_public_dataset := env_var_or_default('AIPERF_PUBLIC_DATASET', 'semianalysis_cc_traces_weka_with_subagents')
 aiperf_random_seed := env_var_or_default('AIPERF_RANDOM_SEED', '42')
 aiperf_failed_request_threshold := env_var_or_default('AIPERF_FAILED_REQUEST_THRESHOLD', '0.10')
 aiperf_trajectory_start_min_ratio := env_var_or_default('AIPERF_TRAJECTORY_START_MIN_RATIO', '0.25')
 aiperf_trajectory_start_max_ratio := env_var_or_default('AIPERF_TRAJECTORY_START_MAX_RATIO', '0.75')
-aiperf_num_dataset_entries := env_var_or_default('AIPERF_NUM_DATASET_ENTRIES', '393')
+# "all" (or empty) omits --num-dataset-entries entirely, which loads the
+# entire corpus regardless of size (see semianalysis_cc_traces_weka.py: the
+# loader only caps when the flag is explicitly passed).
+aiperf_num_dataset_entries := env_var_or_default('AIPERF_NUM_DATASET_ENTRIES', 'all')
 aiperf_slice_duration := env_var_or_default('AIPERF_SLICE_DURATION', '1.0')
+# Allow concurrency to exceed the loaded trace pool by reusing traces across
+# lanes. Required when BENCHMARK_CONCURRENCIES exceeds AIPERF_NUM_DATASET_ENTRIES.
+aiperf_allow_dataset_wrap := env_var_or_default('AIPERF_ALLOW_DATASET_WRAP', 'false')
 aiperf_dataset_configuration_timeout := env_var_or_default('AIPERF_DATASET_CONFIGURATION_TIMEOUT', '1800')
-# Agentic warmup/grace scale with benchmark-duration (IX uses 600/1800 at 3600s).
-aiperf_reference_duration := env_var_or_default('AIPERF_REFERENCE_DURATION', '3600')
-aiperf_reference_cache_warmup := env_var_or_default('AIPERF_REFERENCE_CACHE_WARMUP', '600')
-aiperf_reference_warmup_grace := env_var_or_default('AIPERF_REFERENCE_WARMUP_GRACE', '1800')
-aiperf_min_cache_warmup := env_var_or_default('AIPERF_MIN_CACHE_WARMUP', '60')
-aiperf_min_warmup_grace := env_var_or_default('AIPERF_MIN_WARMUP_GRACE', '180')
+# Persist the tokenized-dataset mmap cache on Lustre (survives pod restarts)
+# instead of the default ~/.cache/aiperf/dataset_mmap on ephemeral /workspace,
+# so repeat attempts/concurrencies skip re-tokenizing the whole corpus.
+aiperf_mmap_cache_dir := env_var_or_default('AIPERF_DATASET_MMAP_CACHE_DIR', lustre_prefix + '/' + manifesto_user + '/aiperf_mmap_cache')
+# Agentic warmup/grace are absolute seconds, independent of benchmark-duration.
+aiperf_cache_warmup_seconds := env_var_or_default('AIPERF_CACHE_WARMUP_SECONDS', '150')
+aiperf_warmup_grace_seconds := env_var_or_default('AIPERF_WARMUP_GRACE_SECONDS', '450')
 # aiperf normally emits a progress/heartbeat log line at least every ~30s; if
 # its log goes quiet for this long without the Job completing, aiperf has
 # likely deadlocked internally (e.g. the agentic subagent/session-replay
@@ -67,7 +74,7 @@ benchmark_retries := env_var_or_default('BENCHMARK_RETRIES', '3')
 benchmark_concurrencies := env_var_or_default('BENCHMARK_CONCURRENCIES', '64 256')
 # Files kubectl cp pulls from CANONICAL_ARTIFACT_DIR (see _run-job); used to
 # detect a partial/incomplete local copy (e.g. after a mid-transfer EOF).
-benchmark_artifact_files := "profile_export_aiperf.json profile_export_aiperf.csv profile_export.jsonl profile_export_console.txt server_metrics_export.json server_metrics_export.csv gpu_telemetry_export.jsonl"
+benchmark_artifact_files := "profile_export_aiperf.json profile_export_aiperf.csv profile_export.jsonl profile_export_console.txt"
 pod_start_timeout := env_var_or_default('POD_START_TIMEOUT', '900')
 monitoring_namespace := env_var_or_default('MONITORING_NAMESPACE', NAMESPACE)
 prometheus_namespace := env_var_or_default('PROMETHEUS_NAMESPACE', monitoring_namespace)
@@ -77,6 +84,8 @@ grafana_namespace := env_var_or_default('GRAFANA_NAMESPACE', monitoring_namespac
 grafana_service := env_var_or_default('GRAFANA_SERVICE', 'grafana')
 concurrency := "64"
 duration    := env_var_or_default('BENCHMARK_DURATION', '900')
+sweep_keep_model := env_var_or_default('SWEEP_KEEP_MODEL', 'false')
+orchestrator_redeploy := env_var_or_default('ORCHESTRATOR_REDEPLOY', 'true')
 
 default:
     @just --list
@@ -244,21 +253,24 @@ _run-job concurrency duration dest unsafe_args attempt:
     URL=$(just --quiet _model-url)
     SERVER_METRICS_ARGS=$(just --quiet _server-metrics-args)
     GPU_TELEMETRY_ARGS=$(just --quiet _gpu-telemetry-args)
+    if [ "{{aiperf_allow_dataset_wrap}}" = "true" ]; then
+        DATASET_WRAP_ARGS="--allow-dataset-wrap"
+    else
+        DATASET_WRAP_ARGS=""
+    fi
+    if [ "{{aiperf_num_dataset_entries}}" = "all" ] || [ -z "{{aiperf_num_dataset_entries}}" ]; then
+        NUM_DATASET_ENTRIES_ARGS=""
+    else
+        NUM_DATASET_ENTRIES_ARGS="--num-dataset-entries {{aiperf_num_dataset_entries}}"
+    fi
     TS=$(date -u +%Y%m%d%H%M%S)
     JOB="agentx-aiperf-c{{concurrency}}-a{{attempt}}-${TS}"
     DEST_CLEAN=$(printf '%s' "{{dest}}" | sed 's#^\./##')
     CANONICAL_ARTIFACT_DIR="{{lustre_prefix}}/{{manifesto_user}}/${DEST_CLEAN}"
     ARTIFACT_DIR="${CANONICAL_ARTIFACT_DIR}_attempt{{attempt}}"
     DURATION={{duration}}
-    REF={{aiperf_reference_duration}}
-    AGENTIC_CACHE_WARMUP=$(( DURATION * {{aiperf_reference_cache_warmup}} / REF ))
-    WARMUP_GRACE=$(( DURATION * {{aiperf_reference_warmup_grace}} / REF ))
-    if [ "$AGENTIC_CACHE_WARMUP" -lt {{aiperf_min_cache_warmup}} ]; then
-        AGENTIC_CACHE_WARMUP={{aiperf_min_cache_warmup}}
-    fi
-    if [ "$WARMUP_GRACE" -lt {{aiperf_min_warmup_grace}} ]; then
-        WARMUP_GRACE={{aiperf_min_warmup_grace}}
-    fi
+    AGENTIC_CACHE_WARMUP={{aiperf_cache_warmup_seconds}}
+    WARMUP_GRACE={{aiperf_warmup_grace_seconds}}
     TIMEOUT=$((DURATION + AGENTIC_CACHE_WARMUP + WARMUP_GRACE + 7200))
     TMP=$(mktemp)
     trap "rm -f $TMP" EXIT
@@ -294,6 +306,8 @@ _run-job concurrency duration dest unsafe_args attempt:
                   value: "{{aiperf_dataset_configuration_timeout}}"
                 - name: HF_HOME
                   value: /workspace/.cache/huggingface
+                - name: AIPERF_DATASET_MMAP_CACHE_DIR
+                  value: "{{aiperf_mmap_cache_dir}}"
                 - name: URL
                   value: "${URL}"
                 - name: MODEL
@@ -302,6 +316,10 @@ _run-job concurrency duration dest unsafe_args attempt:
                   value: "${SERVER_METRICS_ARGS}"
                 - name: GPU_TELEMETRY_ARGS
                   value: "${GPU_TELEMETRY_ARGS}"
+                - name: DATASET_WRAP_ARGS
+                  value: "${DATASET_WRAP_ARGS}"
+                - name: NUM_DATASET_ENTRIES_ARGS
+                  value: "${NUM_DATASET_ENTRIES_ARGS}"
                 - name: UNSAFE_ARGS
                   value: "{{unsafe_args}}"
                 - name: ARTIFACT_DIR
@@ -350,9 +368,10 @@ _run-job concurrency duration dest unsafe_args attempt:
                     --trajectory-start-max-ratio {{aiperf_trajectory_start_max_ratio}} \
                     --agentic-cache-warmup-duration ${AGENTIC_CACHE_WARMUP} \
                     --warmup-grace-period ${WARMUP_GRACE} \
-                    --num-dataset-entries {{aiperf_num_dataset_entries}} \
+                    \$NUM_DATASET_ENTRIES_ARGS \
                     --slice-duration {{aiperf_slice_duration}} \
                     --tokenizer-trust-remote-code \
+                    \$DATASET_WRAP_ARGS \
                     \$SERVER_METRICS_ARGS \
                     \$GPU_TELEMETRY_ARGS \
                     --output-artifact-dir "\$ARTIFACT_DIR" \
@@ -373,11 +392,11 @@ _run-job concurrency duration dest unsafe_args attempt:
                   cp -a "\$ARTIFACT_DIR/." "\$CANONICAL_ARTIFACT_DIR/"
               resources:
                 requests:
-                  cpu: "4"
-                  memory: 8Gi
+                  cpu: "8"
+                  memory: 16Gi
                 limits:
-                  cpu: "16"
-                  memory: 32Gi
+                  cpu: "32"
+                  memory: 64Gi
                   ephemeral-storage: 20Gi
               volumeMounts:
                 - name: workspace
@@ -438,7 +457,7 @@ _run-job concurrency duration dest unsafe_args attempt:
         sleep 10
     done
     JOB_DEADLINE=$((SECONDS + TIMEOUT))
-    STALL_LOG_HASH=""
+    STALL_LOG_LAST=""
     STALL_LAST_CHANGE=$SECONDS
     while true; do
         COMPLETE=$(kubectl get job -n "$NS" "$JOB" -o jsonpath='{range .status.conditions[?(@.type=="Complete")]}{.status}{end}' 2>/dev/null || true)
@@ -458,9 +477,9 @@ _run-job concurrency duration dest unsafe_args attempt:
             kubectl describe -n "$NS" "job/$JOB" || true
             exit 1
         fi
-        STALL_LOG_HASH_NEW=$(kubectl logs -n "$NS" "job/$JOB" --tail=5 2>/dev/null | shasum -a 256 | awk '{print $1}')
-        if [ "$STALL_LOG_HASH_NEW" != "$STALL_LOG_HASH" ]; then
-            STALL_LOG_HASH="$STALL_LOG_HASH_NEW"
+        STALL_LOG_NEW=$(kubectl logs -n "$NS" "job/$JOB" --tail=5 2>/dev/null)
+        if [ "$STALL_LOG_NEW" != "$STALL_LOG_LAST" ]; then
+            STALL_LOG_LAST="$STALL_LOG_NEW"
             STALL_LAST_CHANGE=$SECONDS
         elif [ $((SECONDS - STALL_LAST_CHANGE)) -ge {{aiperf_stall_timeout}} ]; then
             echo "ERROR: benchmark job produced no new log output for {{aiperf_stall_timeout}}s; aiperf is likely stuck/deadlocked internally, treating as failed"
@@ -470,11 +489,15 @@ _run-job concurrency duration dest unsafe_args attempt:
         fi
         sleep 10
     done
-    SELECTOR=$(just --quiet _pod-selector prefill)
-    PVC_POD=$(kubectl get pod -n "$NS" -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}')
-    kubectl exec -n "$NS" "$PVC_POD" -c vllm -- test -f "${CANONICAL_ARTIFACT_DIR}/profile_export_aiperf.json" || {
+    ACCESS=$(just --quiet _lustre-access-pod "$POD" aiperf) || {
+        echo "ERROR: no pod found to verify PVC artifacts (benchmark job pod, model pods, or log-reader)"
+        exit 1
+    }
+    PVC_POD=$(printf '%s\n' "$ACCESS" | awk '{print $1}')
+    PVC_CONTAINER=$(printf '%s\n' "$ACCESS" | awk '{print $2}')
+    kubectl exec -n "$NS" "$PVC_POD" -c "$PVC_CONTAINER" -- test -f "${CANONICAL_ARTIFACT_DIR}/profile_export_aiperf.json" || {
         echo "ERROR: profile_export_aiperf.json missing from canonical PVC path after job completion"
-        kubectl exec -n "$NS" "$PVC_POD" -c vllm -- find "$CANONICAL_ARTIFACT_DIR" -maxdepth 2 -type f 2>/dev/null || true
+        kubectl exec -n "$NS" "$PVC_POD" -c "$PVC_CONTAINER" -- find "$CANONICAL_ARTIFACT_DIR" -maxdepth 2 -type f 2>/dev/null || true
         exit 1
     }
     # Benchmark itself succeeded (canonical artifacts confirmed on the PVC above) — record the
@@ -485,7 +508,7 @@ _run-job concurrency duration dest unsafe_args attempt:
     printf '%s\n' "$ARTIFACT_DIR" > "{{dest}}/remote_attempt_artifact_dir.txt"
     CP_RETRIES=3
     cp_attempt=1
-    until kubectl cp -c vllm "$NS/${PVC_POD}:${CANONICAL_ARTIFACT_DIR}/." "{{dest}}"; do
+    until kubectl cp -c "$PVC_CONTAINER" "$NS/${PVC_POD}:${CANONICAL_ARTIFACT_DIR}/." "{{dest}}"; do
         if [ "$cp_attempt" -ge "$CP_RETRIES" ]; then
             echo "WARNING: kubectl cp failed after $CP_RETRIES attempts. The benchmark itself succeeded"
             echo "  and results are safe on the PVC at $CANONICAL_ARTIFACT_DIR, but could not be"
@@ -541,15 +564,19 @@ _copy-result-from-pvc remote dest:
     #!/usr/bin/env bash
     set -euo pipefail
     NS={{NAMESPACE}}
-    SELECTOR=$(just --quiet _pod-selector prefill)
-    PVC_POD=$(kubectl get pod -n "$NS" -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}')
-    if ! kubectl exec -n "$NS" "$PVC_POD" -c vllm -- test -f "{{remote}}/profile_export_aiperf.json" 2>/dev/null; then
+    ACCESS=$(just --quiet _lustre-access-pod) || {
+        echo "ERROR: no pod found to copy results from PVC"
+        exit 1
+    }
+    PVC_POD=$(printf '%s\n' "$ACCESS" | awk '{print $1}')
+    PVC_CONTAINER=$(printf '%s\n' "$ACCESS" | awk '{print $2}')
+    if ! kubectl exec -n "$NS" "$PVC_POD" -c "$PVC_CONTAINER" -- test -f "{{remote}}/profile_export_aiperf.json" 2>/dev/null; then
         exit 1
     fi
     mkdir -p "{{dest}}"
     CP_RETRIES=3
     cp_attempt=1
-    until kubectl cp -c vllm "$NS/${PVC_POD}:{{remote}}/." "{{dest}}"; do
+    until kubectl cp -c "$PVC_CONTAINER" "$NS/${PVC_POD}:{{remote}}/." "{{dest}}"; do
         if [ "$cp_attempt" -ge "$CP_RETRIES" ]; then
             echo "ERROR: kubectl cp from PVC failed after $CP_RETRIES attempts"
             exit 1
@@ -567,51 +594,170 @@ _copy-result-from-pvc remote dest:
 # Copies file-by-file with per-file retries and skips files already present locally, so it's safe
 # to re-run: a huge file (e.g. server_metrics_export.json) repeatedly failing won't block the rest,
 # and a second run only fetches what's still missing.
-# Usage: just fetch-from-reader <remote-canonical-artifact-dir> <local-dest-dir>
-fetch-from-reader remote dest:
+# Usage: just fetch-from-reader <remote-canonical-artifact-dir> <local-dest-dir> [all]
+#   Pass "all" as 3rd arg to include optional archival files (server_metrics, gpu_telemetry, etc.).
+fetch-from-reader remote dest fetch_all="":
     #!/usr/bin/env bash
-    set -euo pipefail
+    {{ if fetch_all == "all" { "export FETCH_ALL=1" } else { "true" } }}
+    set -euxo pipefail
     NS={{NAMESPACE}}
-    if ! kubectl get pod -n "$NS" {{log_reader_pod}} >/dev/null 2>&1; then
+    POD={{log_reader_pod}}
+    if ! kubectl get pod -n "$NS" "$POD" >/dev/null 2>&1; then
         echo "log-reader pod not found, deploying..."
         just logs-dev-up
     fi
-    kubectl wait -n "$NS" --for=condition=Ready "pod/{{log_reader_pod}}" --timeout=60s
+    kubectl wait -n "$NS" --for=condition=Ready "pod/$POD" --timeout=60s
     mkdir -p "{{dest}}/logs"
-    FAILED=""
-    for f in {{benchmark_artifact_files}} profile_export_aiperf_timeslices.csv profile_export_aiperf_timeslices.json; do
-        if [ -f "{{dest}}/$f" ]; then
-            echo "  $f: already present locally, skipping"
-            continue
-        fi
-        if ! kubectl exec -n "$NS" {{log_reader_pod}} -c log-reader -- test -f "{{remote}}/$f" 2>/dev/null; then
-            echo "  $f: not found on PVC, skipping"
-            continue
-        fi
-        RETRIES=5
-        attempt=1
-        until kubectl cp -c log-reader "$NS/{{log_reader_pod}}:{{remote}}/$f" "{{dest}}/$f" 2>/dev/null; do
-            if [ "$attempt" -ge "$RETRIES" ]; then
-                echo "  $f: WARNING failed after $RETRIES attempts"
-                rm -f "{{dest}}/$f"
-                FAILED="${FAILED} $f"
-                break
+
+    SIZEMAP=$(mktemp)
+    trap 'rm -f "$SIZEMAP"' EXIT
+
+    _lsize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+
+    # Snapshot remote file sizes (one kubectl call).
+    kubectl exec -n "$NS" "$POD" -c log-reader -- \
+        ls -la "{{remote}}/" 2>/dev/null | tail -n +2 > "$SIZEMAP"
+
+    _rsize() { awk -v f="$1" '$NF == f {print $5; exit}' "$SIZEMAP"; }
+
+    _fetch() {
+        local rpath="$1" lpath="$2" label="$3" expected="$4"
+        if [ -f "$lpath" ]; then
+            local cur; cur=$(_lsize "$lpath")
+            if [ "$cur" = "$expected" ]; then
+                echo "  $label: already present ($expected bytes), skipping"
+                return 0
             fi
-            echo "  $f: retry $attempt/$RETRIES..."
-            attempt=$((attempt + 1))
-            sleep 5
-        done
-        if [ -f "{{dest}}/$f" ]; then
-            echo "  $f: done"
+            echo "  $label: local $cur ≠ remote $expected, re-downloading"
+            rm -f "$lpath"
         fi
+        local try=0 delay=5 ok=false
+        while [ "$try" -lt 5 ]; do
+            if kubectl cp -c log-reader "$NS/${POD}:${rpath}" "$lpath" 2>/dev/null; then
+                local cur; cur=$(_lsize "$lpath")
+                if [ "$cur" = "$expected" ]; then ok=true; break; fi
+                echo "  $label: truncated ($cur/$expected bytes)"
+                rm -f "$lpath"
+            else
+                echo "  $label: kubectl cp failed"
+            fi
+            try=$((try + 1))
+            echo "  $label: retry $try/5 in ${delay}s..."
+            sleep "$delay"
+            delay=$((delay < 30 ? delay * 2 : 30))
+        done
+        if $ok; then echo "  $label: done ($expected bytes)"; return 0; fi
+        echo "  $label: FAILED after 5 attempts"
+        rm -f "$lpath"
+        return 1
+    }
+
+    FAILED=""
+    # Required files (report + chart).
+    set -- \
+        profile_export_aiperf.json \
+        profile_export_aiperf.csv \
+        profile_export_console.txt
+    # Pass --all to also fetch optional archival artifacts.
+    if [ "${FETCH_ALL:-}" = "1" ]; then
+        set -- "$@" \
+            server_metrics_export.csv \
+            gpu_telemetry_export.jsonl \
+            profile_export_aiperf_timeslices.json \
+            profile_export_aiperf_timeslices.csv \
+            profile_export.jsonl \
+            server_metrics_export.json
+    fi
+    for f do
+        rsz=$(_rsize "$f")
+        if [ -z "$rsz" ]; then echo "  $f: not on PVC, skipping"; continue; fi
+        _fetch "{{remote}}/$f" "{{dest}}/$f" "$f" "$rsz" || FAILED="$FAILED $f"
     done
-    kubectl cp -c log-reader "$NS/{{log_reader_pod}}:{{remote}}/logs/." "{{dest}}/logs" 2>/dev/null || true
+
+    # Fetch logs/ with the same retry + size-verification logic.
+    # kubectl exec -n "$NS" "$POD" -c log-reader -- \
+    #     ls -la "{{remote}}/logs/" 2>/dev/null | tail -n +2 > "$SIZEMAP"
+    # while read -r _ _ _ _ sz _ _ _ lf; do
+    #     [ -z "$lf" ] && continue
+    #     _fetch "{{remote}}/logs/$lf" "{{dest}}/logs/$lf" "logs/$lf" "$sz" \
+    #         || FAILED="$FAILED logs/$lf"
+    # done < "$SIZEMAP"
+
     if [ -n "$FAILED" ]; then
-        echo "Done with failures:${FAILED}"
+        echo "Done with failures:$FAILED"
         echo "Re-run to retry just the missing files: just fetch-from-reader \"{{remote}}\" \"{{dest}}\""
         exit 1
     fi
     echo "All artifacts fetched to {{dest}}/"
+
+# Rename a results_<old> config directory (and every results_<old>_c<N>
+# subdirectory) to results_<new>, so a re-run of the same setup (e.g. after an
+# aiperf/image fix) shows up as its own distinct series in
+# interactivity_vs_throughput.html instead of colliding with the original.
+# Also updates config_name.txt / config_label.txt to the new name.
+#   just rename-results-config results/infX-v1/clear ilmarkov-ix-1p-ep8-1d-ep8 ilmarkov-ix-1p-ep8-1d-ep8-v2
+rename-results-config dir old new:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{dir}}"
+    OLD="{{old}}"
+    NEW="{{new}}"
+    SRC="results_${OLD}"
+    DST="results_${NEW}"
+    if [ ! -d "$SRC" ]; then
+        echo "ERROR: $SRC not found in {{dir}}" >&2
+        exit 1
+    fi
+    if [ -e "$DST" ]; then
+        echo "ERROR: $DST already exists in {{dir}}" >&2
+        exit 1
+    fi
+    mv "$SRC" "$DST"
+    cd "$DST"
+    COUNT=0
+    for d in "results_${OLD}"_c* "results_${OLD}"_attempt*; do
+        [ -d "$d" ] || continue
+        SUFFIX="${d#results_${OLD}}"
+        mv "$d" "results_${NEW}${SUFFIX}"
+        COUNT=$((COUNT + 1))
+    done
+    echo "$NEW" > config_name.txt
+    echo "$NEW" > config_label.txt
+    echo "Local: renamed results_${OLD} -> results_${NEW} ($COUNT subdirs)"
+
+    # Also rename on the PVC so re-runs don't recover stale results.
+    NS={{NAMESPACE}}
+    POD={{log_reader_pod}}
+    DIR_CLEAN=$(printf '%s' "{{dir}}" | sed 's#^\./##')
+    REMOTE_BASE="{{lustre_prefix}}/{{manifesto_user}}/${DIR_CLEAN}"
+    REMOTE_SRC="${REMOTE_BASE}/results_${OLD}"
+    REMOTE_DST="${REMOTE_BASE}/results_${NEW}"
+    if ! kubectl get pod -n "$NS" "$POD" >/dev/null 2>&1; then
+        echo "PVC: log-reader pod not available, skipping PVC rename"
+        echo "  To rename manually later:"
+        echo "  kubectl exec -n $NS $POD -c log-reader -- mv \"$REMOTE_SRC\" \"$REMOTE_DST\""
+        exit 0
+    fi
+    if ! kubectl exec -n "$NS" "$POD" -c log-reader -- test -d "$REMOTE_SRC" 2>/dev/null; then
+        echo "PVC: $REMOTE_SRC not found, nothing to rename"
+        exit 0
+    fi
+    if kubectl exec -n "$NS" "$POD" -c log-reader -- test -e "$REMOTE_DST" 2>/dev/null; then
+        echo "PVC: ERROR $REMOTE_DST already exists, skipping PVC rename" >&2
+        exit 1
+    fi
+    kubectl exec -n "$NS" "$POD" -c log-reader -- mv "$REMOTE_SRC" "$REMOTE_DST"
+    # Rename concurrency and attempt subdirs inside the PVC config dir.
+    PVC_COUNT=0
+    while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        SUFFIX="${d#results_${OLD}}"
+        kubectl exec -n "$NS" "$POD" -c log-reader -- \
+            mv "${REMOTE_DST}/${d}" "${REMOTE_DST}/results_${NEW}${SUFFIX}"
+        PVC_COUNT=$((PVC_COUNT + 1))
+    done < <(kubectl exec -n "$NS" "$POD" -c log-reader -- \
+        ls "${REMOTE_DST}/" 2>/dev/null | grep "^results_${OLD}")
+    echo "PVC:   renamed results_${OLD} -> results_${NEW} ($PVC_COUNT subdirs)"
 
 # Wait for all running requests to drain on prefill and decode pods.
 drain:
@@ -620,11 +766,13 @@ drain:
     NS={{NAMESPACE}}
     PREFILL_SELECTOR=$(just --quiet _pod-selector prefill)
     DECODE_SELECTOR=$(just --quiet _pod-selector decode)
+    PREFILL_PORTS=$(just --quiet _vllm-ports prefill)
+    DECODE_PORTS=$(just --quiet _vllm-ports decode)
     echo "Waiting for all requests to drain..."
     while true; do
         TOTAL=0
         for pod in $(kubectl get pods -n "$NS" -l "$PREFILL_SELECTOR" -o jsonpath='{.items[*].metadata.name}'); do
-            for port in 8000 8001 8002 8003 8004 8005 8006 8007; do
+            for port in $PREFILL_PORTS; do
                 N=$(kubectl exec -n "$NS" "$pod" -c vllm -- \
                     curl -sf "http://localhost:${port}/metrics" 2>/dev/null \
                     | grep '^vllm:num_requests_running' | awk '{printf "%d", $2}') || N=0
@@ -632,7 +780,7 @@ drain:
             done
         done
         for pod in $(kubectl get pods -n "$NS" -l "$DECODE_SELECTOR" -o jsonpath='{.items[*].metadata.name}'); do
-            for port in 8200 8201 8202 8203 8204 8205 8206 8207; do
+            for port in $DECODE_PORTS; do
                 N=$(kubectl exec -n "$NS" "$pod" -c vllm -- \
                     curl -sf "http://localhost:${port}/metrics" 2>/dev/null \
                     | grep '^vllm:num_requests_running' | awk '{printf "%d", $2}') || N=0
@@ -655,17 +803,19 @@ clear-kv-cache:
     PREFILL_SELECTOR=$(just --quiet _pod-selector prefill)
     DECODE_SELECTOR=$(just --quiet _pod-selector decode)
     ALL_WORKER_SELECTOR=$(just --quiet _pod-selector)
+    PREFILL_PORTS=$(just --quiet _vllm-ports prefill)
+    DECODE_PORTS=$(just --quiet _vllm-ports decode)
     # Reset vLLM prefix cache (GPU + CPU tiers) via API
     for pod in $(kubectl get pods -n "$NS" -l "$PREFILL_SELECTOR" -o jsonpath='{.items[*].metadata.name}'); do
         echo "Resetting prefix cache on prefill $pod..."
-        for port in 8000 8001 8002 8003 8004 8005 8006 8007; do
+        for port in $PREFILL_PORTS; do
             kubectl exec -n "$NS" "$pod" -c vllm -- \
                 curl -sf -X POST "http://localhost:${port}/reset_prefix_cache?reset_external=true" 2>/dev/null || true
         done
     done
     for pod in $(kubectl get pods -n "$NS" -l "$DECODE_SELECTOR" -o jsonpath='{.items[*].metadata.name}'); do
         echo "Resetting prefix cache on decode $pod..."
-        for port in 8200 8201 8202 8203 8204 8205 8206 8207; do
+        for port in $DECODE_PORTS; do
             kubectl exec -n "$NS" "$pod" -c vllm -- \
                 curl -sf -X POST "http://localhost:${port}/reset_prefix_cache?reset_external=true" 2>/dev/null || true
         done
@@ -696,12 +846,20 @@ vllm-version dest=".":
     #!/usr/bin/env bash
     set -euo pipefail
     NS={{NAMESPACE}}
-    PREFILL_SELECTOR=$(just --quiet _pod-selector prefill)
+    POD=""
+    for role in prefill decode; do
+        SELECTOR=$(just --quiet _pod-selector "$role")
+        POD=$(kubectl get pod -n "$NS" -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || true
+        if [ -n "$POD" ]; then break; fi
+    done
+    if [ -z "$POD" ]; then
+        echo "ERROR: no prefill or decode pod found for vllm-version"
+        exit 1
+    fi
     # Image tag
-    kubectl get pod -n "$NS" -l "$PREFILL_SELECTOR" -o jsonpath='{.items[0].spec.containers[0].image}' > "{{dest}}/vllm_image.txt"
+    kubectl get pod -n "$NS" "$POD" -o jsonpath='{.spec.containers[0].image}' > "{{dest}}/vllm_image.txt"
     echo "" >> "{{dest}}/vllm_image.txt"
-    # vLLM version from prefill pod startup logs
-    POD=$(kubectl get pod -n "$NS" -l "$PREFILL_SELECTOR" -o jsonpath='{.items[0].metadata.name}')
+    # vLLM version from pod startup logs
     kubectl logs -n "$NS" "$POD" --all-containers 2>/dev/null \
       | sed -n 's/.*version \([^ ]*\).*/\1/p' | head -1 > "{{dest}}/vllm_version.txt" || true
     echo "vllm version saved to {{dest}}/"
@@ -868,9 +1026,14 @@ scrape-grafana +dirs:
 # Reads namespace.txt from each result directory to find the right Grafana instance.
 # Runs export_dashboard.py inside the orchestrator pod via kubectl exec (no port-forward needed).
 # Usage: just report results/<run>
-report outdir:
+#        just report results/<run> --force   (re-run even if output files exist)
+report outdir *flags:
     #!/usr/bin/env bash
     set -euo pipefail
+    FORCE=false
+    for f in {{flags}}; do
+        case "$f" in --force|-f) FORCE=true;; esac
+    done
     DIRS=$(find "{{outdir}}" -name "profile_export_aiperf.json" -exec dirname {} \;)
     if [ -z "$DIRS" ]; then
         echo "No result directories found in {{outdir}}"
@@ -888,6 +1051,7 @@ report outdir:
         if ! echo "$SETUP_NAMESPACES" | grep -q "|${NS}|"; then
             POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
             kubectl cp export_dashboard.py "$NS/${POD}:/workspace/export_dashboard.py"
+            kubectl cp prefix_cache_report.py "$NS/${POD}:/workspace/prefix_cache_report.py"
             SETUP_NAMESPACES="${SETUP_NAMESPACES}|${NS}|${POD}|"
         fi
         POD=$(echo "$SETUP_NAMESPACES" | grep -o "|${NS}|[^|]*|" | head -1 | cut -d'|' -f3)
@@ -904,22 +1068,117 @@ report outdir:
         else
             POD_REGEX="$DEPLOYMENT"
         fi
+        DASHBOARD_FLAG=""
+        if [ -f "$PARENT/topology.txt" ] && [ "$(cat "$PARENT/topology.txt")" = "aggregated" ]; then
+            DASHBOARD_FLAG="--dashboard aggregate-overview"
+        fi
         echo "=== $NAME ($NS): scraping Grafana ==="
-        TIMESTAMPS=$(python3 -c "import json; d=json.load(open('$dir/profile_export_aiperf.json')); print(d['min_request_timestamp']['avg']/1e9-60); print(d['max_response_timestamp']['avg']/1e9+60)")
+        TIMESTAMPS=$(python3 -c "import json, datetime; d=json.load(open('$dir/profile_export_aiperf.json')); f=lambda s: datetime.datetime.fromisoformat(s).replace(tzinfo=datetime.timezone.utc).timestamp(); print(f(d['start_time'])-60); print(f(d['end_time'])+60)")
         START=$(echo "$TIMESTAMPS" | head -1)
         END=$(echo "$TIMESTAMPS" | tail -1)
+        if [ "$FORCE" = false ] && [ -f "$dir/dashboard.html" ]; then
+            echo "  dashboard.html exists, skipping (use --force to re-run)"
+        else
         echo "  Time range: $START → $END"
         echo "  Deployment: $DEPLOYMENT; pod filter seed: $POD_REGEX"
         kubectl exec -n "$NS" "$POD" -- python3 /workspace/export_dashboard.py \
             --grafana-url "$GRAFANA_URL" \
             --deployment "$DEPLOYMENT" \
             --pod-regex "$POD_REGEX" \
+            $DASHBOARD_FLAG \
             single --start "$START" --end "$END" -o "/workspace/dashboard_${NAME}.html" || {
             echo "  WARNING: scrape failed for $NAME, skipping"
             continue
         }
         kubectl cp "$NS/${POD}:/workspace/dashboard_${NAME}.html" "$dir/dashboard.html" 2>/dev/null || true
         kubectl exec -n "$NS" "$POD" -- rm -f "/workspace/dashboard_${NAME}.html"
+        fi
+        echo "=== $NAME ($NS): prefix-cache hit rate report ==="
+        if [ "$FORCE" = false ] && [ -f "$dir/prefix_cache_report.json" ]; then
+            echo "  prefix_cache_report.json exists, skipping (use --force to re-run)"
+        else
+        CACHE_STATS=$(python3 -c "import json; d=json.load(open('$dir/profile_export_aiperf.json')); print(d.get('theoretical_prefix_cache_hit',{}).get('avg','')); print(d.get('overall_usage_prompt_cache_read_pct',{}).get('avg',''))")
+        THEORETICAL_PCT=$(echo "$CACHE_STATS" | sed -n '1p')
+        USAGE_PCT=$(echo "$CACHE_STATS" | sed -n '2p')
+        kubectl exec -n "$NS" "$POD" -- python3 /workspace/prefix_cache_report.py \
+            --grafana-url "$GRAFANA_URL" \
+            --deployment "$DEPLOYMENT" \
+            --pod-regex "$POD_REGEX" \
+            --start "$START" --end "$END" \
+            --name "$NAME" \
+            --theoretical-pct "$THEORETICAL_PCT" \
+            --usage-overall-pct "$USAGE_PCT" \
+            -o "/workspace/prefix_cache_${NAME}.txt" \
+            --output-json "/workspace/prefix_cache_${NAME}.json" || {
+            echo "  WARNING: prefix-cache report failed for $NAME, skipping"
+            continue
+        }
+        kubectl cp "$NS/${POD}:/workspace/prefix_cache_${NAME}.txt" "$dir/prefix_cache_report.txt" 2>/dev/null || true
+        kubectl cp "$NS/${POD}:/workspace/prefix_cache_${NAME}.json" "$dir/prefix_cache_report.json" 2>/dev/null || true
+        kubectl exec -n "$NS" "$POD" -- rm -f "/workspace/prefix_cache_${NAME}.txt" "/workspace/prefix_cache_${NAME}.json"
+        fi
+        echo "=== $NAME ($NS): KV cache config ==="
+        if [ "$FORCE" = false ] && [ -f "$dir/kv_cache_config.json" ]; then
+            echo "  kv_cache_config.json exists, skipping (use --force to re-run)"
+        else
+        KV_DECODE=0 KV_PREFILL=0 KV_FOUND=false
+        MANIFESTO="{{manifesto_root}}"
+        LOG_READER={{log_reader_pod}}
+        BENCH_TS=$(python3 -c "from datetime import datetime, timezone; print(datetime.fromtimestamp($START+60, tz=timezone.utc).strftime('%Y%m%d-%H%M%S'))")
+        if kubectl get pod -n "$NS" "$LOG_READER" >/dev/null 2>&1; then
+            for role in decode prefill; do
+                LOG_DIR=$(cd "$MANIFESTO" && uv run manifesto log-path "{{manifesto_spec}}" --user "{{manifesto_user}}" --role "$role" 2>/dev/null) || continue
+                # Find log files with timestamp <= benchmark start, pick the latest per pod
+                MATCHING=$(kubectl exec -n "$NS" "$LOG_READER" -c log-reader -- sh -c "
+                    for f in ${LOG_DIR}/*.log; do
+                        [ -f \"\$f\" ] || continue
+                        bn=\$(basename \"\$f\")
+                        ts=\$(echo \"\$bn\" | grep -o '[0-9]\\{8\\}-[0-9]\\{6\\}' | tail -1)
+                        [ -z \"\$ts\" ] && continue
+                        [ \"\$ts\" \\> \"$BENCH_TS\" ] && continue
+                        echo \"\$ts \$f\"
+                    done | sort -t' ' -k1,1r" 2>/dev/null) || continue
+                [ -z "$MATCHING" ] && continue
+                # Deduplicate: keep the latest file per pod hostname
+                # Only consider logs from pods matching this deployment
+                POD_FILTER=$(echo "$POD_REGEX" | sed 's/ /|/g')
+                SEEN_PODS=""
+                FILES=""
+                while IFS=' ' read -r _ts fpath; do
+                    pod_name=$(basename "$fpath" | sed 's/_[0-9]\{8\}-[0-9]\{6\}\.log$//')
+                    # Skip logs from other deployments
+                    if ! echo "$pod_name" | grep -qE "$POD_FILTER"; then
+                        continue
+                    fi
+                    if ! echo "$SEEN_PODS" | grep -qF "|${pod_name}|"; then
+                        SEEN_PODS="${SEEN_PODS}|${pod_name}|"
+                        FILES="${FILES} ${fpath}"
+                    fi
+                done <<< "$MATCHING"
+                [ -z "$FILES" ] && continue
+                # Take the first GPU KV cache size value (all ranks report the same capacity)
+                ROLE_TOKENS=""
+                for f in $FILES; do
+                    ROLE_TOKENS=$(kubectl exec -n "$NS" "$LOG_READER" -c log-reader -- grep 'GPU KV cache size:' "$f" 2>/dev/null \
+                        | head -1 | sed 's/.*GPU KV cache size: *//;s/ *tokens.*//' | tr -d ',') || true
+                    if [ -n "$ROLE_TOKENS" ] && [ "$ROLE_TOKENS" != "0" ]; then
+                        echo "  $role: $ROLE_TOKENS tokens (from $(basename "$f"))"
+                        KV_FOUND=true
+                        break
+                    fi
+                done
+                if [ -n "$ROLE_TOKENS" ] && [ "$ROLE_TOKENS" != "0" ]; then
+                    if [ "$role" = "decode" ]; then KV_DECODE=$ROLE_TOKENS; else KV_PREFILL=$ROLE_TOKENS; fi
+                fi
+            done
+        fi
+        if $KV_FOUND; then
+            python3 -c "import json; json.dump({'prefill': $KV_PREFILL or None, 'decode': $KV_DECODE or None}, open('$dir/kv_cache_config.json','w'), indent=2)"
+            echo "  Written to $dir/kv_cache_config.json"
+        else
+            echo "  WARNING: no KV cache size found in logs, skipping"
+        fi
+        fi
     done
     # Snapshot Prometheus TSDB for each namespace (preserves all metrics)
     SNAPPED=""
@@ -962,18 +1221,24 @@ _manifesto-info:
     from manifesto.instance import Instance
     from manifesto.spec import load_spec
     spec = load_spec("{{manifesto_spec}}", load_cluster("{{manifesto_cluster}}"))
-    instance = Instance("{{manifesto_user}}", spec.release).instance_id
+    inst = Instance("{{manifesto_user}}", spec.release)
+    instance = inst.instance_id
     roles = {r.name: r for r in spec.roles}
     def role_gpus(name):
         r = roles.get(name)
         return 0 if r is None else r.lws.size * r.lws.replicas * r.gpus_per_pod
+    pods_parts = []
+    for r in spec.roles:
+        wn = inst.user_scoped_name(r.workload_name) if r.workload_name else inst.name(r.name)
+        pods_parts.append(wn + ".*")
     print(f"instance={instance}")
     print(f"model={spec.model.id}")
     print(f"model_label={spec.model.label}")
     print(f"release={spec.release}")
+    print(f"topology={spec.topology.value}")
     print(f"decode_gpus={role_gpus('decode')}")
     print(f"prefill_gpus={role_gpus('prefill')}")
-    print(f"pods={spec.release}")
+    print(f"pods={' '.join(pods_parts)}")
     PY
 
 _model-url:
@@ -994,9 +1259,7 @@ _server-metrics-args:
         printf -- '--server-metrics %s\n' "{{server_metrics_url}}"
         exit 0
     fi
-    URL=$(just --quiet _model-url)
-    BASE="${URL%/v1}"
-    printf -- '--server-metrics %s/metrics\n' "$BASE"
+    printf -- '--no-server-metrics\n'
 
 _gpu-telemetry-args:
     #!/usr/bin/env bash
@@ -1005,28 +1268,76 @@ _gpu-telemetry-args:
         printf -- '--gpu-telemetry %s\n' "{{gpu_telemetry_urls}}"
         exit 0
     fi
-    INFO=$(just --quiet _manifesto-info)
-    INSTANCE=$(printf '%s\n' "$INFO" | sed -n 's/^instance=//p')
-    URLS=$(kubectl get pod -n "{{NAMESPACE}}" \
-        -l "app.kubernetes.io/instance=${INSTANCE},llm-d.ai/role" \
-        -o jsonpath='{range .items[*]}http://{.status.podIP}:9400/metrics{" "}{end}' 2>/dev/null \
-        | xargs)
-    if [ -n "$URLS" ]; then
-        printf -- '--gpu-telemetry %s\n' "$URLS"
-    else
-        printf -- '--no-gpu-telemetry\n'
-    fi
+    printf -- '--no-gpu-telemetry\n'
 
 _pod-selector role="":
     #!/usr/bin/env bash
     set -euo pipefail
-    INFO=$(just --quiet _manifesto-info)
-    INSTANCE=$(printf '%s\n' "$INFO" | sed -n 's/^instance=//p')
+    # Use llm-d.ai/owner, not app.kubernetes.io/instance: the instance id embeds
+    # spec.release (e.g. ...-v2 vs ...-v3) and stops matching running pods after
+    # a release bump while the old deployment is still up.
     if [ -n "{{role}}" ]; then
-        printf 'app.kubernetes.io/instance=%s,llm-d.ai/role=%s\n' "$INSTANCE" "{{role}}"
+        printf 'llm-d.ai/owner=%s,llm-d.ai/role=%s,app.kubernetes.io/component=model-server\n' \
+            "{{manifesto_user}}" "{{role}}"
     else
-        printf 'app.kubernetes.io/instance=%s,llm-d.ai/role\n' "$INSTANCE"
+        printf 'llm-d.ai/owner=%s,app.kubernetes.io/component=model-server\n' "{{manifesto_user}}"
     fi
+
+# Print "pod_name container" for a pod that mounts the Lustre PVC.
+# Prefer an explicit pod (e.g. the completed benchmark job) when provided.
+_lustre-access-pod preferred_pod="" preferred_container="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    if [ -n "{{preferred_pod}}" ] && [ -n "{{preferred_container}}" ]; then
+        if kubectl get pod -n "$NS" "{{preferred_pod}}" >/dev/null 2>&1; then
+            printf '%s %s\n' "{{preferred_pod}}" "{{preferred_container}}"
+            exit 0
+        fi
+    fi
+    for role in prefill decode; do
+        SELECTOR=$(just --quiet _pod-selector "$role")
+        POD=$(kubectl get pod -n "$NS" -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || true
+        if [ -n "$POD" ]; then
+            printf '%s vllm\n' "$POD"
+            exit 0
+        fi
+    done
+    INFO=$(just --quiet _manifesto-info)
+    PODS=$(printf '%s\n' "$INFO" | sed -n 's/^pods=//p')
+    for pattern in $PODS; do
+        POD=$(kubectl get pods -n "$NS" -o name 2>/dev/null | grep -E "$pattern" | head -1 | sed 's|pod/||')
+        if [ -n "$POD" ]; then
+            printf '%s vllm\n' "$POD"
+            exit 0
+        fi
+    done
+    LR={{log_reader_pod}}
+    if kubectl get pod -n "$NS" "$LR" >/dev/null 2>&1; then
+        printf '%s log-reader\n' "$LR"
+        exit 0
+    fi
+    exit 1
+
+_vllm-ports role:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{manifesto_root}}"
+    uv run python - <<'PY'
+    from manifesto.spec import load_spec
+    from manifesto.cluster import load_cluster
+    from manifesto.parallelism import parallel_layout
+    from manifesto.dp_ports import derive_ports
+    spec = load_spec("{{manifesto_spec}}", load_cluster("{{manifesto_cluster}}"))
+    try:
+        role = spec.role("{{role}}")
+    except (KeyError, StopIteration):
+        pass
+    else:
+        layout = parallel_layout(role)
+        ports = derive_ports(rank_count=layout.dp_local_size, public_base=role.serving_port_base, backend_base=role.backend_port_base)
+        print(" ".join(str(p) for p in ports.backend))
+    PY
 
 _smoke-interactivity dest concurrency:
     #!/usr/bin/env bash
@@ -1043,6 +1354,7 @@ _smoke-interactivity dest concurrency:
     DECODE_GPUS=$(printf '%s\n' "$INFO" | sed -n 's/^decode_gpus=//p')
     PREFILL_GPUS=$(printf '%s\n' "$INFO" | sed -n 's/^prefill_gpus=//p')
     PODS=$(printf '%s\n' "$INFO" | sed -n 's/^pods=//p')
+    TOPOLOGY=$(printf '%s\n' "$INFO" | sed -n 's/^topology=//p')
     SPEC="{{manifesto_spec}}"
     MODEL_DIR=$(basename "$(dirname "$SPEC")")
     SPEC_NAME=$(basename "$SPEC" .yaml)
@@ -1066,6 +1378,7 @@ _smoke-interactivity dest concurrency:
     printf '%s\n' "$DECODE_GPUS" > "$WORK/results_${CONFIG_NAME}/decode_gpus.txt"
     printf '%s\n' "$PREFILL_GPUS" > "$WORK/results_${CONFIG_NAME}/prefill_gpus.txt"
     printf '%s\n' "$PODS" > "$WORK/results_${CONFIG_NAME}/pods.txt"
+    printf '%s\n' "$TOPOLOGY" > "$WORK/results_${CONFIG_NAME}/topology.txt"
     python3 gen_interactivity_chart.py "$WORK"
     mv "$WORK/interactivity_vs_throughput.html" "$DEST/interactivity_vs_throughput.html"
 
@@ -1155,9 +1468,10 @@ sweep-concurrency config_name dest="." duration="900":
         echo "Failed concurrency levels:${FAILED}"
     fi
 
-sweep outdir duration="900":
+sweep outdir duration="900" keep_model=sweep_keep_model:
     #!/usr/bin/env bash
     set -euo pipefail
+    KEEP_MODEL="{{keep_model}}"
     mkdir -p "{{outdir}}"
     INFO=$(just --quiet _manifesto-info)
     CONFIG_NAME=$(printf '%s\n' "$INFO" | sed -n 's/^instance=//p')
@@ -1167,6 +1481,7 @@ sweep outdir duration="900":
     DECODE_GPUS=$(printf '%s\n' "$INFO" | sed -n 's/^decode_gpus=//p')
     PREFILL_GPUS=$(printf '%s\n' "$INFO" | sed -n 's/^prefill_gpus=//p')
     PODS=$(printf '%s\n' "$INFO" | sed -n 's/^pods=//p')
+    TOPOLOGY=$(printf '%s\n' "$INFO" | sed -n 's/^topology=//p')
     dir="{{outdir}}/results_${CONFIG_NAME}"
     ALL_DONE=true
     for C in {{benchmark_concurrencies}}; do
@@ -1180,10 +1495,14 @@ sweep outdir duration="900":
         exit 0
     fi
     echo "====== ${CONFIG_NAME} (${RELEASE}) ======"
-    just stop-model 2>/dev/null || true
-    just start-model
-    just check
-    just warmup
+    if [ "$KEEP_MODEL" = "true" ] || [ "$KEEP_MODEL" = "1" ]; then
+        echo "Keeping existing model (skip stop/start/check/warmup)"
+    else
+        just stop-model 2>/dev/null || true
+        just start-model
+        just check
+        just warmup
+    fi
     mkdir -p "$dir"
     echo "{{NAMESPACE}}" > "$dir/namespace.txt"
     echo "$MODEL_ID" > "$dir/model.txt"
@@ -1193,14 +1512,48 @@ sweep outdir duration="900":
     echo "$DECODE_GPUS" > "$dir/decode_gpus.txt"
     echo "$PREFILL_GPUS" > "$dir/prefill_gpus.txt"
     echo "$PODS" > "$dir/pods.txt"
+    echo "$TOPOLOGY" > "$dir/topology.txt"
     echo "{{manifesto_spec}}" > "$dir/manifesto_spec.txt"
     (cd "{{manifesto_root}}" && uv run manifesto instance-id "{{manifesto_spec}}" --user "{{manifesto_user}}") > "$dir/manifesto_instance.txt"
     (cd "{{manifesto_root}}" && uv run manifesto render "{{manifesto_spec}}" --cluster "{{manifesto_cluster}}" --namespace "{{NAMESPACE}}" --user "{{manifesto_user}}" {{manifesto_args}}) \
         | uv run python "{{repo_root}}/inject_kueue_queue.py" --queue "{{kueue_queue}}" \
         > "$dir/manifest.yaml"
     just vllm-version "$dir"
+    # Capture per-rank KV cache size from pod logs (before any restarts)
+    echo "=== Capturing KV cache config ==="
+    KV_DECODE="" KV_PREFILL=""
+    for pod_pattern in $PODS; do
+        POD_NAME=$(kubectl get pods -n "{{NAMESPACE}}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+            | grep -m1 "$pod_pattern") || true
+        [ -z "$POD_NAME" ] && continue
+        TOKENS=""
+        while IFS= read -r line; do
+            case "$line" in
+                *"GPU KV cache size:"*)
+                    TOKENS=$(printf '%s' "$line" | sed 's/.*GPU KV cache size: *//;s/ *tokens.*//' | tr -d ',')
+                    break
+                    ;;
+            esac
+        done < <(kubectl logs -n "{{NAMESPACE}}" "$POD_NAME" -c vllm 2>/dev/null || true)
+        [ -z "$TOKENS" ] && continue
+        if echo "$pod_pattern" | grep -qi "prefill"; then
+            KV_PREFILL="$TOKENS"
+            echo "  prefill: $TOKENS tokens (from $POD_NAME)"
+        else
+            KV_DECODE="$TOKENS"
+            echo "  decode: $TOKENS tokens (from $POD_NAME)"
+        fi
+    done
+    if [ -n "$KV_PREFILL" ]; then PREFILL_JSON="$KV_PREFILL"; else PREFILL_JSON="null"; fi
+    if [ -n "$KV_DECODE" ]; then DECODE_JSON="$KV_DECODE"; else DECODE_JSON="null"; fi
+    python3 -c "import json; json.dump({'prefill': $PREFILL_JSON, 'decode': $DECODE_JSON}, open('$dir/kv_cache_config.json','w'), indent=2)"
+    echo "  Saved to $dir/kv_cache_config.json"
     just sweep-concurrency "$CONFIG_NAME" "$dir" {{duration}}
-    just stop-model
+    if [ "$KEEP_MODEL" != "true" ] && [ "$KEEP_MODEL" != "1" ]; then
+        just stop-model
+    else
+        echo "Keeping model running after sweep"
+    fi
 
 snapshot-prometheus ns dest:
     #!/usr/bin/env bash
@@ -1255,12 +1608,11 @@ orchestrator-spec-config:
         printf "AIPERF_TRAJECTORY_START_MAX_RATIO='%s'\n" "{{aiperf_trajectory_start_max_ratio}}"
         printf "AIPERF_NUM_DATASET_ENTRIES='%s'\n" "{{aiperf_num_dataset_entries}}"
         printf "AIPERF_SLICE_DURATION='%s'\n" "{{aiperf_slice_duration}}"
+        printf "AIPERF_ALLOW_DATASET_WRAP='%s'\n" "{{aiperf_allow_dataset_wrap}}"
         printf "AIPERF_DATASET_CONFIGURATION_TIMEOUT='%s'\n" "{{aiperf_dataset_configuration_timeout}}"
-        printf "AIPERF_REFERENCE_DURATION='%s'\n" "{{aiperf_reference_duration}}"
-        printf "AIPERF_REFERENCE_CACHE_WARMUP='%s'\n" "{{aiperf_reference_cache_warmup}}"
-        printf "AIPERF_REFERENCE_WARMUP_GRACE='%s'\n" "{{aiperf_reference_warmup_grace}}"
-        printf "AIPERF_MIN_CACHE_WARMUP='%s'\n" "{{aiperf_min_cache_warmup}}"
-        printf "AIPERF_MIN_WARMUP_GRACE='%s'\n" "{{aiperf_min_warmup_grace}}"
+        printf "AIPERF_DATASET_MMAP_CACHE_DIR='%s'\n" "{{aiperf_mmap_cache_dir}}"
+        printf "AIPERF_CACHE_WARMUP_SECONDS='%s'\n" "{{aiperf_cache_warmup_seconds}}"
+        printf "AIPERF_WARMUP_GRACE_SECONDS='%s'\n" "{{aiperf_warmup_grace_seconds}}"
     } > "$TMP"
     kubectl create configmap {{orchestrator_spec_configmap}} -n {{NAMESPACE}} \
       --from-file=benchmark-sweep.env="$TMP" \
@@ -1343,15 +1695,30 @@ orchestrator-sync:
     just orchestrator-sync-manifesto
     just orchestrator-sync-harness
 
-orchestrator-run outdir="" duration=duration:
+orchestrator-run outdir="" duration=duration redeploy=orchestrator_redeploy keep_model=sweep_keep_model:
     #!/usr/bin/env bash
     set -euo pipefail
     OUTDIR="{{outdir}}"
+    REDEPLOY="{{redeploy}}"
     if [ -z "$OUTDIR" ]; then
         OUTDIR=$(just --quiet run-dir "{{duration}}")
     fi
-    just orchestrator-deploy
-    just orchestrator-sync
+    if [ "$REDEPLOY" = "true" ] || [ "$REDEPLOY" = "1" ]; then
+        just orchestrator-deploy
+    else
+        echo "Keeping existing orchestrator (skip deploy/restart)"
+        POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || true
+        if [ -z "$POD" ]; then
+            echo "ERROR: no orchestrator pod found; run just orchestrator-deploy first or set ORCHESTRATOR_REDEPLOY=true" >&2
+            exit 1
+        fi
+        echo "Orchestrator pod: $POD"
+    fi
+    # orchestrator-deploy already restarted the pod with the current ConfigMap,
+    # so sync files directly onto that fresh pod instead of going through
+    # orchestrator-sync (which would trigger a second, redundant restart+wait).
+    just orchestrator-sync-manifesto
+    just orchestrator-sync-harness
     NS={{NAMESPACE}}
     POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
     kubectl exec -n "$NS" "$POD" -- env \
@@ -1367,7 +1734,8 @@ orchestrator-run outdir="" duration=duration:
       URL="{{url}}" \
       SWEEP_OUTDIR="$OUTDIR" \
       SWEEP_DURATION="{{duration}}" \
-      bash -lc 'set -euo pipefail; set -a; [ -f /workspace/benchmark-sweep.env ] && . /workspace/benchmark-sweep.env; set +a; cd /workspace/agentx-mvp; rm -f /workspace/orchestrator-sweep.exit_code; : > /workspace/orchestrator-sweep.log; nohup bash -lc '"'"'set -a; [ -f /workspace/benchmark-sweep.env ] && . /workspace/benchmark-sweep.env; set +a; just sweep "$SWEEP_OUTDIR" "$SWEEP_DURATION" > /workspace/orchestrator-sweep.log 2>&1; code=$?; echo "$code" > /workspace/orchestrator-sweep.exit_code; rm -f /workspace/orchestrator-sweep.pid; exit "$code"'"'"' </dev/null >/dev/null 2>&1 & pid=$!; echo "$pid" > /workspace/orchestrator-sweep.pid; echo "Launched PID $pid"'
+      SWEEP_KEEP_MODEL="{{keep_model}}" \
+      bash -lc 'set -euo pipefail; set -a; [ -f /workspace/benchmark-sweep.env ] && . /workspace/benchmark-sweep.env; set +a; cd /workspace/agentx-mvp; rm -f /workspace/orchestrator-sweep.exit_code; : > /workspace/orchestrator-sweep.log; nohup bash -lc '"'"'set -a; [ -f /workspace/benchmark-sweep.env ] && . /workspace/benchmark-sweep.env; set +a; just sweep "$SWEEP_OUTDIR" "$SWEEP_DURATION" "$SWEEP_KEEP_MODEL" > /workspace/orchestrator-sweep.log 2>&1; code=$?; echo "$code" > /workspace/orchestrator-sweep.exit_code; rm -f /workspace/orchestrator-sweep.pid; exit "$code"'"'"' </dev/null >/dev/null 2>&1 & pid=$!; echo "$pid" > /workspace/orchestrator-sweep.pid; echo "Launched PID $pid"'
     echo "Sweep running detached: $OUTDIR"
     echo "Monitor: just orchestrator-logs"
     echo "Copy results: just orchestrator-results $OUTDIR"
@@ -1376,7 +1744,7 @@ orchestrator-logs:
     #!/usr/bin/env bash
     set -euo pipefail
     POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
-    kubectl exec -n {{NAMESPACE}} "$POD" -- tail -f /workspace/orchestrator-sweep.log
+    kubectl exec -n {{NAMESPACE}} "$POD" -- tail -n 150 -f /workspace/orchestrator-sweep.log
 
 orchestrator-results outdir:
     #!/usr/bin/env bash

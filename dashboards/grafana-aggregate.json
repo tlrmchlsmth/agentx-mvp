@@ -5776,6 +5776,128 @@
       ],
       "title": "GPU Power Draw",
       "type": "timeseries"
+    },
+    {
+      "id": 900,
+      "type": "row",
+      "title": "Prefix Cache",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 157 },
+      "panels": []
+    },
+    {
+      "id": 901,
+      "type": "timeseries",
+      "title": "Local Prefix Cache Hit Rate",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 158 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(vllm:prefix_cache_hits_total{job=\"vllm-aggregate\", pod=~\"${deployment}-.*\"}[1m]) / rate(vllm:prefix_cache_queries_total{job=\"vllm-aggregate\", pod=~\"${deployment}-.*\"}[1m])",
+          "legendFormat": "{{pod}} engine={{engine}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 902,
+      "type": "timeseries",
+      "title": "External Prefix Cache Hit Rate (KV Transfer)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 158 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(vllm:external_prefix_cache_hits_total{job=\"vllm-aggregate\", pod=~\"${deployment}-.*\"}[1m]) / rate(vllm:external_prefix_cache_queries_total{job=\"vllm-aggregate\", pod=~\"${deployment}-.*\"}[1m])",
+          "legendFormat": "{{pod}} engine={{engine}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 903,
+      "type": "timeseries",
+      "title": "Cached Prompt Tokens Rate",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 166 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(vllm:prompt_tokens_cached_total{job=\"vllm-aggregate\", pod=~\"${deployment}-.*\"}[1m])",
+          "legendFormat": "{{pod}} engine={{engine}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 904,
+      "type": "timeseries",
+      "title": "Prefix Cache Queries vs Hits Rate",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 166 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(vllm:prefix_cache_queries_total{job=\"vllm-aggregate\", pod=~\"${deployment}-.*\"}[1m])",
+          "legendFormat": "queries {{pod}} e{{engine}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(vllm:prefix_cache_hits_total{job=\"vllm-aggregate\", pod=~\"${deployment}-.*\"}[1m])",
+          "legendFormat": "hits {{pod}} e{{engine}}",
+          "refId": "B"
+        }
+      ]
     }
   ],
   "preload": false,
@@ -5805,18 +5927,18 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(vllm:num_requests_running, pod)",
+        "definition": "label_values(vllm:num_requests_running{job=\"vllm-aggregate\"}, pod)",
         "includeAll": true,
         "label": "Deployment",
         "name": "deployment",
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(vllm:num_requests_running, pod)",
+          "query": "label_values(vllm:num_requests_running{job=\"vllm-aggregate\"}, pod)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
-        "regex": "/^(.*?)-(prefill|decode|aggregate)-.*$/",
+        "regex": "/^(.*)-\\d+$/",
         "sort": 1,
         "type": "query"
       }

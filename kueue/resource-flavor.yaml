@@ -3,9 +3,11 @@ kind: ResourceFlavor
 metadata:
   name: gb200
 spec:
+  # Rack selection (hpc-rack-2 | hpc-rack-3) lives in llm-manifesto
+  # clusters/oci-gb200.yaml pod_defaults.affinity — Kueue nodeLabels are ANDed
+  # and cannot express rack OR, so only pin the GPU product here.
   nodeLabels:
     nvidia.com/gpu.product: "NVIDIA-GB200"
-    node-role.kubernetes.io/hpc-rack-2: ""
   tolerations:
     - key: nvidia.com/gpu
       operator: Exists
