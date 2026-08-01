@@ -489,38 +489,29 @@ _run-job concurrency duration dest unsafe_args attempt:
         fi
         sleep 10
     done
-    ACCESS=$(just --quiet _lustre-access-pod "$POD" aiperf) || {
-        echo "ERROR: no pod found to verify PVC artifacts (benchmark job pod, model pods, or log-reader)"
-        exit 1
-    }
-    PVC_POD=$(printf '%s\n' "$ACCESS" | awk '{print $1}')
-    PVC_CONTAINER=$(printf '%s\n' "$ACCESS" | awk '{print $2}')
-    kubectl exec -n "$NS" "$PVC_POD" -c "$PVC_CONTAINER" -- test -f "${CANONICAL_ARTIFACT_DIR}/profile_export_aiperf.json" || {
+    # Job pods are Succeeded and cannot exec; use log-reader for PVC verify/copy.
+    just _ensure-log-reader
+    LR={{log_reader_pod}}
+    if ! kubectl exec -n "$NS" "$LR" -c log-reader -- test -f "${CANONICAL_ARTIFACT_DIR}/profile_export_aiperf.json" 2>/dev/null; then
         echo "ERROR: profile_export_aiperf.json missing from canonical PVC path after job completion"
-        kubectl exec -n "$NS" "$PVC_POD" -c "$PVC_CONTAINER" -- find "$CANONICAL_ARTIFACT_DIR" -maxdepth 2 -type f 2>/dev/null || true
+        kubectl exec -n "$NS" "$LR" -c log-reader -- ls -la "${CANONICAL_ARTIFACT_DIR}" 2>/dev/null \
+            || kubectl exec -n "$NS" "$LR" -c log-reader -- find "$(dirname "${CANONICAL_ARTIFACT_DIR}")" -maxdepth 1 -type d 2>/dev/null \
+            || true
         exit 1
-    }
+    fi
     # Benchmark itself succeeded (canonical artifacts confirmed on the PVC above) — record the
     # remote paths now, before attempting the local copy, so they survive even if the copy fails.
     mkdir -p "{{dest}}/logs"
     printf '%s\n' "$JOB" > "{{dest}}/job_name.txt"
     printf '%s\n' "$CANONICAL_ARTIFACT_DIR" > "{{dest}}/remote_artifact_dir.txt"
     printf '%s\n' "$ARTIFACT_DIR" > "{{dest}}/remote_attempt_artifact_dir.txt"
-    CP_RETRIES=3
-    cp_attempt=1
-    until kubectl cp -c "$PVC_CONTAINER" "$NS/${PVC_POD}:${CANONICAL_ARTIFACT_DIR}/." "{{dest}}"; do
-        if [ "$cp_attempt" -ge "$CP_RETRIES" ]; then
-            echo "WARNING: kubectl cp failed after $CP_RETRIES attempts. The benchmark itself succeeded"
-            echo "  and results are safe on the PVC at $CANONICAL_ARTIFACT_DIR, but could not be"
-            echo "  downloaded locally right now (likely a flaky kubectl connection). NOT retrying"
-            echo "  the benchmark - moving on. Recover later with:"
-            echo "  just fetch-from-reader \"$CANONICAL_ARTIFACT_DIR\" \"{{dest}}\""
-            exit 0
-        fi
-        echo "kubectl cp failed (attempt $cp_attempt/$CP_RETRIES), retrying in 10s..."
-        sleep 10
-        cp_attempt=$((cp_attempt + 1))
-    done
+    if ! just _copy-result-from-pvc "${CANONICAL_ARTIFACT_DIR}" "{{dest}}"; then
+        echo "WARNING: could not copy artifacts locally. The benchmark itself succeeded"
+        echo "  and results are safe on the PVC at $CANONICAL_ARTIFACT_DIR. NOT retrying"
+        echo "  the benchmark - moving on. Recover later with:"
+        echo "  just fetch-from-reader \"${CANONICAL_ARTIFACT_DIR}\" \"{{dest}}\""
+        exit 0
+    fi
     if [ ! -f "{{dest}}/profile_export_aiperf.json" ]; then
         echo "WARNING: kubectl cp reported success but profile_export_aiperf.json is still missing"
         echo "  from {{dest}} (likely a silently truncated transfer). The benchmark itself succeeded"
@@ -560,53 +551,36 @@ smoke-e2e dest="results_smoke" concurrency="1" duration="60":
 results dest="./results":
     @echo "AIPerf Jobs copy artifacts directly into the run directory; no runner pod copy is needed."
 
-_copy-result-from-pvc remote dest:
+# Ensure the dedicated log-reader pod is up (stable Lustre access for test/cp).
+_ensure-log-reader:
     #!/usr/bin/env bash
     set -euo pipefail
     NS={{NAMESPACE}}
-    ACCESS=$(just --quiet _lustre-access-pod) || {
-        echo "ERROR: no pod found to copy results from PVC"
-        exit 1
-    }
-    PVC_POD=$(printf '%s\n' "$ACCESS" | awk '{print $1}')
-    PVC_CONTAINER=$(printf '%s\n' "$ACCESS" | awk '{print $2}')
-    if ! kubectl exec -n "$NS" "$PVC_POD" -c "$PVC_CONTAINER" -- test -f "{{remote}}/profile_export_aiperf.json" 2>/dev/null; then
-        exit 1
-    fi
-    mkdir -p "{{dest}}"
-    CP_RETRIES=3
-    cp_attempt=1
-    until kubectl cp -c "$PVC_CONTAINER" "$NS/${PVC_POD}:{{remote}}/." "{{dest}}"; do
-        if [ "$cp_attempt" -ge "$CP_RETRIES" ]; then
-            echo "ERROR: kubectl cp from PVC failed after $CP_RETRIES attempts"
-            exit 1
-        fi
-        echo "kubectl cp from PVC failed (attempt $cp_attempt/$CP_RETRIES), retrying in 10s..."
-        sleep 10
-        cp_attempt=$((cp_attempt + 1))
-    done
-
-# Manually fetch already-completed benchmark results straight from the Lustre PVC (via the
-# dedicated log-reader pod, see logs-dev-up) to a local directory on this machine. Use this when
-# the orchestrator successfully ran a benchmark but couldn't copy the results out itself (see the
-# WARNING printed by _run-job, which includes the exact command to run).
-#
-# Copies file-by-file with per-file retries and skips files already present locally, so it's safe
-# to re-run: a huge file (e.g. server_metrics_export.json) repeatedly failing won't block the rest,
-# and a second run only fetches what's still missing.
-# Usage: just fetch-from-reader <remote-canonical-artifact-dir> <local-dest-dir> [all]
-#   Pass "all" as 3rd arg to include optional archival files (server_metrics, gpu_telemetry, etc.).
-fetch-from-reader remote dest fetch_all="":
-    #!/usr/bin/env bash
-    {{ if fetch_all == "all" { "export FETCH_ALL=1" } else { "true" } }}
-    set -euxo pipefail
-    NS={{NAMESPACE}}
     POD={{log_reader_pod}}
     if ! kubectl get pod -n "$NS" "$POD" >/dev/null 2>&1; then
-        echo "log-reader pod not found, deploying..."
         just logs-dev-up
+    else
+        kubectl wait -n "$NS" --for=condition=Ready "pod/$POD" --timeout=60s
     fi
-    kubectl wait -n "$NS" --for=condition=Ready "pod/$POD" --timeout=60s
+
+# Return 0 when all benchmark artifact files exist on the Lustre PVC path.
+_pvc-has-benchmark-artifacts remote:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _ensure-log-reader
+    NS={{NAMESPACE}}
+    POD={{log_reader_pod}}
+    for f in {{benchmark_artifact_files}}; do
+        kubectl exec -n "$NS" "$POD" -c log-reader -- test -f "{{remote}}/$f" 2>/dev/null || exit 1
+    done
+
+_fetch-from-reader-one remote dest fetch_all="":
+    #!/usr/bin/env bash
+    {{ if fetch_all == "all" { "export FETCH_ALL=1" } else { "true" } }}
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    POD={{log_reader_pod}}
+    just _ensure-log-reader
     mkdir -p "{{dest}}/logs"
 
     SIZEMAP=$(mktemp)
@@ -614,7 +588,6 @@ fetch-from-reader remote dest fetch_all="":
 
     _lsize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 
-    # Snapshot remote file sizes (one kubectl call).
     kubectl exec -n "$NS" "$POD" -c log-reader -- \
         ls -la "{{remote}}/" 2>/dev/null | tail -n +2 > "$SIZEMAP"
 
@@ -653,19 +626,17 @@ fetch-from-reader remote dest fetch_all="":
     }
 
     FAILED=""
-    # Required files (report + chart).
     set -- \
         profile_export_aiperf.json \
         profile_export_aiperf.csv \
+        profile_export.jsonl \
         profile_export_console.txt
-    # Pass --all to also fetch optional archival artifacts.
     if [ "${FETCH_ALL:-}" = "1" ]; then
         set -- "$@" \
             server_metrics_export.csv \
             gpu_telemetry_export.jsonl \
             profile_export_aiperf_timeslices.json \
             profile_export_aiperf_timeslices.csv \
-            profile_export.jsonl \
             server_metrics_export.json
     fi
     for f do
@@ -674,21 +645,27 @@ fetch-from-reader remote dest fetch_all="":
         _fetch "{{remote}}/$f" "{{dest}}/$f" "$f" "$rsz" || FAILED="$FAILED $f"
     done
 
-    # Fetch logs/ with the same retry + size-verification logic.
-    # kubectl exec -n "$NS" "$POD" -c log-reader -- \
-    #     ls -la "{{remote}}/logs/" 2>/dev/null | tail -n +2 > "$SIZEMAP"
-    # while read -r _ _ _ _ sz _ _ _ lf; do
-    #     [ -z "$lf" ] && continue
-    #     _fetch "{{remote}}/logs/$lf" "{{dest}}/logs/$lf" "logs/$lf" "$sz" \
-    #         || FAILED="$FAILED logs/$lf"
-    # done < "$SIZEMAP"
-
     if [ -n "$FAILED" ]; then
         echo "Done with failures:$FAILED"
-        echo "Re-run to retry just the missing files: just fetch-from-reader \"{{remote}}\" \"{{dest}}\""
         exit 1
     fi
     echo "All artifacts fetched to {{dest}}/"
+
+_copy-result-from-pvc remote dest:
+    just _fetch-from-reader-one "{{remote}}" "{{dest}}"
+
+# Manually fetch already-completed benchmark results straight from the Lustre PVC (via the
+# dedicated log-reader pod, see logs-dev-up) to a local directory on this machine. Use this when
+# the orchestrator successfully ran a benchmark but couldn't copy the results out itself (see the
+# WARNING printed by _run-job, which includes the exact command to run).
+#
+# Copies file-by-file with per-file retries and skips files already present locally, so it's safe
+# to re-run: a huge file (e.g. server_metrics_export.json) repeatedly failing won't block the rest,
+# and a second run only fetches what's still missing.
+# Usage: just fetch-from-reader <remote-canonical-artifact-dir> <local-dest-dir> [all]
+#   Pass "all" as 3rd arg to include optional archival files (server_metrics, gpu_telemetry, etc.).
+fetch-from-reader remote dest fetch_all="":
+    just _fetch-from-reader-one "{{remote}}" "{{dest}}" {{fetch_all}}
 
 # Rename a results_<old> config directory (and every results_<old>_c<N>
 # subdirectory) to results_<new>, so a re-run of the same setup (e.g. after an
@@ -1291,8 +1268,11 @@ _lustre-access-pod preferred_pod="" preferred_container="":
     NS={{NAMESPACE}}
     if [ -n "{{preferred_pod}}" ] && [ -n "{{preferred_container}}" ]; then
         if kubectl get pod -n "$NS" "{{preferred_pod}}" >/dev/null 2>&1; then
-            printf '%s %s\n' "{{preferred_pod}}" "{{preferred_container}}"
-            exit 0
+            PHASE=$(kubectl get pod -n "$NS" "{{preferred_pod}}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Running" ]; then
+                printf '%s %s\n' "{{preferred_pod}}" "{{preferred_container}}"
+                exit 0
+            fi
         fi
     fi
     for role in prefill decode; do
@@ -1306,7 +1286,7 @@ _lustre-access-pod preferred_pod="" preferred_container="":
     INFO=$(just --quiet _manifesto-info)
     PODS=$(printf '%s\n' "$INFO" | sed -n 's/^pods=//p')
     for pattern in $PODS; do
-        POD=$(kubectl get pods -n "$NS" -o name 2>/dev/null | grep -E "$pattern" | head -1 | sed 's|pod/||')
+        POD=$(kubectl get pods -n "$NS" -o name 2>/dev/null | grep -m1 -E "$pattern" | sed 's|pod/||')
         if [ -n "$POD" ]; then
             printf '%s vllm\n' "$POD"
             exit 0
@@ -1409,20 +1389,17 @@ sweep-concurrency config_name dest="." duration="900":
         RDIR="{{dest}}/results_{{config_name}}_c${C}"
         DEST_CLEAN=$(printf '%s' "$RDIR" | sed 's#^\./##')
         REMOTE="{{lustre_prefix}}/{{manifesto_user}}/${DEST_CLEAN}"
+        if just --quiet _pvc-has-benchmark-artifacts "$REMOTE"; then
+            echo "=== concurrency=$C complete on Lustre, skipping ==="
+            just _copy-result-from-pvc "$REMOTE" "$RDIR" 2>/dev/null || true
+            continue
+        fi
         MISSING=""
         for f in {{benchmark_artifact_files}}; do
             [ -f "$RDIR/$f" ] || MISSING="${MISSING} $f"
         done
-        if [ -n "$MISSING" ]; then
-            echo "concurrency=$C: missing local files (${MISSING# }), attempting recovery from PVC..."
-            just _copy-result-from-pvc "$REMOTE" "$RDIR" 2>/dev/null || true
-            MISSING=""
-            for f in {{benchmark_artifact_files}}; do
-                [ -f "$RDIR/$f" ] || MISSING="${MISSING} $f"
-            done
-        fi
         if [ -z "$MISSING" ]; then
-            echo "=== concurrency=$C already exists (recovered from PVC if needed), skipping ==="
+            echo "=== concurrency=$C already exists locally, skipping ==="
             continue
         fi
         echo "=== concurrency=$C ({{duration}}s) ==="
@@ -1438,8 +1415,9 @@ sweep-concurrency config_name dest="." duration="900":
                 RUN_OK=true
                 break
             fi
-            if just _copy-result-from-pvc "$REMOTE" "$RDIR" 2>/dev/null; then
-                echo "concurrency=$C: benchmark completed but a post-run step failed (e.g. artifact copy); recovered full result from PVC, not retrying"
+            if just --quiet _pvc-has-benchmark-artifacts "$REMOTE"; then
+                echo "concurrency=$C: benchmark complete on Lustre; not retrying"
+                just _copy-result-from-pvc "$REMOTE" "$RDIR" 2>/dev/null || true
                 RUN_OK=true
                 just wipe 2>/dev/null || true
                 break
@@ -1485,10 +1463,17 @@ sweep outdir duration="900" keep_model=sweep_keep_model:
     dir="{{outdir}}/results_${CONFIG_NAME}"
     ALL_DONE=true
     for C in {{benchmark_concurrencies}}; do
-        if [ ! -f "$dir/results_${CONFIG_NAME}_c${C}/profile_export_aiperf.json" ]; then
-            ALL_DONE=false
-            break
+        RDIR="$dir/results_${CONFIG_NAME}_c${C}"
+        DEST_CLEAN=$(printf '%s' "$RDIR" | sed 's#^\./##')
+        REMOTE="{{lustre_prefix}}/{{manifesto_user}}/${DEST_CLEAN}"
+        if just --quiet _pvc-has-benchmark-artifacts "$REMOTE"; then
+            continue
         fi
+        if [ -f "$RDIR/profile_export_aiperf.json" ]; then
+            continue
+        fi
+        ALL_DONE=false
+        break
     done
     if [ "$ALL_DONE" = true ]; then
         echo "====== ${CONFIG_NAME} all concurrency levels done, skipping ======"
@@ -1544,8 +1529,8 @@ sweep outdir duration="900" keep_model=sweep_keep_model:
             echo "  decode: $TOKENS tokens (from $POD_NAME)"
         fi
     done
-    if [ -n "$KV_PREFILL" ]; then PREFILL_JSON="$KV_PREFILL"; else PREFILL_JSON="null"; fi
-    if [ -n "$KV_DECODE" ]; then DECODE_JSON="$KV_DECODE"; else DECODE_JSON="null"; fi
+    if [ -n "$KV_PREFILL" ]; then PREFILL_JSON="$KV_PREFILL"; else PREFILL_JSON="None"; fi
+    if [ -n "$KV_DECODE" ]; then DECODE_JSON="$KV_DECODE"; else DECODE_JSON="None"; fi
     python3 -c "import json; json.dump({'prefill': $PREFILL_JSON, 'decode': $DECODE_JSON}, open('$dir/kv_cache_config.json','w'), indent=2)"
     echo "  Saved to $dir/kv_cache_config.json"
     just sweep-concurrency "$CONFIG_NAME" "$dir" {{duration}}
