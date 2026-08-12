@@ -90,12 +90,19 @@ def aggregate_jsonl(path):
             }
     return result
 
-COLORS = [
-    '#ff3333', '#00ccff', '#ffdd00', '#aa44ff', '#00ee77',
-    '#ff7700', '#3388ff', '#ff55aa', '#00ffcc', '#dddd00',
-    '#cc33ff', '#33ff33', '#ff4477', '#0088ff', '#ffaa00',
-    '#77ddff', '#ff0066', '#44ffaa', '#bb88ff', '#88ff00',
+COLORS_DARK = [
+    '#ff4444', '#22ccff', '#ffcc00', '#bb66ff', '#00ee77',
+    '#ff8822', '#4499ff', '#ff55aa', '#00ddbb', '#aadd00',
+    '#dd44ff', '#44ff66', '#ff5588', '#33aaff', '#ffaa33',
+    '#66ccee', '#ff3377', '#55ffbb', '#cc99ff', '#99ee33',
 ]
+COLORS_LIGHT = [
+    '#cc0000', '#0077aa', '#aa8800', '#7722cc', '#008844',
+    '#cc5500', '#1155cc', '#cc2277', '#007766', '#668800',
+    '#9900cc', '#119933', '#cc2244', '#0066cc', '#cc7700',
+    '#226699', '#bb0044', '#228866', '#7744bb', '#558800',
+]
+COLORS = COLORS_DARK
 
 
 def read_model_label(results_dir):
@@ -213,6 +220,43 @@ def read_kv_cache_tokens(run_dir):
     return read_kv_cache_tokens_from_cache_config(run_dir)
 
 
+def _extract_waiting_requests(dash_html_path):
+    """Extract max(sum(waiting)) for prefill and decode from dashboard HTML."""
+    try:
+        with open(dash_html_path) as f:
+            text = f.read()
+    except OSError:
+        return {}
+    m = re.search(r'const panels = ({.*?});\s*(?:const|var|let|function|//)', text, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        panels = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return {}
+    result = {}
+    for panel in panels.values():
+        title = panel.get('title', '').lower()
+        if 'waiting' not in title or 'request' not in title:
+            continue
+        if 'prefill' in title:
+            key = '_max_waiting_prefill'
+        elif 'decode' in title:
+            key = '_max_waiting_decode'
+        else:
+            continue
+        ts_sums = {}
+        for q in panel.get('queries', []):
+            for s in q.get('series', []):
+                for v in s.get('values', []):
+                    ts = v[0]
+                    val = float(v[1])
+                    ts_sums[ts] = ts_sums.get(ts, 0) + val
+        if ts_sums:
+            result[key] = max(ts_sums.values())
+    return result
+
+
 def discover_configs(results_dir):
     """Auto-discover deployment configs and concurrency levels from folder structure.
 
@@ -295,6 +339,12 @@ def discover_configs(results_dir):
                                         break
                             if f'_kv_cache_{role}' in run_data:
                                 break
+
+            dash_html = os.path.join(config_dir, sub, 'dashboard.html')
+            if os.path.isfile(dash_html):
+                waiting = _extract_waiting_requests(dash_html)
+                if waiting:
+                    run_data.update(waiting)
 
             runs[c_val] = run_data
 
@@ -505,9 +555,12 @@ def inject_dashboard_aggregation(content):
 
 def generate_html(configs, output_path, results_dir, metric_units):
     model_label = read_model_label(results_dir)
-    color_map = {}
+    color_map_dark = {}
+    color_map_light = {}
     for i, cfg in enumerate(sorted(configs.keys())):
-        color_map[cfg] = COLORS[i % len(COLORS)]
+        color_map_dark[cfg] = COLORS_DARK[i % len(COLORS_DARK)]
+        color_map_light[cfg] = COLORS_LIGHT[i % len(COLORS_LIGHT)]
+    color_map = color_map_dark
 
     MARKER_SHAPES = [
         'circle', 'square', 'diamond', 'triangle-up', 'cross',
@@ -715,9 +768,9 @@ def generate_html(configs, output_path, results_dir, metric_units):
   .panel .plot {{ width: 100%; height: calc(100% - 36px); min-height: 250px; }}
   .panel .plot .nsewdrag {{ cursor: pointer !important; }}
   .summary {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; overflow-x: auto; }}
-  .summary table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 900px; }}
-  .summary th {{ text-align: left; padding: 6px 8px; color: var(--fg3); border-bottom: 1px solid var(--border); font-weight: 600;
-                 cursor: pointer; user-select: none; white-space: nowrap; }}
+  .summary table {{ width: 100%; border-collapse: collapse; font-size: 13px; min-width: 900px; }}
+  .summary th {{ text-align: left; padding: 7px 8px; color: var(--fg); border-bottom: 2px solid var(--border); font-weight: 700;
+                 cursor: pointer; user-select: none; white-space: nowrap; font-size: 13px; }}
   .summary th:hover {{ color: var(--fg); }}
   .chart-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }}
   @media (max-width: 1200px) {{ .chart-row {{ grid-template-columns: 1fr; }} }}
@@ -812,11 +865,11 @@ function getLayoutDefaults() {{
   return {{
     paper_bgcolor: t.paper, plot_bgcolor: t.plot,
     font: {{ family: 'Inter, -apple-system, sans-serif', size: 13, color: t.fg }},
-    margin: {{ t: 44, r: 30, b: 120, l: 76 }},
+    margin: {{ t: 44, r: 30, b: 50, l: 76 }},
     xaxis: {{ gridcolor: t.grid, zerolinecolor: t.grid, linecolor: t.grid, gridwidth: 1,
-              title: {{ font: {{ size: 13, color: t.fg3 }} }}, tickfont: {{ size: 12, color: t.fg2 }} }},
+              title: {{ font: {{ size: 14, color: t.fg, weight: 700 }} }}, tickfont: {{ size: 12, color: t.fg2 }} }},
     yaxis: {{ gridcolor: t.grid, zerolinecolor: t.grid, linecolor: t.grid, gridwidth: 1,
-              title: {{ font: {{ size: 13, color: t.fg3 }} }}, tickfont: {{ size: 12, color: t.fg2 }} }},
+              title: {{ font: {{ size: 14, color: t.fg, weight: 700 }} }}, tickfont: {{ size: 12, color: t.fg2 }} }},
     legend: {{ bgcolor: t.legend, font: {{ size: 12, color: t.fg }}, bordercolor: t.legendBorder, borderwidth: 1 }},
     hoverlabel: {{ bgcolor: t.hover, bordercolor: t.hoverBorder, font: {{ size: 13, color: t.fg }} }},
     hovermode: 'closest',
@@ -824,7 +877,9 @@ function getLayoutDefaults() {{
 }}
 let LAYOUT_DEFAULTS = getLayoutDefaults();
 
-const COLORS = {json.dumps(color_map)};
+const COLORS_DARK = {json.dumps(color_map_dark)};
+const COLORS_LIGHT = {json.dumps(color_map_light)};
+let COLORS = isDark ? COLORS_DARK : COLORS_LIGHT;
 const SHAPES = {json.dumps(shape_map)};
 const CONFIGS = {json.dumps(configs_js)};
 const CONCURRENCIES = {json.dumps(conc_list_js)};
@@ -839,7 +894,7 @@ const PREFILL_NORMALIZED_METRICS = new Set({json.dumps(prefill_normalized_metric
 const TOTAL_NORMALIZED_METRICS = new Set({json.dumps(total_normalized_metrics)});
 const METRIC_LABELS = {json.dumps(metric_labels)};
 const STAT_KEYS = {json.dumps(STAT_KEYS)};
-const CONFIG_KEYS = Object.keys(CONFIGS);
+const CONFIG_KEYS = Object.keys(CONFIGS).sort((a, b) => CONFIGS[a].label.localeCompare(CONFIGS[b].label));
 
 const root = document.getElementById('root');
 const sidePanel = document.getElementById('sidePanel');
@@ -964,9 +1019,13 @@ let sloITLStat = 'p99';
 let sloTokGPU = null;
 let sloTokUser = null;
 let sloTokUserStat = 'avg';
+let maxWaitPrefill = null;
+let maxWaitDecode = null;
+let minConcurrency = null;
 let maxConcurrency = null;
 
 function passesSLO(cfg, c) {{
+  if (minConcurrency != null && C_LABELS[c] < minConcurrency) return false;
   if (maxConcurrency != null && C_LABELS[c] > maxConcurrency) return false;
   const d = DATA[cfg]?.[c];
   if (!d) return true;
@@ -986,6 +1045,14 @@ function passesSLO(cfg, c) {{
   if (sloTokUser != null) {{
     const v = d.output_token_throughput_per_user?.[sloTokUserStat];
     if (v != null && v < sloTokUser) return false;
+  }}
+  if (maxWaitPrefill != null) {{
+    const v = d._max_waiting_prefill;
+    if (v != null && v > maxWaitPrefill) return false;
+  }}
+  if (maxWaitDecode != null) {{
+    const v = d._max_waiting_decode;
+    if (v != null && v > maxWaitDecode) return false;
   }}
   return true;
 }}
@@ -1172,6 +1239,7 @@ function createChart(container, defaults) {{
   const panel = document.createElement('div');
   panel.className = 'panel';
   panel.style.height = '500px';
+  panel.style.overflow = 'visible';
   const plot = document.createElement('div');
   plot.className = 'plot';
   panel.appendChild(plot);
@@ -1209,7 +1277,7 @@ function createChart(container, defaults) {{
         textposition: 'top center',
         textfont: {{ size: 11, color: COLORS[cfg], family: 'Inter, -apple-system, sans-serif', weight: 600 }},
         texttemplate: validConcs.map(c => passesSLO(cfg, c) ? `c${{C_LABELS[c]}}` : ''),
-        name: `${{meta.label}} (${{meta.decodeGPUs}} decode GPUs)`,
+        name: meta.label,
         line: {{ color: COLORS[cfg], width: 1.5 }},
         marker: {{ size: 10, color: COLORS[cfg], symbol: SHAPES[cfg] || 'circle', line: {{ color: 'rgba(0,0,0,0.4)', width: 0.5 }} }},
       }};
@@ -1217,25 +1285,33 @@ function createChart(container, defaults) {{
   }}
 
   function getLayout() {{
-    const yAxis = {{ ...LAYOUT_DEFAULTS.yaxis, title: {{ text: axisTitle(state.yMetric, state.yStat, state.yNorm), font: {{ size: 11 }} }} }};
+    const yAxis = {{ ...LAYOUT_DEFAULTS.yaxis, title: {{ text: axisTitle(state.yMetric, state.yStat, state.yNorm), font: {{ size: 14, color: LAYOUT_DEFAULTS.font.color, weight: 700 }} }} }};
     if (!state.yNorm.startsWith('cost')) yAxis.rangemode = 'tozero';
     return {{
       ...LAYOUT_DEFAULTS,
-      title: {{ text: `${{metricLabel(state.yMetric)}} vs ${{metricLabel(state.xMetric)}}`, font: {{ size: 13, color: LAYOUT_DEFAULTS.font.color }} }},
-      xaxis: {{ ...LAYOUT_DEFAULTS.xaxis, title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 11 }} }} }},
+      title: {{ text: `${{metricLabel(state.yMetric)}} vs ${{metricLabel(state.xMetric)}}`, font: {{ size: 15, color: LAYOUT_DEFAULTS.font.color, weight: 700 }} }},
+      xaxis: {{ ...LAYOUT_DEFAULTS.xaxis, title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 14, color: LAYOUT_DEFAULTS.font.color, weight: 700 }} }} }},
       yaxis: yAxis,
-      legend: {{ ...LAYOUT_DEFAULTS.legend, orientation: 'h', x: 0.5, y: -0.15, xanchor: 'center', yanchor: 'top' }},
+      legend: {{ ...LAYOUT_DEFAULTS.legend, orientation: 'v', x: 1.02, y: 1, xanchor: 'left', yanchor: 'top' }},
     }};
   }}
 
   function update() {{
     const traces = buildTraces();
+    const layout = getLayout();
     if (state.el.data) {{
       state.el.data.forEach((old, i) => {{
-        if (traces[i] && old.visible === 'legendonly') traces[i].visible = 'legendonly';
+        if (!traces[i]) return;
+        if (old.visible === 'legendonly' || old.visible === false) traces[i].visible = old.visible;
+        if (old.showlegend === false) traces[i].showlegend = false;
       }});
     }}
-    Plotly.react(state.el, traces, getLayout(), {{ responsive: true, edits: {{ legendPosition: true }} }});
+    if (state.el.layout && state.el.layout.legend) {{
+      const cur = state.el.layout.legend;
+      if (cur.x != null) layout.legend.x = cur.x;
+      if (cur.y != null) layout.legend.y = cur.y;
+    }}
+    Plotly.react(state.el, traces, layout, {{ responsive: true, edits: {{ legendPosition: true }} }});
   }}
 
   Plotly.newPlot(state.el, buildTraces(), getLayout(), {{ responsive: true, edits: {{ legendPosition: true }} }});
@@ -1398,10 +1474,41 @@ tokUserWrap.appendChild(tokUserStatSel);
 tokUserWrap.appendChild(tokUserInput);
 sloBar.appendChild(tokUserWrap);
 
-// Max concurrency filter
+// Max waiting request filters
+const maxWaitPWrap = document.createElement('div');
+maxWaitPWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+maxWaitPWrap.textContent = 'Max wait P:';
+const maxWaitPInput = document.createElement('input');
+maxWaitPInput.type = 'number'; maxWaitPInput.step = '1'; maxWaitPInput.min = '0';
+maxWaitPInput.value = ''; maxWaitPInput.placeholder = 'off';
+maxWaitPInput.style.cssText = inputStyle;
+maxWaitPWrap.appendChild(maxWaitPInput);
+sloBar.appendChild(maxWaitPWrap);
+
+const maxWaitDWrap = document.createElement('div');
+maxWaitDWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+maxWaitDWrap.textContent = 'Max wait D:';
+const maxWaitDInput = document.createElement('input');
+maxWaitDInput.type = 'number'; maxWaitDInput.step = '1'; maxWaitDInput.min = '0';
+maxWaitDInput.value = ''; maxWaitDInput.placeholder = 'off';
+maxWaitDInput.style.cssText = inputStyle;
+maxWaitDWrap.appendChild(maxWaitDInput);
+sloBar.appendChild(maxWaitDWrap);
+
+// Concurrency filters
 const concWrap = document.createElement('label');
+const minConcWrap = document.createElement('div');
+minConcWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
+minConcWrap.textContent = 'Min conc:';
+const minConcInput = document.createElement('input');
+minConcInput.type = 'number'; minConcInput.step = '1'; minConcInput.min = '1';
+minConcInput.value = ''; minConcInput.placeholder = 'all';
+minConcInput.style.cssText = inputStyle;
+minConcWrap.appendChild(minConcInput);
+sloBar.appendChild(minConcWrap);
+
 concWrap.style.cssText = 'color:var(--fg3); font-size:15px; display:flex; align-items:center; gap:6px;';
-concWrap.textContent = 'Max concurrency:';
+concWrap.textContent = 'Max conc:';
 const concInput = document.createElement('input');
 concInput.type = 'number'; concInput.step = '1'; concInput.min = '1';
 concInput.value = ''; concInput.placeholder = 'all';
@@ -1418,8 +1525,10 @@ themeBtn.addEventListener('click', () => {{
   isDark = !isDark;
   document.documentElement.classList.toggle('light', !isDark);
   themeBtn.textContent = isDark ? '\\u263E' : '\\u2600';
+  COLORS = isDark ? COLORS_DARK : COLORS_LIGHT;
   LAYOUT_DEFAULTS = getLayoutDefaults();
   allCharts.forEach(ch => ch.update());
+  if (window._updateTableColors) window._updateTableColors();
 }});
 sloBar.appendChild(themeBtn);
 
@@ -1431,16 +1540,20 @@ function applySLOFilter() {{
   sloTokGPU = parseFloat(tokInput.value) || null;
   sloTokUser = parseFloat(tokUserInput.value) || null;
   sloTokUserStat = tokUserStatSel.value;
+  maxWaitPrefill = parseFloat(maxWaitPInput.value);
+  if (isNaN(maxWaitPrefill)) maxWaitPrefill = null;
+  maxWaitDecode = parseFloat(maxWaitDInput.value);
+  if (isNaN(maxWaitDecode)) maxWaitDecode = null;
+  minConcurrency = parseFloat(minConcInput.value) || null;
   maxConcurrency = parseFloat(concInput.value) || null;
   allCharts.forEach(ch => ch.update());
   document.querySelectorAll('tr[data-cfg]').forEach(tr => {{
-    const cfg = tr.dataset.cfg;
-    const c = tr.dataset.conc;
-    tr.classList.toggle('slo-fail', !passesSLO(cfg, c));
+    tr.classList.toggle('slo-fail', !passesSLO(tr.dataset.cfg, tr.dataset.conc));
   }});
+  if (window._resortTable) window._resortTable();
 }}
 
-[ttftInput, itlInput, tokInput, tokUserInput, concInput].forEach(el => el.addEventListener('input', applySLOFilter));
+[ttftInput, itlInput, tokInput, tokUserInput, maxWaitPInput, maxWaitDInput, minConcInput, concInput].forEach(el => el.addEventListener('input', applySLOFilter));
 [ttftStatSel, itlStatSel, tokUserStatSel].forEach(el => el.addEventListener('change', applySLOFilter));
 
 // ── Section 2: Summary table ──
@@ -1461,6 +1574,7 @@ root.appendChild(sec2Wrap);
     'Config', 'Concurrency', 'Errors', 'Decode GPUs', 'KV Cache Prefill', 'KV Cache Decode', 'Input tok/s', 'Output tok/s', 'tok/s/GPU',
     'ITL p50 (ms)', 'ITL p99 (ms)', 'Per-user tok/s',
     'TTFT avg (s)', 'TTFT p50 (s)', 'TTFT p99 (s)', 'TTFT min (s)', 'TTFT max (s)',
+    'Max Wait P', 'Max Wait D',
     '$/M input', '$/M output', '$/M total',
   ];
   const headerRow = document.createElement('tr');
@@ -1511,12 +1625,14 @@ root.appendChild(sec2Wrap);
         ttft ? (ttft.p99/1000).toFixed(1) : '-',
         ttft ? (ttft.min/1000).toFixed(1) : '-',
         ttft ? (ttft.max/1000).toFixed(1) : '-',
+        d._max_waiting_prefill != null ? Math.round(d._max_waiting_prefill) : '-',
+        d._max_waiting_decode != null ? Math.round(d._max_waiting_decode) : '-',
         '-', '-', '-',
       ];
       vals.forEach((v, i) => {{
         const td = document.createElement('td');
         td.textContent = v;
-        if (i === 0) {{ td.style.color = COLORS[cfg]; td.style.fontWeight = '500'; }}
+        if (i === 0) {{ td.style.color = COLORS[cfg]; td.style.fontWeight = '600'; td.dataset.cfgColor = cfg; }}
         if (i === 2 && errCount > 0) {{ td.style.color = '#f44336'; td.style.fontWeight = '600'; }}
         if (i === 8) td.className = 'highlight';
         tr.appendChild(td);
@@ -1552,25 +1668,42 @@ root.appendChild(sec2Wrap);
   costInput.addEventListener('input', updateCostCols);
 
   let sortCol = -1, sortAsc = true;
+  const cfgOrder = {{}};
+  CONFIG_KEYS.forEach((k, i) => cfgOrder[k] = i);
+
+  window._resortTable = function() {{
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    rows.sort((a, b) => {{
+      const aFail = a.classList.contains('slo-fail') ? 1 : 0;
+      const bFail = b.classList.contains('slo-fail') ? 1 : 0;
+      if (aFail !== bFail) return aFail - bFail;
+      if (sortCol >= 0) {{
+        const va = parseFloat(a.cells[sortCol]?.textContent) || 0;
+        const vb = parseFloat(b.cells[sortCol]?.textContent) || 0;
+        const diff = sortAsc ? va - vb : vb - va;
+        if (diff !== 0) return diff;
+      }}
+      const co = cfgOrder[a.dataset.cfg] - cfgOrder[b.dataset.cfg];
+      if (co !== 0) return co;
+      return (C_LABELS[a.dataset.conc] || 0) - (C_LABELS[b.dataset.conc] || 0);
+    }});
+    rows.forEach(r => tbody.appendChild(r));
+  }};
+
   function sortTableBy(col, th) {{
     if (sortCol === col) sortAsc = !sortAsc;
     else {{ sortCol = col; sortAsc = true; }}
 
     thead.querySelectorAll('th').forEach(h => h.textContent = h.dataset.label);
     th.textContent = th.dataset.label + (sortAsc ? ' \\u25B2' : ' \\u25BC');
-
-    const cfgOrder = {{}};
-    CONFIG_KEYS.forEach((k, i) => cfgOrder[k] = i);
-    const rows = Array.from(tbody.querySelectorAll('tr'));
-    rows.sort((a, b) => {{
-      const va = parseFloat(a.cells[col]?.textContent) || 0;
-      const vb = parseFloat(b.cells[col]?.textContent) || 0;
-      const diff = sortAsc ? va - vb : vb - va;
-      if (diff !== 0) return diff;
-      return cfgOrder[a.dataset.cfg] - cfgOrder[b.dataset.cfg];
-    }});
-    rows.forEach(r => tbody.appendChild(r));
+    window._resortTable();
   }}
+
+  window._updateTableColors = function() {{
+    document.querySelectorAll('td[data-cfg-color]').forEach(td => {{
+      td.style.color = COLORS[td.dataset.cfgColor];
+    }});
+  }};
 
   div.appendChild(table);
   sec2Wrap.appendChild(div);
@@ -1589,9 +1722,11 @@ root.appendChild(sec2Wrap);
 
 def generate_3d_html(configs, output_path, results_dir, metric_units):
     model_label = read_model_label(results_dir)
-    color_map = {}
+    color_map_dark = {}
+    color_map_light = {}
     for i, cfg in enumerate(sorted(configs.keys())):
-        color_map[cfg] = COLORS[i % len(COLORS)]
+        color_map_dark[cfg] = COLORS_DARK[i % len(COLORS_DARK)]
+        color_map_light[cfg] = COLORS_LIGHT[i % len(COLORS_LIGHT)]
 
     MARKER_SHAPES_3D = [
         'circle', 'square', 'diamond', 'cross', 'x',
@@ -1753,7 +1888,9 @@ def generate_3d_html(configs, output_path, results_dir, metric_units):
 </div>
 
 <script>
-const COLORS = {json.dumps(color_map)};
+const COLORS_DARK = {json.dumps(color_map_dark)};
+const COLORS_LIGHT = {json.dumps(color_map_light)};
+let COLORS = isDark ? COLORS_DARK : COLORS_LIGHT;
 const SHAPES = {json.dumps(shape_map)};
 const CONFIGS = {json.dumps(configs_js)};
 const CONCURRENCIES = {json.dumps(conc_list_js)};
@@ -1766,7 +1903,7 @@ const PREFILL_NORM = new Set({json.dumps(prefill_normalized_metrics)});
 const TOTAL_NORM = new Set({json.dumps(total_normalized_metrics)});
 const METRIC_LABELS = {json.dumps(metric_labels)};
 const STAT_KEYS = {json.dumps(STAT_KEYS)};
-const CONFIG_KEYS = Object.keys(CONFIGS);
+const CONFIG_KEYS = Object.keys(CONFIGS).sort((a, b) => CONFIGS[a].label.localeCompare(CONFIGS[b].label));
 const GPUS_PER_NODE = {GPUS_PER_NODE};
 
 let isDark = true;
@@ -1921,7 +2058,7 @@ function createChart(plotId, ctrlId, btnBarId, defaults, showLegend) {{
         hoverinfo: 'text',
         mode: 'lines+markers',
         type: 'scatter3d',
-        name: `${{meta.label}} (${{meta.decodeGPUs}} dGPU)`,
+        name: meta.label,
         showlegend: showLegend,
         line: {{ color: COLORS[cfg], width: 3 }},
         marker: {{ size: 5, color: COLORS[cfg], symbol: SHAPES[cfg] || 'circle' }},
@@ -1951,12 +2088,20 @@ function createChart(plotId, ctrlId, btnBarId, defaults, showLegend) {{
 
   function update() {{
     const traces = buildTraces();
+    const layout = getLayout();
     if (plotEl.data) {{
       plotEl.data.forEach((old, i) => {{
-        if (traces[i] && old.visible === 'legendonly') traces[i].visible = 'legendonly';
+        if (!traces[i]) return;
+        if (old.visible === 'legendonly' || old.visible === false) traces[i].visible = old.visible;
+        if (old.showlegend === false) traces[i].showlegend = false;
       }});
     }}
-    Plotly.react(plotEl, traces, getLayout(), {{ responsive: true }});
+    if (plotEl.layout && plotEl.layout.legend) {{
+      const cur = plotEl.layout.legend;
+      if (cur.x != null) layout.legend.x = cur.x;
+      if (cur.y != null) layout.legend.y = cur.y;
+    }}
+    Plotly.react(plotEl, traces, layout, {{ responsive: true }});
   }}
 
   Plotly.newPlot(plotEl, buildTraces(), getLayout(), {{ responsive: true }});
@@ -2010,6 +2155,7 @@ themeBtn.addEventListener('click', () => {{
   isDark = !isDark;
   document.documentElement.classList.toggle('light', !isDark);
   themeBtn.textContent = isDark ? '\\u263E' : '\\u2600';
+  COLORS = isDark ? COLORS_DARK : COLORS_LIGHT;
   charts.forEach(c => c.update());
 }});
 </script>

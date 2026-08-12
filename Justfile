@@ -37,7 +37,7 @@ seed_image := env_var_or_default('SEED_IMAGE', 'quay.io/tms/benchmark-seed:amd64
 seed_deploy := env_var_or_default('SEED_DEPLOY', 'benchmark-seed')
 model     := env_var_or_default('MODEL', 'zai-org/GLM-5.2-FP8')
 model_label := env_var_or_default('MODEL_LABEL', 'GLM-5.2-FP8')
-max_context_length := env_var_or_default('MAX_CONTEXT_LENGTH', '10000000')
+max_context_length := env_var_or_default('MAX_CONTEXT_LENGTH', '142000')
 url       := env_var_or_default('URL', 'http://llm-d-inference-gateway-istio:80/v1')
 server_metrics_url := env_var_or_default('SERVER_METRICS_URL', '')
 gpu_telemetry_urls := env_var_or_default('GPU_TELEMETRY_URLS', '')
@@ -204,6 +204,7 @@ _run-job concurrency duration dest unsafe_args attempt:
                     --use-server-token-count \
                     --public-dataset semianalysis_cc_traces_weka_with_subagents \
                     --concurrency {{concurrency}} \
+                    --random-seed 42 \
                     --benchmark-duration {{duration}} \
                     \$SERVER_METRICS_ARGS \
                     \$GPU_TELEMETRY_ARGS \
@@ -225,11 +226,11 @@ _run-job concurrency duration dest unsafe_args attempt:
                   cp -a "\$ARTIFACT_DIR/." "\$CANONICAL_ARTIFACT_DIR/"
               resources:
                 requests:
-                  cpu: "4"
-                  memory: 8Gi
+                  cpu: "64"
+                  memory: 128Gi
                 limits:
-                  cpu: "16"
-                  memory: 32Gi
+                  cpu: "64"
+                  memory: 128Gi
                   ephemeral-storage: 20Gi
               volumeMounts:
                 - name: workspace
@@ -298,8 +299,23 @@ _run-job concurrency duration dest unsafe_args attempt:
             break
         fi
         if [ "$FAILED" = "True" ]; then
-            kubectl logs -n "$NS" "job/$JOB" --all-containers --tail=200 || true
+            echo "=== Benchmark job FAILED: $JOB ==="
+            kubectl logs -n "$NS" "job/$JOB" --all-containers --tail=500 || true
             kubectl describe -n "$NS" "job/$JOB" || true
+            # Salvage whatever aiperf wrote to lustre before dying
+            mkdir -p "{{dest}}/logs"
+            _PVC_READER="pvc-reader-${JOB}-fail"
+            kubectl run "$_PVC_READER" -n "$NS" --image=busybox --restart=Never \
+              --overrides="{\"spec\":{\"containers\":[{\"name\":\"reader\",\"image\":\"busybox\",\"command\":[\"sleep\",\"120\"],\"volumeMounts\":[{\"name\":\"lustre\",\"mountPath\":\"{{lustre_mount}}\"}]}],\"volumes\":[{\"name\":\"lustre\",\"persistentVolumeClaim\":{\"claimName\":\"{{lustre_claim}}\"}}]}}" \
+              2>/dev/null || true
+            if kubectl wait --for=condition=Ready pod/"$_PVC_READER" -n "$NS" --timeout=60s 2>/dev/null; then
+                echo "Salvaging logs from $ARTIFACT_DIR ..."
+                kubectl exec -n "$NS" "$_PVC_READER" -- find "$ARTIFACT_DIR" -maxdepth 3 -type f 2>/dev/null || true
+                for _f in logs/aiperf.log profile_export_aiperf.json profile_export_console.txt; do
+                    kubectl cp "$NS/${_PVC_READER}:${ARTIFACT_DIR}/${_f}" "{{dest}}/${_f}" 2>/dev/null || true
+                done
+            fi
+            kubectl delete pod "$_PVC_READER" -n "$NS" --ignore-not-found 2>/dev/null || true
             exit 1
         fi
         if [ "$SECONDS" -ge "$JOB_DEADLINE" ]; then
@@ -1540,17 +1556,18 @@ seed outdir configs:
     kubectl exec -n "$NS" "$DEPLOY" -- helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null
     kubectl exec -n "$NS" "$DEPLOY" -- helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null
     kubectl exec -n "$NS" "$DEPLOY" -- helm repo update
-    POD=$(kubectl get pod -n "$NS" -l app={{seed_deploy}} -o jsonpath='{.items[0].metadata.name}')
-    echo "=== Syncing files to seed pod ==="
-    kubectl exec -n "$NS" "$POD" -- mkdir -p /workspace/agentx-mvp
+    POD=$(kubectl get pod -n "$NS" -l app={{seed_deploy}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+    if [ -z "$POD" ]; then echo "ERROR: no Running seed pod found"; exit 1; fi
+    echo "=== Syncing files to seed pod ($POD) ==="
+    kubectl exec -n "$NS" "$DEPLOY" -- mkdir -p /workspace/agentx-mvp
     for f in Justfile agentx.yaml dashboard.json extract_timestamps.py export_dashboard.py gen_interactivity_chart.py overlay_dashboards.py; do
         [ -f "$f" ] && kubectl cp "$f" "$NS/${POD}:/workspace/agentx-mvp/$f"
     done
-    kubectl exec -n "$NS" "$POD" -- mkdir -p /workspace/agentx-mvp/dashboards
+    kubectl exec -n "$NS" "$DEPLOY" -- mkdir -p /workspace/agentx-mvp/dashboards
     for f in dashboards/*.json; do
         kubectl cp "$f" "$NS/${POD}:/workspace/agentx-mvp/$f"
     done
-    kubectl exec -n "$NS" "$POD" -- bash -c \
+    kubectl exec -n "$NS" "$DEPLOY" -- bash -c \
         'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git fetch origin && git checkout {{llm_d_branch}} && git pull; else git clone --branch {{llm_d_branch}} {{llm_d_repo}} /workspace/llm-d; fi'
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
@@ -1563,8 +1580,8 @@ seed outdir configs:
     printf '#!/bin/bash\ncd /workspace/agentx-mvp\njust sweep-isolated %s '\''%s'\'' > /workspace/seed-sweep.log 2>&1\necho $? > /workspace/seed-sweep.exit_code\nrm -f /workspace/seed-sweep.pid\n' "$OUTDIR" "$CONFIGS" > "$TMPSCRIPT"
     kubectl cp "$TMPSCRIPT" "$NS/${POD}:/workspace/run_seed.sh"
     rm -f "$TMPSCRIPT"
-    kubectl exec -n "$NS" "$POD" -- chmod +x /workspace/run_seed.sh
-    kubectl exec -n "$NS" "$POD" -- bash -c 'nohup bash /workspace/run_seed.sh </dev/null >/dev/null 2>&1 & echo $! > /workspace/seed-sweep.pid && echo "Launched PID $!"'
+    kubectl exec -n "$NS" "$DEPLOY" -- chmod +x /workspace/run_seed.sh
+    kubectl exec -n "$NS" "$DEPLOY" -- bash -c 'nohup bash /workspace/run_seed.sh </dev/null >/dev/null 2>&1 & echo $! > /workspace/seed-sweep.pid && echo "Launched PID $!"'
     echo ""
     echo "Sweep running detached. Safe to disconnect."
     echo "  Monitor:  just seed-logs"
@@ -1580,20 +1597,23 @@ seed-sequential outdir configs:
     set -euo pipefail
     NS={{NAMESPACE}}
     DEPLOY=deploy/{{seed_deploy}}
+    kubectl delete pod -n "$NS" -l app={{seed_deploy}} --field-selector=status.phase=Failed --ignore-not-found 2>/dev/null || true
+    kubectl rollout status deploy/{{seed_deploy}} -n "$NS" --timeout=300s
     kubectl exec -n "$NS" "$DEPLOY" -- helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null
     kubectl exec -n "$NS" "$DEPLOY" -- helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null
     kubectl exec -n "$NS" "$DEPLOY" -- helm repo update
-    POD=$(kubectl get pod -n "$NS" -l app={{seed_deploy}} -o jsonpath='{.items[0].metadata.name}')
-    echo "=== Syncing files to seed pod ==="
-    kubectl exec -n "$NS" "$POD" -- mkdir -p /workspace/agentx-mvp
+    POD=$(kubectl get pod -n "$NS" -l app={{seed_deploy}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+    if [ -z "$POD" ]; then echo "ERROR: no Running seed pod found"; exit 1; fi
+    echo "=== Syncing files to seed pod ($POD) ==="
+    kubectl exec -n "$NS" "$DEPLOY" -- mkdir -p /workspace/agentx-mvp
     for f in Justfile agentx.yaml dashboard.json extract_timestamps.py export_dashboard.py gen_interactivity_chart.py overlay_dashboards.py; do
         [ -f "$f" ] && kubectl cp "$f" "$NS/${POD}:/workspace/agentx-mvp/$f"
     done
-    kubectl exec -n "$NS" "$POD" -- mkdir -p /workspace/agentx-mvp/dashboards
+    kubectl exec -n "$NS" "$DEPLOY" -- mkdir -p /workspace/agentx-mvp/dashboards
     for f in dashboards/*.json; do
         kubectl cp "$f" "$NS/${POD}:/workspace/agentx-mvp/$f"
     done
-    kubectl exec -n "$NS" "$POD" -- bash -c \
+    kubectl exec -n "$NS" "$DEPLOY" -- bash -c \
         'if [ -d /workspace/llm-d/.git ]; then cd /workspace/llm-d && git fetch origin && git checkout {{llm_d_branch}} && git pull; else git clone --branch {{llm_d_branch}} {{llm_d_repo}} /workspace/llm-d; fi'
     TMPENV=$(mktemp)
     trap "rm -f $TMPENV" EXIT
@@ -1611,8 +1631,8 @@ seed-sequential outdir configs:
     fi
     kubectl cp "$TMPSCRIPT" "$NS/${POD}:/workspace/run_seed.sh"
     rm -f "$TMPSCRIPT"
-    kubectl exec -n "$NS" "$POD" -- chmod +x /workspace/run_seed.sh
-    kubectl exec -n "$NS" "$POD" -- bash -c 'nohup bash /workspace/run_seed.sh </dev/null >/workspace/seed-sweep.log 2>&1 & echo $! > /workspace/seed-sweep.pid && echo "Launched PID $!"'
+    kubectl exec -n "$NS" "$DEPLOY" -- chmod +x /workspace/run_seed.sh
+    kubectl exec -n "$NS" "$DEPLOY" -- bash -c 'nohup bash /workspace/run_seed.sh </dev/null >/workspace/seed-sweep.log 2>&1 & echo $! > /workspace/seed-sweep.pid && echo "Launched PID $!"'
     echo ""
     echo "Sequential sweep running detached. Safe to disconnect."
     echo "  Monitor:  just seed-logs"
