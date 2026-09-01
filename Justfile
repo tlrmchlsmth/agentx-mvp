@@ -12,6 +12,8 @@ set export
 #   just sweep outdir 900 true            # keep model up (skip stop/start/warmup)
 #   just orchestrator-run              # run a detached in-cluster sweep
 #   just orchestrator-run '' 900 false true   # keep model, skip orchestrator redeploy
+#   just gsm8k                          # run lm-eval GSM8K accuracy benchmark
+#   just gsm8k 32 results/my_gsm8k_run  # override concurrency / dest
 #   just logs / just shell # inspect the orchestrator
 #   just clean             # delete benchmark Jobs and the orchestrator
 
@@ -33,11 +35,14 @@ orchestrator_image := env_var_or_default('ORCHESTRATOR_IMAGE', 'quay.io/tms/benc
 container_cli := env_var_or_default('CONTAINER_CLI', 'docker')
 orchestrator_manifesto_repo := env_var_or_default('ORCHESTRATOR_MANIFESTO_REPO', 'https://github.com/tlrmchlsmth/llm-manifesto.git')
 orchestrator_manifesto_ref := env_var_or_default('ORCHESTRATOR_MANIFESTO_REF', 'main')
-orchestrator_deploy := "benchmark-orchestrator"
-orchestrator_spec_configmap := "benchmark-orchestrator-spec"
+orchestrator_deploy := "benchmark-orchestrator-" + lowercase(manifesto_user)
+orchestrator_spec_configmap := "benchmark-orchestrator-spec-" + lowercase(manifesto_user)
 orchestrator_force_sync := env_var_or_default('ORCHESTRATOR_FORCE_SYNC', 'false')
 model     := env_var_or_default('MODEL', 'deepseek-ai/DeepSeek-V4-Pro')
 model_label := env_var_or_default('MODEL_LABEL', 'DeepSeek-V4-Pro')
+local_nvme_path := env_var_or_default('LOCAL_NVME_PATH', '/mnt/numa0')
+cache_model_image := env_var_or_default('CACHE_MODEL_IMAGE', 'vllm/vllm-openai:nightly-49f31d7cee425a6d38f8c5bc76877986daf832ed')
+model_cache_ds := "model-cache"
 max_context_length := env_var_or_default('MAX_CONTEXT_LENGTH', '128000')
 url       := env_var_or_default('URL', '')
 server_metrics_url := env_var_or_default('SERVER_METRICS_URL', '')
@@ -70,11 +75,17 @@ aiperf_warmup_grace_seconds := env_var_or_default('AIPERF_WARMUP_GRACE_SECONDS',
 # orchestrator can hang instead of exiting on error) and we fail fast instead
 # of waiting out the multi-hour activeDeadlineSeconds safety net.
 aiperf_stall_timeout := env_var_or_default('AIPERF_STALL_TIMEOUT', '300')
+# lm-eval accuracy benchmarks (gsm8k, etc.)
+lmeval_base_image := env_var_or_default('LMEVAL_BASE_IMAGE', 'python:3.12-slim')
+lmeval_concurrency := env_var_or_default('LMEVAL_CONCURRENCY', '64')
 benchmark_retries := env_var_or_default('BENCHMARK_RETRIES', '3')
 benchmark_concurrencies := env_var_or_default('BENCHMARK_CONCURRENCIES', '64 256')
 # Files kubectl cp pulls from CANONICAL_ARTIFACT_DIR (see _run-job); used to
 # detect a partial/incomplete local copy (e.g. after a mid-transfer EOF).
 benchmark_artifact_files := "profile_export_aiperf.json profile_export_aiperf.csv profile_export.jsonl profile_export_console.txt"
+# Small per-config metadata files written once at the top of `sweep` (see
+# _push-config-to-pvc); required by `report` to identify namespace/pods/etc.
+config_metadata_files := "namespace.txt model.txt model_label.txt config_name.txt config_label.txt decode_gpus.txt prefill_gpus.txt pods.txt topology.txt manifesto_spec.txt manifesto_instance.txt manifest.yaml vllm_image.txt vllm_version.txt kv_cache_config.json"
 pod_start_timeout := env_var_or_default('POD_START_TIMEOUT', '900')
 monitoring_namespace := env_var_or_default('MONITORING_NAMESPACE', NAMESPACE)
 prometheus_namespace := env_var_or_default('PROMETHEUS_NAMESPACE', monitoring_namespace)
@@ -185,6 +196,27 @@ _gateway-run-probe:
 _gateway-ready:
     just --quiet _gateway-run-probe
 
+# Wait for decode + prefill pods to be Ready. Used before each concurrency's
+# warmup in sweep-concurrency so we don't launch traffic against a prefill
+# group that LeaderWorkerSet recreated (and is still reloading) after a crash.
+_check-pods-ready:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    INSTANCE=$(cd "{{manifesto_root}}" && uv run manifesto instance-id "{{manifesto_spec}}" --user "{{manifesto_user}}")
+    echo "Checking all pods ready for instance=$INSTANCE..."
+    kubectl wait -n "$NS" --for=condition=Ready pod -l "app.kubernetes.io/instance=$INSTANCE,llm-d.ai/role=decode" --timeout={{pod_start_timeout}}s &
+    DECODE_PID=$!
+    (kubectl wait -n "$NS" --for=condition=Ready pod -l "app.kubernetes.io/instance=$INSTANCE,llm-d.ai/role=prefill" --timeout={{pod_start_timeout}}s 2>/dev/null || true) &
+    PREFILL_PID=$!
+    # wait on each PID explicitly and propagate its real exit code -- a bare
+    # `wait` with no operands always returns 0 regardless of job failures.
+    # Prefill is optional (aggregated topologies have no prefill role), so its
+    # wait is suppressed; decode failure still propagates.
+    wait "$DECODE_PID"
+    wait "$PREFILL_PID"
+    echo "All pods ready."
+
 # Wait for model pods, EPP, and gateway /models (replaces manifesto just ready).
 _wait-model-ready:
     #!/usr/bin/env bash
@@ -242,6 +274,21 @@ warmup:
         sleep 30
     done
 
+# Fail fast (instead of a 900s pod-start-timeout x3 retries per concurrency)
+# when LUSTRE_CLAIM points at a PVC that doesn't exist in this namespace.
+# LUSTRE_CLAIM is normally a single PVC shared across all MANIFESTO_USERs
+# (isolation comes from the per-user subdirectory under LUSTRE_PREFIX, not
+# from a separate PVC per user) — don't override it per user.
+_check-lustre-claim:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! kubectl get pvc -n {{NAMESPACE}} {{lustre_claim}} >/dev/null 2>&1; then
+        echo "ERROR: LUSTRE_CLAIM='{{lustre_claim}}' PVC not found in namespace {{NAMESPACE}}." >&2
+        echo "  LUSTRE_CLAIM is normally shared across users — don't override it per" >&2
+        echo "  MANIFESTO_USER unless you actually have a separate PVC by that name." >&2
+        exit 1
+    fi
+
 # Run the AgentX-MVP benchmark as a Kueue-managed Kubernetes Job.
 run concurrency=concurrency duration=duration dest="./results" attempt="1":
     just _run-job {{concurrency}} {{duration}} "{{dest}}" "" {{attempt}}
@@ -250,6 +297,7 @@ _run-job concurrency duration dest unsafe_args attempt:
     #!/usr/bin/env bash
     set -euo pipefail
     NS={{NAMESPACE}}
+    just _check-lustre-claim
     URL=$(just --quiet _model-url)
     SERVER_METRICS_ARGS=$(just --quiet _server-metrics-args)
     GPU_TELEMETRY_ARGS=$(just --quiet _gpu-telemetry-args)
@@ -281,6 +329,7 @@ _run-job concurrency duration dest unsafe_args attempt:
       name: ${JOB}
       labels:
         app: agentx-aiperf
+        manifesto-user: {{manifesto_user}}
         kueue.x-k8s.io/queue-name: {{kueue_queue}}
     spec:
       suspend: true
@@ -393,10 +442,10 @@ _run-job concurrency duration dest unsafe_args attempt:
               resources:
                 requests:
                   cpu: "8"
-                  memory: 16Gi
+                  memory: 32Gi
                 limits:
                   cpu: "32"
-                  memory: 64Gi
+                  memory: 128Gi
                   ephemeral-storage: 20Gi
               volumeMounts:
                 - name: workspace
@@ -477,7 +526,7 @@ _run-job concurrency duration dest unsafe_args attempt:
             kubectl describe -n "$NS" "job/$JOB" || true
             exit 1
         fi
-        STALL_LOG_NEW=$(kubectl logs -n "$NS" "job/$JOB" --tail=5 2>/dev/null)
+        STALL_LOG_NEW=$(kubectl logs -n "$NS" "job/$JOB" --tail=5 2>/dev/null || true)
         if [ "$STALL_LOG_NEW" != "$STALL_LOG_LAST" ]; then
             STALL_LOG_LAST="$STALL_LOG_NEW"
             STALL_LAST_CHANGE=$SECONDS
@@ -551,6 +600,211 @@ smoke-e2e dest="results_smoke" concurrency="1" duration="60":
 results dest="./results":
     @echo "AIPerf Jobs copy artifacts directly into the run directory; no runner pod copy is needed."
 
+# Run lm-eval GSM8K accuracy benchmark against the deployment as a Kueue-managed Job.
+# Installs lm_eval[api] into a plain Python image at runtime (no custom image needed).
+#   just gsm8k              # default concurrency (64)
+#   just gsm8k 32           # override concurrency
+#   just gsm8k 64 results/my_gsm8k_run
+gsm8k concurrency=lmeval_concurrency dest="results_gsm8k":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    just _check-lustre-claim
+    URL=$(just --quiet _model-url)
+    TS=$(date -u +%Y%m%d%H%M%S)
+    JOB="agentx-gsm8k-c{{concurrency}}-${TS}"
+    DEST_CLEAN=$(printf '%s' "{{dest}}" | sed 's#^\./##')
+    CANONICAL_ARTIFACT_DIR="{{lustre_prefix}}/{{manifesto_user}}/${DEST_CLEAN}"
+    TIMEOUT=7200
+    TMP=$(mktemp)
+    trap "rm -f $TMP" EXIT
+    cat > "$TMP" <<EOF
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: ${JOB}
+      labels:
+        app: agentx-gsm8k
+        manifesto-user: {{manifesto_user}}
+        kueue.x-k8s.io/queue-name: {{kueue_queue}}
+    spec:
+      suspend: true
+      backoffLimit: 0
+      activeDeadlineSeconds: ${TIMEOUT}
+      template:
+        metadata:
+          labels:
+            app: agentx-gsm8k
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: lm-eval
+              image: {{lmeval_base_image}}
+              imagePullPolicy: IfNotPresent
+              workingDir: /workspace
+              env:
+                - name: HF_HOME
+                  value: "{{lustre_prefix}}/{{manifesto_user}}/hf_cache"
+                - name: URL
+                  value: "${URL}"
+                - name: MODEL
+                  value: "{{model}}"
+                - name: CONCURRENCY
+                  value: "{{concurrency}}"
+                - name: ARTIFACT_DIR
+                  value: "${CANONICAL_ARTIFACT_DIR}"
+              envFrom:
+                - secretRef:
+                    name: aiperf-hf-token
+                    optional: true
+              command:
+                - /bin/bash
+                - -c
+              args:
+                - |-
+                  set -euo pipefail
+                  if [ -z "\$ARTIFACT_DIR" ] || [ "\$ARTIFACT_DIR" = "/" ]; then
+                    echo "Refusing to use unsafe ARTIFACT_DIR='\$ARTIFACT_DIR'" >&2
+                    exit 1
+                  fi
+                  pip install --quiet "lm_eval[api]"
+                  mkdir -p "\$ARTIFACT_DIR"
+                  lm_eval --model local-chat-completions \
+                    --model_args "model=\$MODEL,base_url=\$URL/chat/completions,num_concurrent=\$CONCURRENCY" \
+                    --tasks gsm8k \
+                    --apply_chat_template \
+                    --gen_kwargs reasoning_effort=none \
+                    --log_samples \
+                    --output_path "\$ARTIFACT_DIR/lm_eval_output" \
+                    2>&1 | tee "\$ARTIFACT_DIR/lm_eval.log"
+                  RESULTS_JSON=\$(find "\$ARTIFACT_DIR/lm_eval_output" -name "results_*.json" -type f | head -1)
+                  if [ -z "\$RESULTS_JSON" ]; then
+                    echo "ERROR: results.json not found after lm_eval" >&2
+                    find "\$ARTIFACT_DIR/lm_eval_output" -type f | sort >&2 || true
+                    exit 1
+                  fi
+                  cp "\$RESULTS_JSON" "\$ARTIFACT_DIR/results.json"
+              resources:
+                requests:
+                  cpu: "4"
+                  memory: 8Gi
+                limits:
+                  cpu: "8"
+                  memory: 16Gi
+              volumeMounts:
+                - name: workspace
+                  mountPath: /workspace
+                - name: lustre
+                  mountPath: {{lustre_mount}}
+          volumes:
+            - name: workspace
+              emptyDir:
+                sizeLimit: 10Gi
+            - name: lustre
+              persistentVolumeClaim:
+                claimName: {{lustre_claim}}
+    EOF
+    kubectl apply -n "$NS" -f "$TMP"
+    echo "GSM8K job submitted: $JOB"
+    echo "Artifacts: $CANONICAL_ARTIFACT_DIR"
+    echo "Waiting for pod..."
+    POD=""
+    while [ -z "$POD" ]; do
+        POD=$(kubectl get pod -n "$NS" -l job-name="$JOB" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        [ -z "$POD" ] && sleep 5
+    done
+    echo "Pod created: $POD"
+    POD_START_DEADLINE=$((SECONDS + {{pod_start_timeout}}))
+    LAST_STATUS=""
+    while true; do
+        PHASE=$(kubectl get pod -n "$NS" "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        REASON=$(kubectl get pod -n "$NS" "$POD" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+        STATUS="$PHASE"
+        [ -n "$REASON" ] && STATUS="$STATUS/$REASON"
+        if [ "$STATUS" != "$LAST_STATUS" ]; then
+            echo "Pod status: $STATUS"
+            LAST_STATUS="$STATUS"
+        fi
+        case "$PHASE" in
+            Running|Succeeded) break ;;
+            Failed)
+                kubectl logs -n "$NS" "$POD" --tail=200 || true
+                kubectl describe -n "$NS" "pod/$POD" || true
+                exit 1 ;;
+        esac
+        if [ "$SECONDS" -ge "$POD_START_DEADLINE" ]; then
+            echo "ERROR: pod did not start within {{pod_start_timeout}}s"
+            kubectl logs -n "$NS" "$POD" --tail=200 || true
+            kubectl describe -n "$NS" "pod/$POD" || true
+            exit 1
+        fi
+        sleep 10
+    done
+    JOB_DEADLINE=$((SECONDS + TIMEOUT))
+    while true; do
+        COMPLETE=$(kubectl get job -n "$NS" "$JOB" -o jsonpath='{range .status.conditions[?(@.type=="Complete")]}{.status}{end}' 2>/dev/null || true)
+        FAILED=$(kubectl get job -n "$NS" "$JOB" -o jsonpath='{range .status.conditions[?(@.type=="Failed")]}{.status}{end}' 2>/dev/null || true)
+        if [ "$COMPLETE" = "True" ]; then
+            echo "GSM8K job completed: $JOB"
+            break
+        fi
+        if [ "$FAILED" = "True" ]; then
+            kubectl logs -n "$NS" "job/$JOB" --tail=200 || true
+            kubectl describe -n "$NS" "job/$JOB" || true
+            exit 1
+        fi
+        if [ "$SECONDS" -ge "$JOB_DEADLINE" ]; then
+            echo "ERROR: job did not complete within ${TIMEOUT}s"
+            kubectl logs -n "$NS" "job/$JOB" --tail=200 || true
+            kubectl describe -n "$NS" "job/$JOB" || true
+            exit 1
+        fi
+        sleep 10
+    done
+    just _ensure-log-reader
+    LR={{log_reader_pod}}
+    if ! kubectl exec -n "$NS" "$LR" -c log-reader -- test -f "${CANONICAL_ARTIFACT_DIR}/results.json" 2>/dev/null; then
+        echo "ERROR: results.json missing from PVC after job completion"
+        kubectl exec -n "$NS" "$LR" -c log-reader -- ls -la "${CANONICAL_ARTIFACT_DIR}" 2>/dev/null || true
+        exit 1
+    fi
+    mkdir -p "{{dest}}"
+    printf '%s\n' "$JOB" > "{{dest}}/job_name.txt"
+    printf '%s\n' "$CANONICAL_ARTIFACT_DIR" > "{{dest}}/remote_artifact_dir.txt"
+    FAILED_COPY=""
+    for f in results.json lm_eval.log; do
+        RSIZE=$(kubectl exec -n "$NS" "$LR" -c log-reader -- stat -c%s "${CANONICAL_ARTIFACT_DIR}/$f" 2>/dev/null || true)
+        if [ -z "$RSIZE" ]; then
+            echo "  $f: not on PVC, skipping"
+            continue
+        fi
+        if kubectl exec -n "$NS" "$LR" -c log-reader -- cat "${CANONICAL_ARTIFACT_DIR}/$f" > "{{dest}}/$f" 2>/dev/null; then
+            LSIZE=$(stat -f%z "{{dest}}/$f" 2>/dev/null || stat -c%s "{{dest}}/$f" 2>/dev/null || echo 0)
+            if [ "$LSIZE" = "$RSIZE" ]; then
+                echo "  $f: done ($RSIZE bytes)"
+            else
+                echo "  $f: truncated ($LSIZE/$RSIZE bytes)"
+                rm -f "{{dest}}/$f"
+                FAILED_COPY="$FAILED_COPY $f"
+            fi
+        else
+            echo "  $f: fetch failed"
+            FAILED_COPY="$FAILED_COPY $f"
+        fi
+    done
+    if [ -n "$FAILED_COPY" ]; then
+        echo "WARNING: could not copy some artifacts locally:$FAILED_COPY"
+        echo "  Results are safe on the PVC at $CANONICAL_ARTIFACT_DIR"
+        echo "  Recover with:"
+        echo "    kubectl exec -n $NS $LR -c log-reader -- cat ${CANONICAL_ARTIFACT_DIR}/results.json > {{dest}}/results.json"
+    fi
+    kubectl delete -n "$NS" job "$JOB" --ignore-not-found=true
+    echo "GSM8K results: {{dest}}/"
+
+# Delete any leftover GSM8K Jobs (scoped to this MANIFESTO_USER).
+gsm8k-wipe:
+    kubectl delete job -n {{NAMESPACE}} -l app=agentx-gsm8k,manifesto-user={{manifesto_user}} --ignore-not-found=true
+
 # Ensure the dedicated log-reader pod is up (stable Lustre access for test/cp).
 _ensure-log-reader:
     #!/usr/bin/env bash
@@ -606,13 +860,13 @@ _fetch-from-reader-one remote dest fetch_all="":
         fi
         local try=0 delay=5 ok=false
         while [ "$try" -lt 5 ]; do
-            if kubectl cp -c log-reader "$NS/${POD}:${rpath}" "$lpath" 2>/dev/null; then
+            if kubectl exec -n "$NS" "$POD" -c log-reader -- cat "$rpath" > "$lpath" 2>/dev/null; then
                 local cur; cur=$(_lsize "$lpath")
                 if [ "$cur" = "$expected" ]; then ok=true; break; fi
                 echo "  $label: truncated ($cur/$expected bytes)"
                 rm -f "$lpath"
             else
-                echo "  $label: kubectl cp failed"
+                echo "  $label: fetch failed"
             fi
             try=$((try + 1))
             echo "  $label: retry $try/5 in ${delay}s..."
@@ -653,6 +907,27 @@ _fetch-from-reader-one remote dest fetch_all="":
 
 _copy-result-from-pvc remote dest:
     just _fetch-from-reader-one "{{remote}}" "{{dest}}"
+
+# Push the small per-config metadata files written by `sweep` (namespace.txt,
+# manifest.yaml, kv_cache_config.json, etc.) from `dir` up to the Lustre PVC,
+# so they're durable and survive orchestrator pod restarts (the pod's
+# /workspace is an ephemeral emptyDir) and are visible from the log-reader
+# pod / usable by `report` straight off the PVC.
+_push-config-to-pvc dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _ensure-log-reader
+    NS={{NAMESPACE}}
+    LR={{log_reader_pod}}
+    DIR_CLEAN=$(printf '%s' "{{dir}}" | sed 's#^\./##')
+    REMOTE="{{lustre_prefix}}/{{manifesto_user}}/${DIR_CLEAN}"
+    kubectl exec -n "$NS" "$LR" -c log-reader -- mkdir -p "$REMOTE"
+    for f in {{config_metadata_files}}; do
+        [ -f "{{dir}}/$f" ] || continue
+        kubectl cp -c log-reader "{{dir}}/$f" "$NS/${LR}:${REMOTE}/$f" 2>/dev/null \
+            || echo "  WARNING: failed to push $f to PVC" >&2
+    done
+    echo "  Config metadata pushed to PVC: $REMOTE"
 
 # Manually fetch already-completed benchmark results straight from the Lustre PVC (via the
 # dedicated log-reader pod, see logs-dev-up) to a local directory on this machine. Use this when
@@ -804,9 +1079,10 @@ clear-kv-cache:
     done
     echo "All prefix caches reset (GPU + CPU + NVMe)."
 
-# Delete any leftover benchmark Jobs.
+# Delete any leftover benchmark Jobs (scoped to this MANIFESTO_USER only, so
+# it never touches another user's concurrently running benchmark Job).
 wipe:
-    kubectl delete job -n {{NAMESPACE}} -l app=agentx-aiperf --ignore-not-found=true
+    kubectl delete job -n {{NAMESPACE}} -l app=agentx-aiperf,manifesto-user={{manifesto_user}} --ignore-not-found=true
 
 logs:
     kubectl logs -n {{NAMESPACE}} deploy/{{orchestrator_deploy}} -f
@@ -814,9 +1090,79 @@ logs:
 shell:
     kubectl exec -it -n {{NAMESPACE}} deploy/{{orchestrator_deploy}} -- bash
 
+# Stream EPP logs: raw → Lustre, filtered summary → local file + terminal.
+# Finds the running infpool pod automatically. Kills any previous watcher first.
+epp-watch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    SCRIPT="{{justfile_directory()}}/epp-watcher.py"
+    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+    LOG_READER="agentx-log-reader-{{manifesto_user}}"
+
+    EPP_POD=$(kubectl get pods -n "$NS" --no-headers 2>/dev/null \
+        | awk '/infpool/ && /{{manifesto_user}}/ && /Running/ {print $1; exit}')
+    if [[ -z "$EPP_POD" ]]; then
+        echo "ERROR: no Running infpool pod for user '{{manifesto_user}}' in ns $NS" >&2
+        exit 1
+    fi
+
+    FILTERED_LOG="{{justfile_directory()}}/epp-filtered-${TIMESTAMP}.log"
+    RAW_LUSTRE="{{lustre_mount}}/{{manifesto_user}}/logs/epp/${EPP_POD}_${TIMESTAMP}.raw.log"
+
+    pkill -f "epp-watcher.py" 2>/dev/null || true
+    pkill -f "kubectl logs.*infpool.*-f" 2>/dev/null || true
+    sleep 0.5
+
+    echo "EPP pod:     $EPP_POD"
+    echo "Filtered:    $FILTERED_LOG"
+    echo "Raw→Lustre:  $RAW_LUSTRE"
+
+    # Raw stream → Lustre via log-reader pod
+    kubectl logs -n "$NS" "$EPP_POD" -f 2>&1 \
+        | kubectl exec -i -n "$NS" "$LOG_READER" -- \
+              sh -c "mkdir -p $(dirname \"$RAW_LUSTRE\") && cat >> \"$RAW_LUSTRE\"" &
+    RAW_PID=$!
+
+    # Filtered watcher → terminal + local file
+    kubectl logs -n "$NS" "$EPP_POD" -f 2>&1 \
+        | python3 "$SCRIPT" --out "$FILTERED_LOG" &
+    WATCH_PID=$!
+
+    echo "$RAW_PID $WATCH_PID" > /tmp/epp-watcher-{{manifesto_user}}.pids
+    echo "Raw PID:     $RAW_PID"
+    echo "Watcher PID: $WATCH_PID"
+
+# Stop the background EPP log watcher started by `just epp-watch`.
+epp-watch-stop:
+    #!/usr/bin/env bash
+    pkill -f "epp-watcher.py"        2>/dev/null && echo "Stopped watcher"    || echo "No watcher running"
+    pkill -f "kubectl logs.*infpool.*-f" 2>/dev/null && echo "Stopped raw stream" || echo "No raw stream running"
+    rm -f /tmp/epp-watcher-{{manifesto_user}}.pids
+
 clean:
     just wipe
     just orchestrator-clean
+
+# Delete all manifesto model-serving resources and benchmark pods for a given
+# user (llm-d.ai/owner label). Does not touch other users' resources.
+# Usage: just cleanup-all <username>
+# Example: just cleanup-all ilmarkov
+cleanup-all username:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    echo "Deleting all resources for owner={{username}} in namespace=$NS..."
+    kubectl -n "$NS" delete lws \
+        -l "llm-d.ai/owner={{username}}" \
+        --grace-period=0 --force --ignore-not-found=true
+    kubectl -n "$NS" delete deploy,svc,httproute,gateway,inferencepool \
+        -l "llm-d.ai/owner={{username}}" \
+        --ignore-not-found=true
+    kubectl -n "$NS" delete pod \
+        -l "llm-d.ai/owner={{username}}" \
+        --grace-period=0 --force --ignore-not-found=true
+    echo "Done."
 
 # Capture vllm version info from a running deployment into a directory.
 vllm-version dest=".":
@@ -989,6 +1335,92 @@ dump-crash-logs dest=".":
     done
     echo "Crash logs saved to $OUTDIR/ (every restart, not just the current run)"
 
+# Print all pod names for *role* derived from MODEL_SPEC + MANIFESTO_USER (one per line).
+# Works without running pods. Used internally by get-logs.
+_pod-names role:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{manifesto_root}}"
+    uv run python - <<'PY'
+    from manifesto.cluster import load_cluster
+    from manifesto.instance import Instance
+    from manifesto.spec import load_spec
+    import sys
+    spec = load_spec("{{manifesto_spec}}", load_cluster("{{manifesto_cluster}}"))
+    inst = Instance("{{manifesto_user}}", spec.release)
+    role = "{{role}}"
+    for r in spec.roles:
+        if r.name != role:
+            continue
+        lws = inst.user_scoped_name(r.workload_name) if r.workload_name else inst.name(r.name)
+        for rep in range(r.lws.replicas):
+            print(f"{lws}-{rep}")
+            for w in range(1, r.lws.size):
+                print(f"{lws}-{rep}-{w}")
+    PY
+
+# Download the Nth-latest Lustre log for every pod of *role* to .tmp/.
+# Pod names are derived from MODEL_SPEC + MANIFESTO_USER — works even when pods are not running.
+# nth=1 (default) = latest log, nth=2 = second-to-latest, etc.
+# Usage:
+#   just get-logs                # latest prefill logs
+#   just get-logs decode         # latest decode logs
+#   just get-logs prefill 2      # second-to-latest prefill
+#   just get-logs decode 3       # third-to-latest decode
+get-logs role="prefill" nth="1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    NTH="{{nth}}"
+    LOG_DIR="{{lustre_mount}}/{{manifesto_user}}/logs/{{role}}"
+    DEST="{{justfile_directory()}}/.tmp/logs-{{role}}-$(date +%Y%m%d-%H%M%S)"
+
+    just _ensure-log-reader
+    LR={{log_reader_pod}}
+
+    if ! kubectl exec -n "$NS" "$LR" -c log-reader -- sh -c "test -d '$LOG_DIR'" 2>/dev/null; then
+        echo "ERROR: $LOG_DIR does not exist on Lustre (no '{{role}}' pods for user '{{manifesto_user}}' have started yet)" >&2
+        exit 1
+    fi
+
+    PODS=$(just --quiet _pod-names "{{role}}")
+    if [ -z "$PODS" ]; then
+        echo "ERROR: no pods found for role '{{role}}' in spec '{{manifesto_spec}}'" >&2
+        exit 1
+    fi
+
+    mkdir -p "$DEST"
+    echo "Role:    {{role}}"
+    echo "Nth:     $NTH  (1=latest, 2=second-to-latest, ...)"
+    echo "Dest:    $DEST"
+    echo ""
+
+    ANY=false
+    for POD in $PODS; do
+        LOG=$(kubectl exec -n "$NS" "$LR" -c log-reader -- \
+            sh -c "ls -1t \"$LOG_DIR/${POD}_\"*.log 2>/dev/null | sed -n '${NTH}p'" 2>/dev/null) || LOG=""
+        if [ -z "$LOG" ]; then
+            TOTAL=$(kubectl exec -n "$NS" "$LR" -c log-reader -- \
+                sh -c "ls -1 \"$LOG_DIR/${POD}_\"*.log 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]') || TOTAL=0
+            echo "  [$POD] SKIP — only ${TOTAL:-0} log(s) on Lustre, requested nth=$NTH"
+            continue
+        fi
+        BASENAME=$(basename "$LOG")
+        echo "  [$POD] $BASENAME"
+        kubectl exec -n "$NS" "$LR" -c log-reader -- cat "$LOG" > "$DEST/$BASENAME" 2>/dev/null
+        BYTES=$(wc -c < "$DEST/$BASENAME" 2>/dev/null) || BYTES=0
+        echo "         → $DEST/$BASENAME  ($((BYTES / 1024 / 1024)) MiB)"
+        ANY=true
+    done
+
+    echo ""
+    if $ANY; then
+        echo "Done: $DEST"
+    else
+        echo "No files downloaded (check nth=$NTH or verify logs exist in $LOG_DIR)."
+        rmdir "$DEST" 2>/dev/null || true
+    fi
+
 # Port-forward Grafana to localhost (background, like llm-manifesto `just grafana`).
 grafana port="3000":
     kubectl port-forward -n {{grafana_namespace}} svc/{{grafana_service}} {{port}}:80 > /dev/null 2>&1 &
@@ -1029,6 +1461,7 @@ report outdir *flags:
             POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
             kubectl cp export_dashboard.py "$NS/${POD}:/workspace/export_dashboard.py"
             kubectl cp prefix_cache_report.py "$NS/${POD}:/workspace/prefix_cache_report.py"
+            kubectl cp spec_decode_report.py "$NS/${POD}:/workspace/spec_decode_report.py"
             SETUP_NAMESPACES="${SETUP_NAMESPACES}|${NS}|${POD}|"
         fi
         POD=$(echo "$SETUP_NAMESPACES" | grep -o "|${NS}|[^|]*|" | head -1 | cut -d'|' -f3)
@@ -1094,9 +1527,33 @@ report outdir *flags:
         kubectl cp "$NS/${POD}:/workspace/prefix_cache_${NAME}.json" "$dir/prefix_cache_report.json" 2>/dev/null || true
         kubectl exec -n "$NS" "$POD" -- rm -f "/workspace/prefix_cache_${NAME}.txt" "/workspace/prefix_cache_${NAME}.json"
         fi
+        echo "=== $NAME ($NS): spec-decode report ==="
+        if [ -f "$PARENT/manifest.yaml" ] && ! grep -qE '(speculative.config|speculative_config)' "$PARENT/manifest.yaml"; then
+            echo "  speculative decoding not enabled for this config, skipping"
+        elif [ "$FORCE" = false ] && [ -f "$dir/spec_decode_report.json" ]; then
+            echo "  spec_decode_report.json exists, skipping (use --force to re-run)"
+        else
+        kubectl exec -n "$NS" "$POD" -- python3 /workspace/spec_decode_report.py \
+            --grafana-url "$GRAFANA_URL" \
+            --deployment "$DEPLOYMENT" \
+            --pod-regex "$POD_REGEX" \
+            --start "$START" --end "$END" \
+            --name "$NAME" \
+            -o "/workspace/spec_decode_${NAME}.txt" \
+            --output-json "/workspace/spec_decode_${NAME}.json" || {
+            echo "  WARNING: spec-decode report failed for $NAME, skipping"
+            continue
+        }
+        kubectl cp "$NS/${POD}:/workspace/spec_decode_${NAME}.txt" "$dir/spec_decode_report.txt" 2>/dev/null || true
+        kubectl cp "$NS/${POD}:/workspace/spec_decode_${NAME}.json" "$dir/spec_decode_report.json" 2>/dev/null || true
+        kubectl exec -n "$NS" "$POD" -- rm -f "/workspace/spec_decode_${NAME}.txt" "/workspace/spec_decode_${NAME}.json"
+        fi
         echo "=== $NAME ($NS): KV cache config ==="
         if [ "$FORCE" = false ] && [ -f "$dir/kv_cache_config.json" ]; then
             echo "  kv_cache_config.json exists, skipping (use --force to re-run)"
+        elif [ -f "$PARENT/kv_cache_config.json" ]; then
+            cp "$PARENT/kv_cache_config.json" "$dir/kv_cache_config.json"
+            echo "  Copied from parent config dir"
         else
         KV_DECODE=0 KV_PREFILL=0 KV_FOUND=false
         MANIFESTO="{{manifesto_root}}"
@@ -1381,6 +1838,115 @@ stop-model:
         | uv run python "{{repo_root}}/inject_kueue_queue.py" --queue "{{kueue_queue}}" \
         | kubectl delete -n "{{NAMESPACE}}" -f - --ignore-not-found=true
 
+# Pre-warm a model's weights into GPU nodes' local NVMe HF cache
+# (/mnt/numa0 -> $HF_HOME=/mnt/local/hf_cache, matching manifesto/cluster.py's
+# local_nvme_path convention) *before* a benchmark deployment schedules onto
+# them, so vLLM doesn't pay a multi-hundred-GB cold HF Hub download inline
+# with pod startup on every fresh node.
+#
+# By default targets every node labeled nvidia.com/gpu.present=true. Pass
+# `node` as a single node name, or a comma-separated list of node names
+# (e.g. from `kubectl get pod -o wide`) to target just those nodes instead
+# (downloaded in parallel, one DaemonSet pod per node) - e.g. to warm only
+# the nodes in a rack that don't already have the weights cached:
+#   just cache-model deepseek-ai/DeepSeek-V4-Pro-DSpark 10.0.136.252
+#   just cache-model deepseek-ai/DeepSeek-V4-Pro-DSpark 10.0.128.116,10.0.129.200
+#
+# Ported from j-llm-d's gb200/model-cache-ds.yaml + `just cache-model`.
+cache-model model node="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NS={{NAMESPACE}}
+    kubectl delete daemonset -n "$NS" {{model_cache_ds}} --ignore-not-found=true
+    NODE={{node}}
+    if [ -n "$NODE" ]; then
+        AFFINITY_KEY="kubernetes.io/hostname"
+        AFFINITY_VALUES=$(echo "$NODE" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^/                        - /')
+    else
+        AFFINITY_KEY="nvidia.com/gpu.present"
+        AFFINITY_VALUES='                        - "true"'
+    fi
+    TMP=$(mktemp)
+    trap "rm -f $TMP" EXIT
+    cat > "$TMP" <<EOF
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      name: {{model_cache_ds}}
+    spec:
+      selector:
+        matchLabels:
+          app: {{model_cache_ds}}
+      template:
+        metadata:
+          labels:
+            app: {{model_cache_ds}}
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: $AFFINITY_KEY
+                        operator: In
+                        values:
+    $AFFINITY_VALUES
+          initContainers:
+            - name: download
+              image: {{cache_model_image}}
+              securityContext:
+                runAsUser: 0
+                runAsGroup: 0
+              command: ["/bin/sh", "-c"]
+              args:
+                - hf download {{model}}
+              env:
+                - name: HF_HOME
+                  value: /mnt/local/hf_cache
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: HF_TOKEN
+                      optional: true
+              volumeMounts:
+                - mountPath: /mnt/local
+                  name: local-nvme
+              resources:
+                requests:
+                  cpu: 8
+                  memory: 32Gi
+                limits:
+                  cpu: 8
+                  memory: 32Gi
+          containers:
+            - name: idle
+              image: {{cache_model_image}}
+              command: ["sleep", "infinity"]
+              resources:
+                requests:
+                  cpu: 1m
+                  memory: 16Mi
+                limits:
+                  cpu: 1m
+                  memory: 16Mi
+          volumes:
+            - name: local-nvme
+              hostPath:
+                path: {{local_nvme_path}}
+                type: Directory
+    EOF
+    kubectl apply -n "$NS" -f "$TMP"
+    echo "Waiting for {{model_cache_ds}} DaemonSet to finish downloading {{model}}..."
+    kubectl rollout status daemonset/{{model_cache_ds}} -n "$NS" --timeout=90m
+    echo "All targeted nodes cached. Cleaning up DaemonSet..."
+    kubectl delete daemonset -n "$NS" {{model_cache_ds}}
+
+# Cancel an in-progress `cache-model` run early (leaves partially-downloaded
+# files on each node's local cache; re-running `cache-model` resumes them).
+stop-cache-model:
+    kubectl delete daemonset -n {{NAMESPACE}} {{model_cache_ds}} --ignore-not-found=true
+
 sweep-concurrency config_name dest="." duration="900":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -1411,7 +1977,7 @@ sweep-concurrency config_name dest="." duration="900":
             fi
             just drain
             just clear-kv-cache
-            if just warmup && just run $C {{duration}} "$RDIR" "$attempt"; then
+            if just _check-pods-ready && just warmup && just run $C {{duration}} "$RDIR" "$attempt"; then
                 RUN_OK=true
                 break
             fi
@@ -1533,6 +2099,7 @@ sweep outdir duration="900" keep_model=sweep_keep_model:
     if [ -n "$KV_DECODE" ]; then DECODE_JSON="$KV_DECODE"; else DECODE_JSON="None"; fi
     python3 -c "import json; json.dump({'prefill': $PREFILL_JSON, 'decode': $DECODE_JSON}, open('$dir/kv_cache_config.json','w'), indent=2)"
     echo "  Saved to $dir/kv_cache_config.json"
+    just _push-config-to-pvc "$dir"
     just sweep-concurrency "$CONFIG_NAME" "$dir" {{duration}}
     if [ "$KEEP_MODEL" != "true" ] && [ "$KEEP_MODEL" != "1" ]; then
         just stop-model
@@ -1564,10 +2131,17 @@ snapshot-prometheus ns dest:
     kubectl exec -n "$PROM_NS" "$PROM_POD" -c prometheus-server -- rm -rf "/data/snapshots/${SNAP_NAME}" 2>/dev/null || true
     echo "  Saved to $SNAP_DIR"
 
-orchestrator-build:
+orchestrator-build no_cache="false":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CACHE_ARGS=""
+    if [ "{{no_cache}}" = "true" ]; then
+        CACHE_ARGS="--no-cache"
+    fi
     {{container_cli}} build --platform linux/amd64 \
       --build-arg MANIFESTO_REPO="{{orchestrator_manifesto_repo}}" \
       --build-arg MANIFESTO_REF="{{orchestrator_manifesto_ref}}" \
+      $CACHE_ARGS \
       -f Dockerfile.orchestrator -t {{orchestrator_image}} .
     {{container_cli}} push {{orchestrator_image}}
 
@@ -1585,6 +2159,8 @@ orchestrator-spec-config:
         printf "LUSTRE_CLAIM='%s'\n" "{{lustre_claim}}"
         printf "LUSTRE_MOUNT='%s'\n" "{{lustre_mount}}"
         printf "LUSTRE_PREFIX='%s'\n" "{{lustre_prefix}}"
+        printf "MODEL='%s'\n" "{{model}}"
+        printf "MODEL_LABEL='%s'\n" "{{model_label}}"
         printf "AIPERF_IMAGE='%s'\n" "{{aiperf_image}}"
         printf "AIPERF_PUBLIC_DATASET='%s'\n" "{{aiperf_public_dataset}}"
         printf "AIPERF_RANDOM_SEED='%s'\n" "{{aiperf_random_seed}}"
@@ -1598,6 +2174,7 @@ orchestrator-spec-config:
         printf "AIPERF_DATASET_MMAP_CACHE_DIR='%s'\n" "{{aiperf_mmap_cache_dir}}"
         printf "AIPERF_CACHE_WARMUP_SECONDS='%s'\n" "{{aiperf_cache_warmup_seconds}}"
         printf "AIPERF_WARMUP_GRACE_SECONDS='%s'\n" "{{aiperf_warmup_grace_seconds}}"
+        printf "MANIFESTO_CLUSTER='%s'\n" "{{manifesto_cluster}}"
     } > "$TMP"
     kubectl create configmap {{orchestrator_spec_configmap}} -n {{NAMESPACE}} \
       --from-file=benchmark-sweep.env="$TMP" \
@@ -1607,56 +2184,70 @@ orchestrator-deploy:
     #!/usr/bin/env bash
     set -euo pipefail
     just orchestrator-spec-config
-    kubectl apply -n {{NAMESPACE}} -f orchestrator.yaml
+    sed -e "s/__ORCHESTRATOR_NAME__/{{orchestrator_deploy}}/g" \
+        -e "s/__ORCHESTRATOR_SPEC_CONFIGMAP__/{{orchestrator_spec_configmap}}/g" \
+        orchestrator.yaml \
+      | kubectl apply -n {{NAMESPACE}} -f -
     kubectl set image -n {{NAMESPACE}} deploy/{{orchestrator_deploy}} orchestrator={{orchestrator_image}}
     kubectl rollout restart -n {{NAMESPACE}} deploy/{{orchestrator_deploy}}
     kubectl rollout status deploy/{{orchestrator_deploy}} -n {{NAMESPACE}} --timeout=300s
     POD=$(kubectl get pod -n {{NAMESPACE}} -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
     echo "Orchestrator pod ready: $POD"
 
-# Sync only llm-manifesto models/ + clusters/ into the orchestrator pod when
+# Sync only llm-manifesto models/ + clusters/ + config/ into the orchestrator pod when
 # local and in-pod YAML hashes differ (not manifesto Python/templates/etc.).
+# config/ carries images.yaml (the image_ref catalog) — it must stay in sync or
+# image_ref aliases added/changed locally (e.g. to route around a GC'd nightly
+# tag) will fail to resolve on the pod with "unknown image ref".
 orchestrator-sync-manifesto:
     #!/usr/bin/env bash
     set -euo pipefail
     MANIFESTO="{{manifesto_root}}"
     NS={{NAMESPACE}}
     POD_DEST="/workspace/llm-manifesto"
-    if [ ! -d "$MANIFESTO/models" ] || [ ! -d "$MANIFESTO/clusters" ]; then
-        echo "ERROR: MANIFESTO_ROOT must contain models/ and clusters/: $MANIFESTO" >&2
+    ROUTING_PY="$MANIFESTO/manifesto/render/routing.py"
+    if [ ! -d "$MANIFESTO/models" ] || [ ! -d "$MANIFESTO/clusters" ] || [ ! -d "$MANIFESTO/config" ]; then
+        echo "ERROR: MANIFESTO_ROOT must contain models/, clusters/ and config/: $MANIFESTO" >&2
         exit 1
     fi
-    # Hash YAML under models/ and clusters/ only — not the rest of llm-manifesto.
+    if [ ! -f "$ROUTING_PY" ]; then
+        echo "ERROR: routing.py not found at $ROUTING_PY" >&2
+        exit 1
+    fi
+    # Hash YAML under models/, clusters/ and config/, plus manifesto/render/routing.py.
     compute_local_hash() {
-        find "$MANIFESTO/models" "$MANIFESTO/clusters" \
-            -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 \
-            | sort -z \
-            | xargs -0 shasum -a 256 2>/dev/null \
-            | awk '{print $1}' \
-            | shasum -a 256 \
-            | awk '{print $1}'
+        {
+            find "$MANIFESTO/models" "$MANIFESTO/clusters" "$MANIFESTO/config" \
+                -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 \
+                | sort -z \
+                | xargs -0 shasum -a 256 2>/dev/null \
+                | awk '{print $1}'
+            shasum -a 256 "$ROUTING_PY" 2>/dev/null | awk '{print $1}'
+        } | shasum -a 256 | awk '{print $1}'
     }
     LOCAL_HASH=$(compute_local_hash)
     POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
     POD_HASH=$(kubectl exec -n "$NS" "$POD" -- sh -c \
-        'find '"$POD_DEST"'/models '"$POD_DEST"'/clusters \
+        '{ find '"$POD_DEST"'/models '"$POD_DEST"'/clusters '"$POD_DEST"'/config \
             -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 2>/dev/null \
             | sort -z \
             | xargs -0 sha256sum 2>/dev/null \
-            | awk "{print \$1}" \
-            | sha256sum \
-            | awk "{print \$1}"')
+            | awk "{print \$1}"
+          sha256sum '"$POD_DEST"'/manifesto/render/routing.py 2>/dev/null | awk "{print \$1}"
+        } | sha256sum | awk "{print \$1}"')
     FORCE="{{orchestrator_force_sync}}"
     if [ "$FORCE" != "true" ] && [ "$FORCE" != "1" ]; then
         if [ -n "$POD_HASH" ] && [ "$POD_HASH" = "$LOCAL_HASH" ]; then
-            echo "models/ + clusters/ match pod (hash $(printf '%.12s' "$LOCAL_HASH")…), skipping sync"
+            echo "models/ + clusters/ + config/ + routing.py match pod (hash $(printf '%.12s' "$LOCAL_HASH")…), skipping sync"
             exit 0
         fi
     fi
-    echo "Syncing models/ + clusters/ to pod $POD (local $(printf '%.12s' "$LOCAL_HASH")… pod $(printf '%.12s' "$POD_HASH")…)..."
+    echo "Syncing models/ + clusters/ + config/ + routing.py to pod $POD (local $(printf '%.12s' "$LOCAL_HASH")… pod $(printf '%.12s' "$POD_HASH")…)..."
     kubectl cp "$MANIFESTO/models/." "$NS/${POD}:${POD_DEST}/models/"
     kubectl cp "$MANIFESTO/clusters/." "$NS/${POD}:${POD_DEST}/clusters/"
-    echo "models/ + clusters/ sync complete."
+    kubectl cp "$MANIFESTO/config/." "$NS/${POD}:${POD_DEST}/config/"
+    kubectl cp "$ROUTING_PY" "$NS/${POD}:${POD_DEST}/manifesto/render/routing.py"
+    echo "models/ + clusters/ + config/ + routing.py sync complete."
 
 # Copy local agentx-mvp harness files into the orchestrator pod (Justfile, inject script).
 orchestrator-sync-harness:
@@ -1683,6 +2274,7 @@ orchestrator-sync:
 orchestrator-run outdir="" duration=duration redeploy=orchestrator_redeploy keep_model=sweep_keep_model:
     #!/usr/bin/env bash
     set -euo pipefail
+    just _check-lustre-claim
     OUTDIR="{{outdir}}"
     REDEPLOY="{{redeploy}}"
     if [ -z "$OUTDIR" ]; then
@@ -1709,6 +2301,8 @@ orchestrator-run outdir="" duration=duration redeploy=orchestrator_redeploy keep
     kubectl exec -n "$NS" "$POD" -- env \
       JUST_NO_DOTENV=true \
       NAMESPACE="{{NAMESPACE}}" \
+      MODEL="{{model}}" \
+      MODEL_LABEL="{{model_label}}" \
       MODEL_SPEC="{{manifesto_spec}}" \
       MANIFESTO_ROOT="/workspace/llm-manifesto" \
       MANIFESTO_CLUSTER="{{manifesto_cluster}}" \
@@ -1734,24 +2328,58 @@ orchestrator-logs:
 orchestrator-results outdir:
     #!/usr/bin/env bash
     set -euo pipefail
+    just _ensure-log-reader
     NS={{NAMESPACE}}
-    POD=$(kubectl get pod -n "$NS" -l app={{orchestrator_deploy}} -o jsonpath='{.items[0].metadata.name}')
-    DIRS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -name "profile_export_aiperf.json" -exec dirname {} \; 2>/dev/null)
-    for dir in $DIRS; do
-        LOCAL=${dir#/workspace/agentx-mvp/}
-        mkdir -p "$LOCAL"
-        kubectl cp "$NS/${POD}:${dir}" "$LOCAL" 2>/dev/null || true
-    done
-    EXTRAS=$(kubectl exec -n "$NS" "$POD" -- find /workspace/agentx-mvp/{{outdir}} -maxdepth 2 \( -name "*.yaml" -o -name "*.txt" -o -name "*.html" \) 2>/dev/null)
-    for f in $EXTRAS; do
-        LOCAL=${f#/workspace/agentx-mvp/}
-        mkdir -p "$(dirname "$LOCAL")"
-        kubectl cp "$NS/${POD}:${f}" "$LOCAL" 2>/dev/null || true
-    done
-    echo "Results copied to {{outdir}}/"
-    python3 gen_interactivity_chart.py "{{outdir}}" 2>/dev/null || true
+    LR={{log_reader_pod}}
+    _norm() { printf '%s' "$1" | sed 's#/\{2,\}#/#g; s#/$##'; }
+    OUTDIR_CLEAN=$(_norm "$(printf '%s' "{{outdir}}" | sed 's#^\./##')")
+    REMOTE_BASE=$(_norm "{{lustre_prefix}}/{{manifesto_user}}/${OUTDIR_CLEAN}")
+    if ! kubectl exec -n "$NS" "$LR" -c log-reader -- test -d "$REMOTE_BASE" 2>/dev/null; then
+        echo "No results found on PVC at $REMOTE_BASE"
+        exit 0
+    fi
 
-orchestrator-stop:
+    _cat() { kubectl exec -n "$NS" "$LR" -c log-reader -- cat "$1" 2>/dev/null; }
+    _relpath() { local p=$(_norm "$1"); [ "$p" = "$REMOTE_BASE" ] && return; printf '%s' "${p#$REMOTE_BASE/}"; }
+
+    # Find canonical concurrency dirs (have profile_export_aiperf.json, no _attempt suffix)
+    DIRS=$(kubectl exec -n "$NS" "$LR" -c log-reader -- \
+        find "$REMOTE_BASE" -name "profile_export_aiperf.json" -exec dirname {} \; 2>/dev/null \
+        | grep -v '_attempt[0-9]' || true)
+    if [ -z "$DIRS" ]; then
+        echo "No completed canonical results on PVC yet"
+        exit 0
+    fi
+
+    # Fetch config-level metadata
+    CONFIG_DIR=$(_norm "$(echo "$DIRS" | head -1 | xargs dirname)")
+    REL=$(_relpath "$CONFIG_DIR")
+    if [ -n "$REL" ]; then
+        LOCAL_CONFIG="${OUTDIR_CLEAN}/${REL}"
+    else
+        LOCAL_CONFIG="${OUTDIR_CLEAN}"
+    fi
+    mkdir -p "$LOCAL_CONFIG"
+    META_LIST=$(kubectl exec -n "$NS" "$LR" -c log-reader -- \
+        find "$CONFIG_DIR" -maxdepth 1 -type f \( -name "*.txt" -o -name "*.yaml" -o -name "*.json" \) 2>/dev/null || true)
+    for rf in $META_LIST; do
+        LOCALF="$LOCAL_CONFIG/$(basename "$rf")"
+        _cat "$rf" > "$LOCALF" || true
+    done
+    echo "Config metadata → $LOCAL_CONFIG/"
+
+    # Fetch profile_export_aiperf.json from each canonical concurrency dir
+    for rdir in $DIRS; do
+        LOCAL="${OUTDIR_CLEAN}/$(_relpath "$rdir")"
+        mkdir -p "$LOCAL"
+        _cat "$rdir/profile_export_aiperf.json" > "$LOCAL/profile_export_aiperf.json"
+        echo "  $(basename "$rdir"): profile_export_aiperf.json ($(wc -c < "$LOCAL/profile_export_aiperf.json") bytes)"
+    done
+
+    echo "Results copied to {{outdir}}/"
+    just report "{{outdir}}" 2>/dev/null || true
+
+orchestrator-stop stop_model="true":
     #!/usr/bin/env bash
     set -euo pipefail
     NS={{NAMESPACE}}
@@ -1759,15 +2387,17 @@ orchestrator-stop:
     if [ -n "$POD" ]; then
         kubectl exec -n "$NS" "$POD" -- bash -c 'kill $(cat /workspace/orchestrator-sweep.pid 2>/dev/null) 2>/dev/null; rm -f /workspace/orchestrator-sweep.pid' 2>/dev/null || true
     fi
-    just stop-model 2>/dev/null || true
+    if [ "{{stop_model}}" = "true" ]; then
+        just stop-model 2>/dev/null || true
+    fi
     echo "Sweep stopped; namespace preserved."
 
 orchestrator-clean:
     #!/usr/bin/env bash
     set -euo pipefail
     kubectl delete deploy {{orchestrator_deploy}} -n {{NAMESPACE}} --ignore-not-found
-    kubectl delete rolebinding benchmark-orchestrator -n {{NAMESPACE}} --ignore-not-found
-    kubectl delete role benchmark-orchestrator -n {{NAMESPACE}} --ignore-not-found
-    kubectl delete clusterrolebinding benchmark-orchestrator --ignore-not-found 2>/dev/null || true
-    kubectl delete sa benchmark-orchestrator -n {{NAMESPACE}} --ignore-not-found
+    kubectl delete rolebinding {{orchestrator_deploy}} -n {{NAMESPACE}} --ignore-not-found
+    kubectl delete role {{orchestrator_deploy}} -n {{NAMESPACE}} --ignore-not-found
+    kubectl delete clusterrolebinding {{orchestrator_deploy}} --ignore-not-found 2>/dev/null || true
+    kubectl delete sa {{orchestrator_deploy}} -n {{NAMESPACE}} --ignore-not-found
     echo "Orchestrator pod cleaned up."

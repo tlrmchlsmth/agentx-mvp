@@ -1,12 +1,12 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: benchmark-orchestrator
+  name: __ORCHESTRATOR_NAME__
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: benchmark-orchestrator
+  name: __ORCHESTRATOR_NAME__
 rules:
   - apiGroups: ["*"]
     resources: ["*"]
@@ -15,34 +15,34 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: benchmark-orchestrator
+  name: __ORCHESTRATOR_NAME__
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: benchmark-orchestrator
+  name: __ORCHESTRATOR_NAME__
 subjects:
   - kind: ServiceAccount
-    name: benchmark-orchestrator
+    name: __ORCHESTRATOR_NAME__
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: benchmark-orchestrator
+  name: __ORCHESTRATOR_NAME__
   labels:
-    app: benchmark-orchestrator
+    app: __ORCHESTRATOR_NAME__
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: benchmark-orchestrator
+      app: __ORCHESTRATOR_NAME__
   template:
     metadata:
       labels:
-        app: benchmark-orchestrator
+        app: __ORCHESTRATOR_NAME__
     spec:
-      serviceAccountName: benchmark-orchestrator
+      serviceAccountName: __ORCHESTRATOR_NAME__
       restartPolicy: Always
       affinity:
         nodeAffinity:
@@ -74,4 +74,4 @@ spec:
       volumes:
         - name: orchestrator-spec
           configMap:
-            name: benchmark-orchestrator-spec
+            name: __ORCHESTRATOR_SPEC_CONFIGMAP__

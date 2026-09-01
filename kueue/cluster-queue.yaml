@@ -13,11 +13,11 @@ spec:
         - name: gb200
           resources:
             - name: cpu
-              nominalQuota: 320
+              nominalQuota: 768
             - name: memory
-              nominalQuota: 5120Gi
+              nominalQuota: 12288Gi
             - name: nvidia.com/gpu
-              nominalQuota: 40
+              nominalQuota: 72
             - name: ephemeral-storage
-              nominalQuota: 1280Gi
+              nominalQuota: 3072Gi
   queueingStrategy: StrictFIFO
