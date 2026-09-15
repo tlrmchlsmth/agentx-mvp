@@ -38,6 +38,8 @@ RUN_ID="$(kubectl get job -n "$NAMESPACE" "$JOB_NAME" \
   -o jsonpath='{.metadata.annotations.benchmark\.llm-d\.ai/run-id}')"
 BUILD_COMMIT="$(kubectl get job -n "$NAMESPACE" "$JOB_NAME" \
   -o jsonpath='{.metadata.labels.benchmark\.llm-d\.ai/vllm-build-commit}')"
+MODEL_LABEL="$(kubectl get job -n "$NAMESPACE" "$JOB_NAME" \
+  -o jsonpath='{.metadata.labels.benchmark\.llm-d\.ai/model}')"
 JOB_TIMESTAMP="${JOB_NAME##*-}"
 if [[ -n "$RUN_ID" ]] && ! [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "Newest AIPerf Job has an unsafe run-id annotation" >&2
@@ -68,12 +70,14 @@ REPORTER_CONFIGMAP="aiperf-report-download-$$"
 MONITORING_SECRET=""
 JOB_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX.yaml")"
 JOB_LOG_SNAPSHOT=""
+CURRENT_PODS_SNAPSHOT=""
 cleanup() {
   kubectl delete pod -n "$NAMESPACE" "$RETRIEVER_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl delete configmap -n "$NAMESPACE" "$REPORTER_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
   [[ -z "$MONITORING_SECRET" ]] || kubectl delete secret -n "$NAMESPACE" "$MONITORING_SECRET" --ignore-not-found >/dev/null 2>&1 || true
   rm -f "$JOB_SNAPSHOT"
   [[ -z "$JOB_LOG_SNAPSHOT" ]] || rm -f "$JOB_LOG_SNAPSHOT"
+  [[ -z "$CURRENT_PODS_SNAPSHOT" ]] || rm -f "$CURRENT_PODS_SNAPSHOT"
 }
 trap cleanup EXIT
 
@@ -104,6 +108,13 @@ if [[ "$MONITORING" == true ]]; then
   kubectl create secret generic "$MONITORING_SECRET" -n "$NAMESPACE" --from-literal=auth="${GRAFANA_USER}:${GRAFANA_PASSWORD}" >/dev/null
   JOB_LOG_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job-log.XXXXXX")"
   kubectl logs -n "$NAMESPACE" "job/${JOB_NAME}" --timestamps > "$JOB_LOG_SNAPSHOT"
+  [[ -n "$MODEL_LABEL" ]] || { echo "AIPerf Job has no model label; cannot scope monitoring safely" >&2; exit 1; }
+  CURRENT_PODS_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-serving-pods.XXXXXX")"
+  kubectl get pods -n "$NAMESPACE" \
+    -l "llm-d.ai/model=${MODEL_LABEL},llm-d.ai/inference-serving=true" \
+    -o go-template='{{range .items}}{{.metadata.name}}{{"\n"}}{{end}}' > "$CURRENT_PODS_SNAPSHOT"
+  [[ -s "$CURRENT_PODS_SNAPSHOT" ]] || { echo "No current serving pods for ${MODEL_LABEL} in ${NAMESPACE}" >&2; exit 1; }
+  echo "Monitoring scope: ${NAMESPACE}, model ${MODEL_LABEL}, $(wc -l < "$CURRENT_PODS_SNAPSHOT" | tr -d ' ') current serving pods"
 fi
 REPORTER_FILES=(
   --from-file=aiperf_report.py="${SCRIPT_DIR}/report.py"
@@ -113,6 +124,7 @@ REPORTER_FILES=(
   --from-file=plotly-basic-2.35.2.min.js.gz="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
 )
 [[ -z "$JOB_LOG_SNAPSHOT" ]] || REPORTER_FILES+=(--from-file=aiperf-job.log="$JOB_LOG_SNAPSHOT")
+[[ -z "$CURRENT_PODS_SNAPSHOT" ]] || REPORTER_FILES+=(--from-file=current-serving-pods.txt="$CURRENT_PODS_SNAPSHOT")
 kubectl create configmap "$REPORTER_CONFIGMAP" -n "$NAMESPACE" "${REPORTER_FILES[@]}"
 kubectl create -f - <<EOF
 apiVersion: v1
@@ -162,13 +174,10 @@ fi
 if [[ "$MONITORING" == true ]]; then
   kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- \
     cp /reporter/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
-  # Scope dashboard PromQL to the serving pods captured with the benchmark,
-  # rather than the legacy deployment-name convention.  This is especially
-  # important for live llm-d names such as *-prefill-* and *-decode-*.
+  # Scope PromQL to the current serving pods of this Job's model in this
+  # namespace, not every deployment represented by the Grafana dashboard.
   kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
-    first="$(find "$1" -mindepth 1 -maxdepth 1 -type d -name "c*" | sort | head -n 1)"
-    [ -n "$first" ] && [ -f "$first/serving-pods.yaml" ] || exit 1
-    awk "\$1 == \"name:\" { print \$2 }" "$first/serving-pods.yaml" | sort -u | paste -sd "|" - > "$1/pods.txt"
+    tr "\n" "|" < /reporter/current-serving-pods.txt | sed "s/|\$//" > "$1/pods.txt"
     [ -s "$1/pods.txt" ]
   ' sh "$RUN_DIR"
   echo "Capturing Grafana dashboard data for each inferred AIPerf time range..."
