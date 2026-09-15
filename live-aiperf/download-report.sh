@@ -231,9 +231,11 @@ if [[ "$MONITORING" == true ]]; then
     [[ -n "$directory" ]] || continue
     # The timestamped Job log supplies the exact profiling start/end; do not
     # use exported metrics or padding, which could include warm-up traffic.
-    kexec python3 /reporter/export_dashboard.py --grafana-url "$GRAFANA_URL" --auth "$GRAFANA_AUTH" \
-      --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz --aiperf-log "${RUN_DIR}/aiperf-job.log" \
-      results "$directory" --pad 0
+    kexec sh -c '
+      python3 /reporter/export_dashboard.py --grafana-url "$1" --auth "$GRAFANA_AUTH" \
+        --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz --aiperf-log "$2/aiperf-job.log" \
+        results "$3" --pad 0
+    ' sh "$GRAFANA_URL" "$RUN_DIR" "$directory"
   done < <(kexec find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name 'c*' | sort)
 fi
 kexec cp /reporter/aiperf-job.yaml "${RUN_DIR}/aiperf-job.yaml"
