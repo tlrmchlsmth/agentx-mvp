@@ -162,6 +162,15 @@ fi
 if [[ "$MONITORING" == true ]]; then
   kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- \
     cp /reporter/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
+  # Scope dashboard PromQL to the serving pods captured with the benchmark,
+  # rather than the legacy deployment-name convention.  This is especially
+  # important for live llm-d names such as *-prefill-* and *-decode-*.
+  kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
+    first="$(find "$1" -mindepth 1 -maxdepth 1 -type d -name "c*" | sort | head -n 1)"
+    [ -n "$first" ] && [ -f "$first/serving-pods.yaml" ] || exit 1
+    awk "\$1 == \"name:\" { print \$2 }" "$first/serving-pods.yaml" | sort -u | paste -sd "|" - > "$1/pods.txt"
+    [ -s "$1/pods.txt" ]
+  ' sh "$RUN_DIR"
   echo "Capturing Grafana dashboard data for each inferred AIPerf time range..."
   kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
     for directory in "$1"/c*; do
