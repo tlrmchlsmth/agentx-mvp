@@ -28,7 +28,9 @@ The second command downloads `~/Downloads/aiperf-history.html`; it rebuilds the
 self-contained report from persisted artifacts for the newest completed Job.
 Passing `true` performs a post-hoc query of the deployed `llmd-grafana` dashboard
 for each saved AIPerf time range, then embeds those offline dashboards in the same
-downloaded HTML. It auto-discovers the monitoring service and does not query it by default.
+downloaded HTML. The range is exactly the measured AIPerf request/response window
+(no pre-run padding, so warm-up is excluded). It auto-discovers the monitoring
+service and does not query it by default.
 
 ## Prerequisites
 

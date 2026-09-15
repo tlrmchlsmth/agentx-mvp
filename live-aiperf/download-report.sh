@@ -157,7 +157,9 @@ if [[ "$MONITORING" == true ]]; then
   kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
     for directory in "$1"/c*; do
       [ -f "$directory/profile_export_aiperf.json" ] || continue
-      python3 /reporter/export_dashboard.py --grafana-url "$2" --auth "$GRAFANA_AUTH" --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz results "$directory" --pad 60
+      # AIPerf exported min/max request timestamps delimit measured traffic.
+      # Do not extend before that start: the preceding period may be warm-up.
+      python3 /reporter/export_dashboard.py --grafana-url "$2" --auth "$GRAFANA_AUTH" --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz results "$directory" --pad 0
     done
   ' sh "$RUN_DIR" "$GRAFANA_URL"
 fi
