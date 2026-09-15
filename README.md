@@ -8,6 +8,23 @@ The service branch exposes the same bounded benchmark tools over MCP
 The repository also ships a bounded, durable MCP benchmark service. Start
 with [the service contract and deployment guide](docs/agentx-service.md).
 
+## Live llm-d sweep
+
+Use this when the question is: “how does the model deployed in this namespace
+perform right now?” It is separate from the typed service and legacy manifesto
+paths: it discovers the live model and topology, records the deployed vLLM
+branch/SHA, captures the serving-pod and AIPerf Job YAML, and submits one
+autonomous Kubernetes Job for the entire concurrency sweep.
+
+```bash
+just live-aiperf 1,4,8,16
+just live-aiperf-report
+```
+
+The first command returns after submitting the Job, so the laptop can close.
+The second command downloads `~/Downloads/aiperf-history.html`; it rebuilds the
+self-contained report from persisted artifacts for the newest completed Job.
+
 ## Prerequisites
 
 - `kubectl` configured for your cluster

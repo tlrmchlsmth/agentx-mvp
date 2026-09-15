@@ -12,6 +12,8 @@ set export
 #   just orchestrator-run  # submit through the durable in-cluster controller
 #   just logs / just shell # inspect the typed service
 #   just clean             # delete typed Jobs and service resources
+#   just live-aiperf 1,4,8,16 # benchmark the deployed llm-d model
+#   just live-aiperf-report   # download the newest portable report
 
 NAMESPACE := env_var_or_default('NAMESPACE', 'vllm')
 repo_root := justfile_directory()
@@ -57,6 +59,16 @@ agentx_request := env_var_or_default('AGENTX_REQUEST', 'examples/kimi-k3-a100-fu
 
 default:
     @just --list
+
+# Benchmark the currently deployed llm-d model. This is intentionally a thin
+# deployment-coupled path: it discovers the model/topology, captures the
+# serving spec, and submits one autonomous sweep Job.
+live-aiperf concurrencies:
+    ./live-aiperf/submit.sh "{{concurrencies}}"
+
+# Regenerate and download the newest completed live-aiperf report.
+live-aiperf-report:
+    ./live-aiperf/download-report.sh
 
 _spec-slug:
     #!/usr/bin/env bash

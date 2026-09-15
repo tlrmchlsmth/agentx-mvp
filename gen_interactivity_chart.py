@@ -338,8 +338,12 @@ def highlight_yaml(text):
     return '\n'.join(out)
 
 
-def generate_html(configs, output_path, results_dir, metric_units):
-    model_label = read_model_label(results_dir)
+def generate_html(configs, output_path, results_dir, metric_units, model_label=None, chart_defaults=None):
+    model_label = model_label or read_model_label(results_dir)
+    chart_defaults = chart_defaults or {
+        'throughput': {'xMetric': 'output_token_throughput_per_user', 'yMetric': 'output_token_throughput', 'yNorm': 'decode'},
+        'latency': {'xMetric': 'inter_token_latency', 'xStat': 'p99', 'yMetric': 'output_token_throughput', 'yNorm': 'decode'},
+    }
     color_map = {}
     for i, cfg in enumerate(sorted(configs.keys())):
         color_map[cfg] = COLORS[i % len(COLORS)]
@@ -367,6 +371,7 @@ def generate_html(configs, output_path, results_dir, metric_units):
     metrics_js = {k: {'unit': v} for k, v in sorted(metric_units.items())}
     x_axis_metrics = [
         'output_token_throughput_per_user',
+        'e2e_output_token_throughput',
         'inter_token_latency',
         'time_to_first_token',
         'time_to_second_token',
@@ -1014,8 +1019,8 @@ chartCol2.className = 'chart-col';
 chartRow.appendChild(chartCol1);
 chartRow.appendChild(chartCol2);
 
-createChart(chartCol1, {{ xMetric: 'output_token_throughput_per_user', yMetric: 'output_token_throughput', yNorm: 'decode' }});
-createChart(chartCol2, {{ xMetric: 'inter_token_latency', xStat: 'p99', yMetric: 'output_token_throughput', yNorm: 'decode' }});
+createChart(chartCol1, {json.dumps(chart_defaults['throughput'])});
+createChart(chartCol2, {json.dumps(chart_defaults['latency'])});
 
 // ── Cost input ──
 const costWrap = document.createElement('label');
