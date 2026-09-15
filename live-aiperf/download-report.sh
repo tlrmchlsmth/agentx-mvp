@@ -67,11 +67,13 @@ RETRIEVER_POD="aiperf-report-download-$$"
 REPORTER_CONFIGMAP="aiperf-report-download-$$"
 MONITORING_SECRET=""
 JOB_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX.yaml")"
+JOB_LOG_SNAPSHOT=""
 cleanup() {
   kubectl delete pod -n "$NAMESPACE" "$RETRIEVER_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl delete configmap -n "$NAMESPACE" "$REPORTER_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
   [[ -z "$MONITORING_SECRET" ]] || kubectl delete secret -n "$NAMESPACE" "$MONITORING_SECRET" --ignore-not-found >/dev/null 2>&1 || true
   rm -f "$JOB_SNAPSHOT"
+  [[ -z "$JOB_LOG_SNAPSHOT" ]] || rm -f "$JOB_LOG_SNAPSHOT"
 }
 trap cleanup EXIT
 
@@ -100,13 +102,18 @@ if [[ "$MONITORING" == true ]]; then
   [[ -n "$GRAFANA_USER" && -n "$GRAFANA_PASSWORD" ]] || { echo "Grafana credentials are missing from ${GRAFANA_NAMESPACE}/${GRAFANA_SECRET_NAME}" >&2; exit 1; }
   MONITORING_SECRET="aiperf-grafana-auth-$$"
   kubectl create secret generic "$MONITORING_SECRET" -n "$NAMESPACE" --from-literal=auth="${GRAFANA_USER}:${GRAFANA_PASSWORD}" >/dev/null
+  JOB_LOG_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job-log.XXXXXX")"
+  kubectl logs -n "$NAMESPACE" "job/${JOB_NAME}" > "$JOB_LOG_SNAPSHOT"
 fi
-kubectl create configmap "$REPORTER_CONFIGMAP" -n "$NAMESPACE" \
-  --from-file=aiperf_report.py="${SCRIPT_DIR}/report.py" \
-  --from-file=gen_interactivity_chart.py="${SCRIPT_DIR}/../gen_interactivity_chart.py" \
-  --from-file=export_dashboard.py="${SCRIPT_DIR}/../export_dashboard.py" \
-  --from-file=aiperf-job.yaml="$JOB_SNAPSHOT" \
+REPORTER_FILES=(
+  --from-file=aiperf_report.py="${SCRIPT_DIR}/report.py"
+  --from-file=gen_interactivity_chart.py="${SCRIPT_DIR}/../gen_interactivity_chart.py"
+  --from-file=export_dashboard.py="${SCRIPT_DIR}/../export_dashboard.py"
+  --from-file=aiperf-job.yaml="$JOB_SNAPSHOT"
   --from-file=plotly-basic-2.35.2.min.js.gz="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
+)
+[[ -z "$JOB_LOG_SNAPSHOT" ]] || REPORTER_FILES+=(--from-file=aiperf-job.log="$JOB_LOG_SNAPSHOT")
+kubectl create configmap "$REPORTER_CONFIGMAP" -n "$NAMESPACE" "${REPORTER_FILES[@]}"
 kubectl create -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -153,13 +160,15 @@ if [[ -z "$RUN_DIR" ]]; then
   exit 1
 fi
 if [[ "$MONITORING" == true ]]; then
+  kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- \
+    cp /reporter/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
   echo "Capturing Grafana dashboard data for each inferred AIPerf time range..."
   kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
     for directory in "$1"/c*; do
       [ -f "$directory/profile_export_aiperf.json" ] || continue
       # AIPerf exported min/max request timestamps delimit measured traffic.
       # Do not extend before that start: the preceding period may be warm-up.
-      python3 /reporter/export_dashboard.py --grafana-url "$2" --auth "$GRAFANA_AUTH" --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz results "$directory" --pad 0
+      python3 /reporter/export_dashboard.py --grafana-url "$2" --auth "$GRAFANA_AUTH" --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz --aiperf-log "$1/aiperf-job.log" results "$directory" --pad 0
     done
   ' sh "$RUN_DIR" "$GRAFANA_URL"
 fi

@@ -273,6 +273,10 @@ spec:
                 cp /benchmark-input/serving-pods.yaml "\$output/serving-pods.yaml"
                 cp /benchmark-input/aiperf-job.yaml "\$output/aiperf-job.yaml"
                 if [[ -f "\$output/profile_export_aiperf.json" ]]; then
+                  # Make monitoring bounds durable in the Job log.  These are
+                  # AIPerf's measured request/response timestamps, not the
+                  # outer command lifetime (which can include warm-up).
+                  /opt/venv/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("AIPERF_MEASURED_WINDOW concurrency={} start_ns={} end_ns={}".format(sys.argv[2], int(d["min_request_timestamp"]["avg"]), int(d["max_response_timestamp"]["avg"])))' "\$output/profile_export_aiperf.json" "\$concurrency"
                   /opt/venv/bin/python3 /benchmark-input/aiperf_report.py run "\$output"
                 fi
                 (( status == 0 )) || overall_status=\$status

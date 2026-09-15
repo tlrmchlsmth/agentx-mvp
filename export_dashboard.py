@@ -29,6 +29,10 @@ SCOPED_METRIC_PREFIXES = (
 )
 
 POD_MATCHER_RE = re.compile(r'pod\s*(=~|=)\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
+AI_PERF_WINDOW_RE = re.compile(
+    r"AIPERF_MEASURED_WINDOW\s+concurrency=(?P<concurrency>\d+)\s+"
+    r"start_ns=(?P<start>\d+)\s+end_ns=(?P<end>\d+)"
+)
 METRIC_SELECTOR_RE = re.compile(
     r'(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
     r'(?P<selector>\{[^{}]*\})'
@@ -536,6 +540,30 @@ if (rows.length === 0) {{
 </html>"""
 
 
+def logged_aiperf_window(log_path, directory):
+    """Return the measured window emitted by AIPerf itself for this c<N> run."""
+    match = re.fullmatch(r"c(\d+)", os.path.basename(directory))
+    if not match:
+        raise RuntimeError(f"Cannot identify concurrency from {directory}")
+    wanted = match.group(1)
+    try:
+        lines = open(log_path, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read AIPerf Job log {log_path}: {exc}") from exc
+    with lines:
+        for line in lines:
+            marker = AI_PERF_WINDOW_RE.search(line)
+            if marker and marker["concurrency"] == wanted:
+                start = int(marker["start"]) / 1e9
+                end = int(marker["end"]) / 1e9
+                if end > start:
+                    return start, end
+    raise RuntimeError(
+        f"No AIPERF_MEASURED_WINDOW marker for c{wanted} in {log_path}; "
+        "refusing to guess a monitoring range"
+    )
+
+
 def export_results(args):
     tasks = []
     for d in args.dirs:
@@ -549,10 +577,13 @@ def export_results(args):
         with open(json_path) as f:
             data = json.load(f)
 
-        start_ns = data["min_request_timestamp"]["avg"]
-        end_ns = data["max_response_timestamp"]["avg"]
-        start = start_ns / 1e9 - args.pad
-        end = end_ns / 1e9 + args.pad
+        if args.aiperf_log:
+            start, end = logged_aiperf_window(args.aiperf_log, d)
+        else:
+            start_ns = data["min_request_timestamp"]["avg"]
+            end_ns = data["max_response_timestamp"]["avg"]
+            start = start_ns / 1e9 - args.pad
+            end = end_ns / 1e9 + args.pad
 
         out_path = os.path.join(d, "dashboard.html")
         name = os.path.basename(d)
@@ -598,6 +629,7 @@ def main():
     parser.add_argument("--auth", default="admin:admin", help="user:password")
     parser.add_argument("--dashboard", default="wideep-overview", help="Dashboard UID")
     parser.add_argument("--plotly-bundle", help="gzip-compressed Plotly JS to embed for offline output")
+    parser.add_argument("--aiperf-log", help="AIPerf Job log containing measured-window markers")
 
     sub = parser.add_subparsers(dest="command")
 
