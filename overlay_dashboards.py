@@ -72,9 +72,10 @@ def generate_html(merged, rows, labels, plotly_bundle=None):
   .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
   .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 8px; }}
-  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; overflow: hidden; }}
-  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; }}
-  .panel .plot {{ width: 100%; height: 250px; }}
+  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; overflow: auto; resize: both; min-width: 400px; min-height: 300px; height: 300px; }}
+  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; cursor: grab; user-select: none; }}
+  .panel.dragging {{ opacity: .45; }}
+  .panel .plot {{ width: 100%; height: calc(100% - 36px); min-height: 260px; }}
   .empty {{ color: #555; font-size: 12px; padding: 60px 12px; text-align: center; }}
   .hidden {{ display: none; }}
 </style>
@@ -112,6 +113,19 @@ function rgbStr(rgb, alpha) {{
 
 const root = document.getElementById('root');
 let currentGrid = null;
+let draggedPanel = null;
+function makePanelInteractive(panel, plot) {{
+  const title = panel.querySelector('.panel-title');
+  title.draggable = true;
+  title.addEventListener('dragstart', () => {{ draggedPanel = panel; panel.classList.add('dragging'); }});
+  title.addEventListener('dragend', () => {{ draggedPanel = null; panel.classList.remove('dragging'); }});
+  panel.addEventListener('dragover', event => {{
+    event.preventDefault();
+    if (!draggedPanel || draggedPanel === panel || draggedPanel.parentElement !== panel.parentElement) return;
+    panel.parentElement.insertBefore(draggedPanel, event.clientY < panel.getBoundingClientRect().top + panel.offsetHeight / 2 ? panel : panel.nextSibling);
+  }});
+  new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
+}}
 
 if (rows.length === 0) {{
   currentGrid = document.createElement('div');
@@ -167,6 +181,7 @@ function renderPanel(container, pid, m) {{
   plotDiv.className = 'plot';
   div.appendChild(plotDiv);
   container.appendChild(div);
+  makePanelInteractive(div, plotDiv);
 
   const traces = [];
   const allY = [];

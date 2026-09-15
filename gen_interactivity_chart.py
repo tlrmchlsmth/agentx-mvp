@@ -532,6 +532,8 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
   @media (max-width: 1200px) {{ .chart-row {{ grid-template-columns: 1fr; }} }}
   .chart-col {{ display: flex; flex-direction: column; gap: 4px; }}
   .chart-col .panel {{ min-width: 0; }}
+  .chart-move-handle {{ color: #8e8e8e; cursor: grab; font-size: 11px; padding: 3px 4px; user-select: none; }}
+  .chart-col.dragging {{ opacity: .45; }}
   .axis-controls {{ display: flex; gap: 10px; align-items: center; padding: 6px 4px; flex-wrap: wrap; }}
   .axis-controls label {{ color: #8e8e8e; font-size: 12px; display: flex; align-items: center; gap: 4px; }}
   .axis-controls select {{ background: #181b1f; color: #d8d9da; border: 1px solid #2a2a2e; border-radius: 4px;
@@ -828,7 +830,24 @@ function hoverText(cfg, c, d) {{
 
 const allCharts = [];
 
+let draggedChartColumn = null;
+function makeChartColumnMovable(container) {{
+  const handle = document.createElement('div');
+  handle.className = 'chart-move-handle';
+  handle.textContent = 'Drag chart to rearrange';
+  handle.draggable = true;
+  handle.addEventListener('dragstart', () => {{ draggedChartColumn = container; container.classList.add('dragging'); }});
+  handle.addEventListener('dragend', () => {{ draggedChartColumn = null; container.classList.remove('dragging'); }});
+  container.addEventListener('dragover', event => {{
+    event.preventDefault();
+    if (!draggedChartColumn || draggedChartColumn === container) return;
+    container.parentElement.insertBefore(draggedChartColumn, event.clientX < container.getBoundingClientRect().left + container.offsetWidth / 2 ? container : container.nextSibling);
+  }});
+  container.appendChild(handle);
+}}
+
 function createChart(container, defaults) {{
+  makeChartColumnMovable(container);
   const state = {{
     xMetric: defaults.xMetric || 'output_token_throughput_per_user',
     xStat: defaults.xStat || 'avg',
