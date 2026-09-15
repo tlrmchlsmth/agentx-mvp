@@ -169,6 +169,16 @@ function renderPanel(container, pid, m) {{
   container.appendChild(div);
 
   const traces = [];
+  const allY = [];
+  for (const e of m.entries) for (const q of e.panel.queries) for (const s of q.series)
+    for (const v of s.values) {{ const value = parseFloat(v[1]); if (Number.isFinite(value)) allY.push(Math.abs(value)); }}
+  const largestY = Math.max(...allY, 0);
+  // Fixed-point formatting is intentional: monitoring values must never flip
+  // to exponent notation.  Keep only precision that remains meaningful.
+  const decimals = largestY >= 100 ? 0 : largestY >= 1 ? 2 : largestY >= 0.01 ? 4 : 6;
+  const yFormat = `,.${{decimals}}f`;
+  const leftMargin = Math.max(70, (largestY.toFixed(decimals).length + 2) * 8);
+  const hoverFormat = '%{{y:' + yFormat + '}}<extra>%{{fullData.name}}</extra>';
   for (const e of m.entries) {{
     const rgb = LABEL_COLORS[e.label] || [200,200,200];
     const totalSeries = e.panel.queries.reduce((n, q) => n + q.series.length, 0);
@@ -185,7 +195,7 @@ function renderPanel(container, pid, m) {{
           type: 'scatter',
           mode: 'lines',
           line: {{ width: 1.5, color: rgbStr(rgb, alpha) }},
-          hovertemplate: '%{{y:.4g}}<extra>%{{fullData.name}}</extra>',
+          hovertemplate: hoverFormat,
         }});
         si++;
       }}
@@ -193,12 +203,12 @@ function renderPanel(container, pid, m) {{
   }}
 
   Plotly.newPlot(plotDiv, traces, {{
-    margin: {{ l: 50, r: 16, t: 4, b: 30 }},
+    margin: {{ l: leftMargin, r: 16, t: 4, b: 30 }},
     paper_bgcolor: 'transparent',
     plot_bgcolor: 'transparent',
     font: {{ color: '#8e8e8e', size: 10 }},
     xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', title: 'seconds', tickformat: 'd' }},
-    yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: ',.4f', hoverformat: ',.4f' }},
+    yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: yFormat, hoverformat: yFormat }},
     legend: {{ font: {{ size: 9 }}, orientation: 'h', y: -0.35 }},
     showlegend: true,
     hovermode: 'x unified',
