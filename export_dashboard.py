@@ -149,6 +149,11 @@ def substitute_vars(expr, deployment):
     expr = expr.replace("$namespace", ".*")
     expr = expr.replace("${namespace}", ".*")
     expr = expr.replace("$__rate_interval", "15s")
+    # Grafana turns an "All" variable into a regex matcher.  The live adapter
+    # has no legacy deployment name, so its equivalent is `.*`; leaving that
+    # behind an exact `=` matcher asks Prometheus for a literal asterisk and
+    # silently produces empty panels.
+    expr = re.sub(r'(?<![!~])=\s*"\.\*"', '=~".*"', expr)
     return expr
 
 
