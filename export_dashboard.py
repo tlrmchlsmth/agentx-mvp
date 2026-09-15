@@ -2,6 +2,7 @@
 import argparse
 import base64
 import concurrent.futures
+import gzip
 import json
 import os
 import re
@@ -343,7 +344,7 @@ def export(args):
     else:
         out_path = f"dashboard_{ts_start}_{ts_end}.html"
 
-    html = generate_html(panel_data, row_order, start, end, args.dashboard)
+    html = generate_html(panel_data, row_order, start, end, args.dashboard, args.plotly_bundle)
 
     with open(out_path, "w") as f:
         f.write(html)
@@ -351,19 +352,24 @@ def export(args):
     print(f"\nExported to {out_path}")
 
 
-def generate_html(panel_data, row_order, start, end, dashboard_name):
+def generate_html(panel_data, row_order, start, end, dashboard_name, plotly_bundle=None):
     start_str = datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     end_str = datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     panels_json = json.dumps(panel_data)
     rows_json = json.dumps(row_order)
 
+    plotly_tag = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
+    if plotly_bundle:
+        with gzip.open(plotly_bundle, "rt", encoding="utf-8") as f:
+            plotly_tag = "<script>" + f.read() + "</script>"
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>{dashboard_name} — {start_str} to {end_str}</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+{plotly_tag}
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: #111217; color: #d8d9da; font-family: Inter, -apple-system, sans-serif; padding: 16px; }}
@@ -591,6 +597,7 @@ def main():
     parser.add_argument("--grafana-url", default="http://localhost:3001")
     parser.add_argument("--auth", default="admin:admin", help="user:password")
     parser.add_argument("--dashboard", default="wideep-overview", help="Dashboard UID")
+    parser.add_argument("--plotly-bundle", help="gzip-compressed Plotly JS to embed for offline output")
 
     sub = parser.add_subparsers(dest="command")
 

@@ -19,11 +19,16 @@ autonomous Kubernetes Job for the entire concurrency sweep.
 ```bash
 just live-aiperf 1,4,8,16
 just live-aiperf-report
+# Optional: infer every benchmark window and bundle Grafana/Prometheus data.
+just live-aiperf-report true
 ```
 
 The first command returns after submitting the Job, so the laptop can close.
 The second command downloads `~/Downloads/aiperf-history.html`; it rebuilds the
 self-contained report from persisted artifacts for the newest completed Job.
+Passing `true` performs a post-hoc query of the deployed `llmd-grafana` dashboard
+for each saved AIPerf time range, then embeds those offline dashboards in the same
+downloaded HTML. It auto-discovers the monitoring service and does not query it by default.
 
 ## Prerequisites
 

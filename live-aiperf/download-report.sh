@@ -22,6 +22,9 @@ fi
 DESTINATION="${DESTINATION:-${HOME}/Downloads/aiperf-history.html}"
 RESULTS_PVC="${RESULTS_PVC:-kimi-k3-build-cache}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MONITORING="${LIVE_AIPERF_MONITORING:-false}"
+case "$MONITORING" in true|false) ;; *) echo "LIVE_AIPERF_MONITORING must be true or false" >&2; exit 2 ;; esac
+decode_base64() { base64 --decode 2>/dev/null || base64 -D; }
 
 JOB_NAME="$(kubectl get jobs -n "$NAMESPACE" \
   -l benchmark.llm-d.ai/workload=inferencex-agentx-mvp \
@@ -62,10 +65,12 @@ done
 mkdir -p "$(dirname "$DESTINATION")"
 RETRIEVER_POD="aiperf-report-download-$$"
 REPORTER_CONFIGMAP="aiperf-report-download-$$"
+MONITORING_SECRET=""
 JOB_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX.yaml")"
 cleanup() {
   kubectl delete pod -n "$NAMESPACE" "$RETRIEVER_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl delete configmap -n "$NAMESPACE" "$REPORTER_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
+  [[ -z "$MONITORING_SECRET" ]] || kubectl delete secret -n "$NAMESPACE" "$MONITORING_SECRET" --ignore-not-found >/dev/null 2>&1 || true
   rm -f "$JOB_SNAPSHOT"
 }
 trap cleanup EXIT
@@ -74,9 +79,32 @@ trap cleanup EXIT
 # short-lived helper pod, regenerate HTML from persisted AIPerf JSON/YAML,
 # then stream it out. This is independent of the submission-time UI.
 kubectl get job -n "$NAMESPACE" "$JOB_NAME" -o yaml > "$JOB_SNAPSHOT"
+if [[ "$MONITORING" == true ]]; then
+  # Do this before creating the helper: container environment is resolved at
+  # startup, and the short-lived Secret must exist then.
+  GRAFANA_URL="${LIVE_AIPERF_GRAFANA_URL:-}"
+  GRAFANA_SERVICE="${LIVE_AIPERF_GRAFANA_SERVICE:-llmd-grafana}"
+  GRAFANA_NAMESPACE="${LIVE_AIPERF_GRAFANA_NAMESPACE:-}"
+  if [[ -z "$GRAFANA_URL" ]]; then
+    matches="$(kubectl get svc --all-namespaces -o go-template='{{range .items}}{{if eq .metadata.name "llmd-grafana"}}{{.metadata.namespace}}{{"\t"}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}')"
+    if [[ -z "$GRAFANA_NAMESPACE" ]]; then
+      [[ "$(printf '%s\n' "$matches" | awk 'NF' | wc -l | tr -d ' ')" == 1 ]] || { echo "Could not uniquely discover Grafana; set LIVE_AIPERF_GRAFANA_URL" >&2; exit 1; }
+      GRAFANA_NAMESPACE="${matches%%$'\t'*}"
+      GRAFANA_SERVICE="${matches#*$'\t'}"
+    fi
+    GRAFANA_URL="http://${GRAFANA_SERVICE}.${GRAFANA_NAMESPACE}.svc.cluster.local"
+  fi
+  GRAFANA_SECRET_NAME="${LIVE_AIPERF_GRAFANA_SECRET:-$GRAFANA_SERVICE}"
+  GRAFANA_USER="$(kubectl get secret -n "$GRAFANA_NAMESPACE" "$GRAFANA_SECRET_NAME" -o jsonpath='{.data.admin-user}' | decode_base64)"
+  GRAFANA_PASSWORD="$(kubectl get secret -n "$GRAFANA_NAMESPACE" "$GRAFANA_SECRET_NAME" -o jsonpath='{.data.admin-password}' | decode_base64)"
+  [[ -n "$GRAFANA_USER" && -n "$GRAFANA_PASSWORD" ]] || { echo "Grafana credentials are missing from ${GRAFANA_NAMESPACE}/${GRAFANA_SECRET_NAME}" >&2; exit 1; }
+  MONITORING_SECRET="aiperf-grafana-auth-$$"
+  kubectl create secret generic "$MONITORING_SECRET" -n "$NAMESPACE" --from-literal=auth="${GRAFANA_USER}:${GRAFANA_PASSWORD}" >/dev/null
+fi
 kubectl create configmap "$REPORTER_CONFIGMAP" -n "$NAMESPACE" \
   --from-file=aiperf_report.py="${SCRIPT_DIR}/report.py" \
   --from-file=gen_interactivity_chart.py="${SCRIPT_DIR}/../gen_interactivity_chart.py" \
+  --from-file=export_dashboard.py="${SCRIPT_DIR}/../export_dashboard.py" \
   --from-file=aiperf-job.yaml="$JOB_SNAPSHOT" \
   --from-file=plotly-basic-2.35.2.min.js.gz="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
 kubectl create -f - <<EOF
@@ -91,6 +119,13 @@ spec:
     - name: retrieve
       image: python:3.12-alpine
       command: ["sh", "-c", "sleep 600"]
+      env:
+        - name: GRAFANA_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: ${MONITORING_SECRET:-aiperf-no-monitoring}
+              key: auth
+              optional: true
       volumeMounts:
         - name: workload
           mountPath: /workload
@@ -116,6 +151,15 @@ fi
 if [[ -z "$RUN_DIR" ]]; then
   echo "Could not find persisted artifacts for ${JOB_NAME}" >&2
   exit 1
+fi
+if [[ "$MONITORING" == true ]]; then
+  echo "Capturing Grafana dashboard data for each inferred AIPerf time range..."
+  kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
+    for directory in "$1"/c*; do
+      [ -f "$directory/profile_export_aiperf.json" ] || continue
+      python3 /reporter/export_dashboard.py --grafana-url "$2" --auth "$GRAFANA_AUTH" --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz results "$directory" --pad 60
+    done
+  ' sh "$RUN_DIR" "$GRAFANA_URL"
 fi
 kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- \
   cp /reporter/aiperf-job.yaml "${RUN_DIR}/aiperf-job.yaml"

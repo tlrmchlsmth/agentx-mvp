@@ -467,6 +467,10 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
     for cfg in configs:
         for c_val in configs[cfg]['runs']:
             key = f'c{c_val}'
+            saved_dashboard = configs[cfg].get('dashboards', {}).get(key)
+            if saved_dashboard:
+                embedded_dashboards[f'{cfg}_{key}'] = saved_dashboard
+                continue
             dash_path = os.path.join(results_dir, f'results_{cfg}', f'results_{cfg}_{key}', 'dashboard.html')
             if os.path.isfile(dash_path):
                 with open(dash_path, 'rb') as df:

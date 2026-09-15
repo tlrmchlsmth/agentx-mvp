@@ -67,8 +67,8 @@ live-aiperf concurrencies:
     ./live-aiperf/submit.sh "{{concurrencies}}"
 
 # Regenerate and download the newest completed live-aiperf report.
-live-aiperf-report:
-    ./live-aiperf/download-report.sh
+live-aiperf-report monitoring="false":
+    LIVE_AIPERF_MONITORING="{{monitoring}}" ./live-aiperf/download-report.sh
 
 _spec-slug:
     #!/usr/bin/env bash

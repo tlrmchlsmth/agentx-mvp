@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import html
+import base64
 import gzip
 import importlib.util
 import json
@@ -117,6 +118,8 @@ def run_data(directory: Path) -> dict[str, Any] | None:
         "aiperf_job_yaml": aiperf_job_path.read_text(encoding="utf-8")
         if aiperf_job_path.is_file()
         else "AIPerf Job manifest was not captured.",
+        "dashboard": (directory / "dashboard.html").read_bytes()
+        if (directory / "dashboard.html").is_file() else None,
     }
 
 
@@ -676,6 +679,8 @@ def write_index(root: Path) -> None:
             if isinstance(value, dict) and any(isinstance(item, (int, float)) for item in value.values())
         }
         config["runs"][concurrency] = profile
+        if data["dashboard"] is not None:
+            config.setdefault("dashboards", {})[f"c{concurrency}"] = base64.b64encode(data["dashboard"]).decode("ascii")
         for key, value in profile.items():
             metric_units.setdefault(key, str(value.get("unit", "")))
 
