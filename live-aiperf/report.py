@@ -652,6 +652,8 @@ def write_index(root: Path) -> None:
     if not runs:
         raise SystemExit(f"No completed live AIPerf runs in {root}")
 
+    overlay_html = monitoring_overlay(root, runs)
+
     configs: dict[str, dict[str, Any]] = {}
     metric_units: dict[str, str] = {}
     for data in runs:
@@ -707,8 +709,53 @@ def write_index(root: Path) -> None:
         for data in sorted({sweep_key(data): data for data in runs}.values(), key=sweep_key)
     )
     source = '<div class="subtitle">' + source_rows + '</div>'
-    page = page.replace('<div id="root"></div>', source + '<div id="root"></div>', 1)
+    overlay_control = ""
+    if overlay_html:
+        encoded_overlay = base64.b64encode(overlay_html).decode("ascii")
+        overlay_control = (
+            '<p><button id="monitoring-overlay">Overlay monitoring across concurrencies</button></p>'
+            '<script>document.getElementById("monitoring-overlay").addEventListener("click",()=>{'
+            f'const b=atob("{encoded_overlay}");const a=new Uint8Array(b.length);'
+            'for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);'
+            'window.open(URL.createObjectURL(new Blob([a],{type:"text/html"})),"_blank");});</script>'
+        )
+    page = page.replace('<div id="root"></div>', source + overlay_control + '<div id="root"></div>', 1)
     output.write_text(page, encoding="utf-8")
+
+
+def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
+    """Build one relative-time dashboard comparison from all saved concurrencies."""
+    paths: list[tuple[int, Path]] = []
+    for data in runs:
+        try:
+            concurrency = int(data["metadata"]["concurrency"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        path = data["directory"] / "dashboard.html"
+        if path.is_file():
+            paths.append((concurrency, path))
+    if len(paths) < 2:
+        return None
+    overlay_path = Path(__file__).with_name("overlay_dashboards.py")
+    spec = importlib.util.spec_from_file_location("agentx_dashboard_overlay", overlay_path)
+    if spec is None or spec.loader is None:
+        return None
+    overlay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(overlay)
+    file_data = []
+    labels = []
+    for concurrency, path in sorted(paths):
+        label = f"c{concurrency}"
+        panels, rows = overlay.extract_data(path)
+        file_data.append((panels, rows, label))
+        labels.append(label)
+    merged = overlay.merge(file_data)
+    page = overlay.generate_html(
+        merged, file_data[0][1], labels,
+        str(Path(__file__).with_name("plotly-basic-2.35.2.min.js.gz")),
+    )
+    (root / "monitoring-overlay.html").write_text(page, encoding="utf-8")
+    return page.encode("utf-8")
 
 
 def main() -> None:

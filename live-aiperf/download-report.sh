@@ -119,6 +119,7 @@ fi
 REPORTER_FILES=(
   --from-file=aiperf_report.py="${SCRIPT_DIR}/report.py"
   --from-file=gen_interactivity_chart.py="${SCRIPT_DIR}/../gen_interactivity_chart.py"
+  --from-file=overlay_dashboards.py="${SCRIPT_DIR}/../overlay_dashboards.py"
   --from-file=export_dashboard.py="${SCRIPT_DIR}/../export_dashboard.py"
   --from-file=aiperf-job.yaml="$JOB_SNAPSHOT"
   --from-file=plotly-basic-2.35.2.min.js.gz="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"

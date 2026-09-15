@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import gzip
 import json
 import os
 import re
@@ -45,17 +46,21 @@ def merge(file_data):
     return merged
 
 
-def generate_html(merged, rows, labels):
+def generate_html(merged, rows, labels, plotly_bundle=None):
     merged_json = json.dumps(merged)
     rows_json = json.dumps(rows)
     labels_json = json.dumps(labels)
 
+    plotly_tag = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
+    if plotly_bundle:
+        with gzip.open(plotly_bundle, "rt", encoding="utf-8") as f:
+            plotly_tag = "<script>" + f.read() + "</script>"
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>Overlay — {', '.join(labels)}</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+{plotly_tag}
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: #111217; color: #d8d9da; font-family: Inter, -apple-system, sans-serif; padding: 16px; }}
@@ -193,7 +198,7 @@ function renderPanel(container, pid, m) {{
     plot_bgcolor: 'transparent',
     font: {{ color: '#8e8e8e', size: 10 }},
     xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', title: 'seconds', tickformat: 'd' }},
-    yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: '.3s', hoverformat: '.4g' }},
+    yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: ',.4f', hoverformat: ',.4f' }},
     legend: {{ font: {{ size: 9 }}, orientation: 'h', y: -0.35 }},
     showlegend: true,
     hovermode: 'x unified',
@@ -209,6 +214,7 @@ def main():
     parser.add_argument("files", nargs="+", help="HTML dashboard files to overlay")
     parser.add_argument("--label", action="append", help="Labels for each file (default: auto-detect from directory name)")
     parser.add_argument("--output", "-o", default="overlay.html", help="Output HTML file (default: overlay.html)")
+    parser.add_argument("--plotly-bundle", help="gzip-compressed Plotly JS to embed for offline output")
     args = parser.parse_args()
 
     if args.label and len(args.label) != len(args.files):
@@ -226,7 +232,7 @@ def main():
     merged = merge(file_data)
     rows = file_data[0][1]
 
-    html = generate_html(merged, rows, labels)
+    html = generate_html(merged, rows, labels, args.plotly_bundle)
     with open(args.output, "w") as f:
         f.write(html)
 

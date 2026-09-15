@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPORTER_SCRIPT="${SCRIPT_DIR}/report.py"
 GENERATOR_SCRIPT="${SCRIPT_DIR}/../gen_interactivity_chart.py"
+OVERLAY_SCRIPT="${SCRIPT_DIR}/../overlay_dashboards.py"
 PLOTLY_BUNDLE="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
 
 CONCURRENCY="${1:-}"
@@ -323,6 +324,7 @@ kubectl create configmap "$ARTIFACT_CONFIGMAP" -n "$NAMESPACE" \
   --from-file=aiperf-job.yaml="$JOB_MANIFEST" \
   --from-file=aiperf_report.py="$REPORTER_SCRIPT" \
   --from-file=gen_interactivity_chart.py="$GENERATOR_SCRIPT" \
+  --from-file=overlay_dashboards.py="$OVERLAY_SCRIPT" \
   --from-file=plotly-basic-2.35.2.min.js.gz="$PLOTLY_BUNDLE" \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl create -f "$JOB_MANIFEST"
