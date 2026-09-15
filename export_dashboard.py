@@ -615,6 +615,7 @@ def export_results(args):
             deployment=deployment, pod_regex=pod_regex, step=args.step,
             grafana_url=args.grafana_url, auth=args.auth,
             output=out_path, dashboard=args.dashboard,
+            plotly_bundle=args.plotly_bundle, aiperf_log=args.aiperf_log,
         )))
 
     if not tasks:
