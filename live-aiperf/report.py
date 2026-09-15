@@ -100,6 +100,13 @@ def run_data(directory: Path) -> dict[str, Any] | None:
         return None
     profile = read_json(profile_path)
     metadata = read_json(directory / "benchmark-metadata.json")
+    # A sweep has one Kubernetes Job shared by all c<N> result directories.
+    # Submission stores a copy in every directory, while report recovery
+    # deliberately stores it once at the sweep root.  Accept either layout so
+    # a report regenerated from a completed Job never loses the manifest.
+    aiperf_job_path = directory / "aiperf-job.yaml"
+    if not aiperf_job_path.is_file():
+        aiperf_job_path = directory.parent / "aiperf-job.yaml"
     return {
         "directory": directory,
         "profile": profile,
@@ -107,8 +114,8 @@ def run_data(directory: Path) -> dict[str, Any] | None:
         "yaml": (directory / "serving-pods.yaml").read_text(encoding="utf-8")
         if (directory / "serving-pods.yaml").is_file()
         else "Pod manifest snapshot was not captured.",
-        "aiperf_job_yaml": (directory / "aiperf-job.yaml").read_text(encoding="utf-8")
-        if (directory / "aiperf-job.yaml").is_file()
+        "aiperf_job_yaml": aiperf_job_path.read_text(encoding="utf-8")
+        if aiperf_job_path.is_file()
         else "AIPerf Job manifest was not captured.",
     }
 
