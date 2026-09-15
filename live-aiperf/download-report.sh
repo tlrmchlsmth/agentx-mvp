@@ -103,7 +103,7 @@ if [[ "$MONITORING" == true ]]; then
   MONITORING_SECRET="aiperf-grafana-auth-$$"
   kubectl create secret generic "$MONITORING_SECRET" -n "$NAMESPACE" --from-literal=auth="${GRAFANA_USER}:${GRAFANA_PASSWORD}" >/dev/null
   JOB_LOG_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job-log.XXXXXX")"
-  kubectl logs -n "$NAMESPACE" "job/${JOB_NAME}" > "$JOB_LOG_SNAPSHOT"
+  kubectl logs -n "$NAMESPACE" "job/${JOB_NAME}" --timestamps > "$JOB_LOG_SNAPSHOT"
 fi
 REPORTER_FILES=(
   --from-file=aiperf_report.py="${SCRIPT_DIR}/report.py"
@@ -166,8 +166,8 @@ if [[ "$MONITORING" == true ]]; then
   kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
     for directory in "$1"/c*; do
       [ -f "$directory/profile_export_aiperf.json" ] || continue
-      # AIPerf exported min/max request timestamps delimit measured traffic.
-      # Do not extend before that start: the preceding period may be warm-up.
+      # The timestamped Job log supplies the exact profiling start/end; do not
+      # use exported metrics or padding, which could include warm-up traffic.
       python3 /reporter/export_dashboard.py --grafana-url "$2" --auth "$GRAFANA_AUTH" --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz --aiperf-log "$1/aiperf-job.log" results "$directory" --pad 0
     done
   ' sh "$RUN_DIR" "$GRAFANA_URL"

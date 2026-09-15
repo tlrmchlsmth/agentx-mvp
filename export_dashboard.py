@@ -29,10 +29,8 @@ SCOPED_METRIC_PREFIXES = (
 )
 
 POD_MATCHER_RE = re.compile(r'pod\s*(=~|=)\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
-AI_PERF_WINDOW_RE = re.compile(
-    r"AIPERF_MEASURED_WINDOW\s+concurrency=(?P<concurrency>\d+)\s+"
-    r"start_ns=(?P<start>\d+)\s+end_ns=(?P<end>\d+)"
-)
+KUBECTL_LOG_TIMESTAMP_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+(?P<message>.*)$")
+PROFILE_LANES_RE = re.compile(r"PROFILING setup:\s*(?P<concurrency>\d+) trajectory lanes")
 METRIC_SELECTOR_RE = re.compile(
     r'(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
     r'(?P<selector>\{[^{}]*\})'
@@ -541,7 +539,7 @@ if (rows.length === 0) {{
 
 
 def logged_aiperf_window(log_path, directory):
-    """Return the measured window emitted by AIPerf itself for this c<N> run."""
+    """Return the exact AIPerf profiling phase boundaries for this c<N> run."""
     match = re.fullmatch(r"c(\d+)", os.path.basename(directory))
     if not match:
         raise RuntimeError(f"Cannot identify concurrency from {directory}")
@@ -550,16 +548,31 @@ def logged_aiperf_window(log_path, directory):
         lines = open(log_path, encoding="utf-8", errors="replace")
     except OSError as exc:
         raise RuntimeError(f"Cannot read AIPerf Job log {log_path}: {exc}") from exc
+    pending_concurrency = None
+    active_concurrency = None
+    windows = {}
     with lines:
         for line in lines:
-            marker = AI_PERF_WINDOW_RE.search(line)
-            if marker and marker["concurrency"] == wanted:
-                start = int(marker["start"]) / 1e9
-                end = int(marker["end"]) / 1e9
-                if end > start:
-                    return start, end
+            stamped = KUBECTL_LOG_TIMESTAMP_RE.match(line)
+            if not stamped:
+                continue
+            timestamp = datetime.fromisoformat(stamped["timestamp"].replace("Z", "+00:00")).timestamp()
+            message = stamped["message"]
+            lanes = PROFILE_LANES_RE.search(message)
+            if lanes:
+                pending_concurrency = lanes["concurrency"]
+            if "Phase profiling started" in message:
+                active_concurrency = pending_concurrency
+                if active_concurrency:
+                    windows[active_concurrency] = [timestamp, None]
+            elif "Phase profiling complete" in message and active_concurrency:
+                windows[active_concurrency][1] = timestamp
+                active_concurrency = None
+    start, end = windows.get(wanted, (None, None))
+    if start is not None and end is not None and end > start:
+        return start, end
     raise RuntimeError(
-        f"No AIPERF_MEASURED_WINDOW marker for c{wanted} in {log_path}; "
+        f"No complete timestamped profiling phase for c{wanted} in {log_path}; "
         "refusing to guess a monitoring range"
     )
 
@@ -629,7 +642,7 @@ def main():
     parser.add_argument("--auth", default="admin:admin", help="user:password")
     parser.add_argument("--dashboard", default="wideep-overview", help="Dashboard UID")
     parser.add_argument("--plotly-bundle", help="gzip-compressed Plotly JS to embed for offline output")
-    parser.add_argument("--aiperf-log", help="AIPerf Job log containing measured-window markers")
+    parser.add_argument("--aiperf-log", help="Timestamped AIPerf Job log used for profiling-phase boundaries")
 
     sub = parser.add_subparsers(dest="command")
 
