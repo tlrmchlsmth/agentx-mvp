@@ -252,8 +252,10 @@ def infer_unit(title, unit):
     return unit
 
 
-def query_prometheus(base_url, auth, ds_id, expr, start, end, step):
-    path = f"/api/datasources/proxy/{ds_id}/api/v1/query_range"
+def query_prometheus(base_url, auth, ds_uid, expr, start, end, step):
+    # Grafana 12 removed the numeric-ID proxy route.  The datasource UID is
+    # stable and works on both the dashboard API and its proxy route.
+    path = f"/api/datasources/proxy/uid/{ds_uid}/api/v1/query_range"
     params = urllib.parse.urlencode({
         "query": expr,
         "start": int(start),
@@ -277,7 +279,7 @@ def export(args):
 
     dash = grafana_request(args.grafana_url, f"/api/dashboards/uid/{args.dashboard}", args.auth)
     ds_info = grafana_request(args.grafana_url, "/api/datasources/uid/PBFA97CFB590B2093", args.auth)
-    ds_id = ds_info["id"]
+    ds_uid = ds_info["uid"]
 
     dash_body = dash["dashboard"]
     if "elements" in dash_body and "panels" not in dash_body:
@@ -316,7 +318,7 @@ def export(args):
             expr = substitute_vars(expr, args.deployment)
             expr = scope_promql_expr(expr, pod_regex)
             legend = target.get("legendFormat", "")
-            result = query_prometheus(args.grafana_url, args.auth, ds_id, expr, start, end, step)
+            result = query_prometheus(args.grafana_url, args.auth, ds_uid, expr, start, end, step)
 
             series = []
             if result.get("status") == "success":
@@ -329,7 +331,9 @@ def export(args):
             queries.append({"expr": expr, "legend": legend, "series": series})
 
         total_points = sum(len(s["values"]) for q in queries for s in q["series"])
-        print(f"  [{pid}] {title} ({len(queries)} queries, {total_points} datapoints)")
+        errors = [q.get("error", "") for q in queries if q.get("error")]
+        suffix = f"; ERROR: {errors[0]}" if errors else ""
+        print(f"  [{pid}] {title} ({len(queries)} queries, {total_points} datapoints){suffix}")
 
         return pid, {
             "id": pid,

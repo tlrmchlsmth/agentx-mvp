@@ -68,7 +68,7 @@ mkdir -p "$(dirname "$DESTINATION")"
 RETRIEVER_POD="aiperf-report-download-$$"
 REPORTER_CONFIGMAP="aiperf-report-download-$$"
 MONITORING_SECRET=""
-JOB_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX.yaml")"
+JOB_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX")"
 JOB_LOG_SNAPSHOT=""
 CURRENT_PODS_SNAPSHOT=""
 cleanup() {
