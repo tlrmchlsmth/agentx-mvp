@@ -25,6 +25,52 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONITORING="${LIVE_AIPERF_MONITORING:-false}"
 case "$MONITORING" in true|false) ;; *) echo "LIVE_AIPERF_MONITORING must be true or false" >&2; exit 2 ;; esac
 decode_base64() { base64 --decode 2>/dev/null || base64 -D; }
+EXEC_ATTEMPTS="${LIVE_AIPERF_EXEC_ATTEMPTS:-6}"
+TRANSFER_CHUNK_BYTES=$((4 * 1024 * 1024))
+backoff() { local seconds=$(( $1 * 2 )); (( seconds > 15 )) && seconds=15; echo "$seconds"; }
+kexec() {
+  local attempt=0
+  while (( attempt < EXEC_ATTEMPTS )); do
+    attempt=$((attempt + 1))
+    if kubectl -n "$NAMESPACE" --request-timeout=90s exec "$RETRIEVER_POD" -- "$@"; then
+      return 0
+    fi
+    (( attempt == EXEC_ATTEMPTS )) && break
+    echo "  helper exec failed (attempt ${attempt}/${EXEC_ATTEMPTS}); retrying in $(backoff "$attempt")s..." >&2
+    sleep "$(backoff "$attempt")"
+  done
+  return 1
+}
+local_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+download_report() {
+  local remote="$1" partial="${DESTINATION}.part" remote_size offset remaining want chunk attempt=0
+  remote_size="$(kexec sh -c 'wc -c < "$1"' sh "$remote" | tr -d '[:space:]')"
+  [[ "$remote_size" =~ ^[1-9][0-9]*$ ]] || { echo "Remote report is empty or unreadable" >&2; return 1; }
+  [[ -f "$partial" ]] || : > "$partial"
+  offset="$(local_size "$partial")"
+  if (( offset > remote_size )); then : > "$partial"; offset=0; fi
+  while (( offset < remote_size )); do
+    remaining=$((remote_size - offset)); want=$TRANSFER_CHUNK_BYTES; (( remaining < want )) && want=$remaining
+    chunk="${partial}.chunk"
+    : > "$chunk"
+    attempt=0
+    while :; do
+      attempt=$((attempt + 1))
+      if kubectl -n "$NAMESPACE" --request-timeout=90s exec "$RETRIEVER_POD" -- sh -c \
+          'tail -c +"$1" "$2" | head -c "$3"' sh "$((offset + 1))" "$remote" "$want" > "$chunk" \
+          && [[ "$(local_size "$chunk")" == "$want" ]]; then
+        cat "$chunk" >> "$partial"
+        break
+      fi
+      (( attempt == EXEC_ATTEMPTS )) && { echo "Report transfer failed at byte ${offset}" >&2; return 1; }
+      echo "  report transfer failed at byte ${offset}; retrying in $(backoff "$attempt")s..." >&2
+      sleep "$(backoff "$attempt")"
+    done
+    offset=$((offset + want))
+  done
+  rm -f "${partial}.chunk"
+  mv "$partial" "$DESTINATION"
+}
 
 JOB_NAME="$(kubectl get jobs -n "$NAMESPACE" \
   -l benchmark.llm-d.ai/workload=inferencex-agentx-mvp \
@@ -163,7 +209,7 @@ EOF
 kubectl wait -n "$NAMESPACE" --for=condition=Ready "pod/${RETRIEVER_POD}" --timeout=180s
 if [[ -z "$RUN_ID" ]]; then
   BUILD_SHORT="${BUILD_COMMIT:0:12}"
-  RUN_DIR="$(kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- find /workload/aiperf-agentx \
+  RUN_DIR="$(kexec find /workload/aiperf-agentx \
     -mindepth 1 -maxdepth 1 -type d -name "*-vllm-${BUILD_SHORT}-${JOB_TIMESTAMP}" | head -n 1)"
 else
   RUN_DIR="/workload/aiperf-agentx/${RUN_ID}"
@@ -173,28 +219,25 @@ if [[ -z "$RUN_DIR" ]]; then
   exit 1
 fi
 if [[ "$MONITORING" == true ]]; then
-  kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- \
-    cp /reporter/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
+  kexec cp /reporter/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
   # Scope PromQL to the current serving pods of this Job's model in this
   # namespace, not every deployment represented by the Grafana dashboard.
-  kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
+  kexec sh -c '
     tr "\n" "|" < /reporter/current-serving-pods.txt | sed "s/|\$//" > "$1/pods.txt"
     [ -s "$1/pods.txt" ]
   ' sh "$RUN_DIR"
   echo "Capturing Grafana dashboard data for each inferred AIPerf time range..."
-  kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- sh -c '
-    for directory in "$1"/c*; do
-      [ -f "$directory/profile_export_aiperf.json" ] || continue
-      # The timestamped Job log supplies the exact profiling start/end; do not
-      # use exported metrics or padding, which could include warm-up traffic.
-      python3 /reporter/export_dashboard.py --grafana-url "$2" --auth "$GRAFANA_AUTH" --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz --aiperf-log "$1/aiperf-job.log" results "$directory" --pad 0
-    done
-  ' sh "$RUN_DIR" "$GRAFANA_URL"
+  while IFS= read -r directory; do
+    [[ -n "$directory" ]] || continue
+    # The timestamped Job log supplies the exact profiling start/end; do not
+    # use exported metrics or padding, which could include warm-up traffic.
+    kexec python3 /reporter/export_dashboard.py --grafana-url "$GRAFANA_URL" --auth "$GRAFANA_AUTH" \
+      --plotly-bundle /reporter/plotly-basic-2.35.2.min.js.gz --aiperf-log "${RUN_DIR}/aiperf-job.log" \
+      results "$directory" --pad 0
+  done < <(kexec find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name 'c*' | sort)
 fi
-kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- \
-  cp /reporter/aiperf-job.yaml "${RUN_DIR}/aiperf-job.yaml"
-kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- \
-  python3 /reporter/aiperf_report.py index "$RUN_DIR"
-kubectl exec -n "$NAMESPACE" "$RETRIEVER_POD" -- cat "${RUN_DIR}/index.html" > "$DESTINATION"
+kexec cp /reporter/aiperf-job.yaml "${RUN_DIR}/aiperf-job.yaml"
+kexec python3 /reporter/aiperf_report.py index "$RUN_DIR"
+download_report "${RUN_DIR}/index.html"
 test -s "$DESTINATION"
 echo "Downloaded ${JOB_NAME} report to ${DESTINATION}"
