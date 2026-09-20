@@ -23,6 +23,11 @@ just live-aiperf-report
 just live-aiperf-report true
 ```
 
+To collect repeated samples in one Job, repeat the concurrency values in the
+argument. Each repeated sample is retained separately, for example
+`1,4,8,16,1,4,8,16` produces `c1-r1` through `c16-r2`; a concurrency that
+appears only once keeps the normal `c<N>` directory name.
+
 The first command returns after submitting the Job, so the laptop can close.
 The second command downloads `~/Downloads/aiperf-history.html`; it rebuilds the
 self-contained report from persisted artifacts for the newest completed Job.

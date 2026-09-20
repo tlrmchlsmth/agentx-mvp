@@ -72,6 +72,31 @@ echo "Benchmarking vLLM ${VLLM_BUILD_REF} (${VLLM_BUILD_COMMIT})"
 RUN_TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
 CONCURRENCY_LABEL="$(IFS=-; echo "${SWEEP_CONCURRENCIES[*]}")"
 CONCURRENCY_ARGS="${SWEEP_CONCURRENCIES[*]}"
+
+# Preserve every occurrence in a sweep. A repeated concurrency gets a stable
+# sample suffix (c<N>-r<M>) so a rerun cannot overwrite the earlier sample.
+# Use indexed arrays only: the macOS system Bash is commonly version 3.2 and
+# does not support associative arrays.
+RUN_SPECS=()
+for ((run_index = 0; run_index < ${#SWEEP_CONCURRENCIES[@]}; run_index++)); do
+  sweep_concurrency="${SWEEP_CONCURRENCIES[$run_index]}"
+  repeat_index=0
+  repeat_count=0
+  for ((scan_index = 0; scan_index < ${#SWEEP_CONCURRENCIES[@]}; scan_index++)); do
+    [[ "${SWEEP_CONCURRENCIES[$scan_index]}" == "$sweep_concurrency" ]] || continue
+    repeat_count=$((repeat_count + 1))
+    if (( scan_index <= run_index )); then
+      repeat_index=$((repeat_index + 1))
+    fi
+  done
+  if (( repeat_count > 1 )); then
+    output_name="c${sweep_concurrency}-r${repeat_index}"
+  else
+    output_name="c${sweep_concurrency}"
+  fi
+  RUN_SPECS+=("${sweep_concurrency}:${repeat_index}:${repeat_count}:${output_name}")
+done
+RUN_SPECS_ARGS="${RUN_SPECS[*]}"
 if [[ -n "${LIVE_AIPERF_RUN_ID:-}" ]]; then
   RUN_ID="$LIVE_AIPERF_RUN_ID"
 elif (( ${#SWEEP_CONCURRENCIES[@]} == 1 )); then
@@ -282,15 +307,21 @@ spec:
               model=\$(/opt/venv/bin/python3 -c 'import json,sys,urllib.request; payload=json.load(urllib.request.urlopen(sys.argv[1], timeout=30)); models=payload.get("data", []); assert len(models) == 1, f"expected exactly one served model, got {models!r}"; print(models[0]["id"])' "${BASE_URL}/models")
               /opt/venv/bin/python3 -c 'from transformers import AutoTokenizer; import sys; AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)' "\$model"
               overall_status=0
-              for concurrency in ${CONCURRENCY_ARGS}; do
+              for run_spec in ${RUN_SPECS_ARGS}; do
+                IFS=: read -r concurrency repeat_index repeat_count output_name <<< "\$run_spec"
                 echo "Clearing every prefill and decode vLLM prefix cache before c\$concurrency"
                 /opt/venv/bin/python3 /benchmark-input/reset-prefix-caches.py
-                output="\$output_root/c\$concurrency"
+                output="\$output_root/\$output_name"
+                if (( repeat_count > 1 )); then
+                  run_suffix="c\$concurrency-r\$repeat_index"
+                else
+                  run_suffix="c\$concurrency"
+                fi
                 mkdir -p "\$output"
                 # Keep the exact source details with the AIPerf output, not
                 # only in ephemeral Kubernetes metadata.
-                printf '{\n  "run_id": "%s-c%s",\n  "model_label": "%s",\n  "model": "%s",\n  "vllm_build_ref": "%s",\n  "vllm_build_commit": "%s",\n  "topology": "%s",\n  "prefill_gpu_count": %s,\n  "decode_gpu_count": %s,\n  "total_gpu_count": %s,\n  "concurrency": %s,\n  "duration_seconds": %s\n}\n' \\
-                  "${RUN_ID}" "\$concurrency" "${MODEL_LABEL}" "\$model" "${VLLM_BUILD_REF}" "${VLLM_BUILD_COMMIT}" "${TOPOLOGY}" "${PREFILL_GPU_COUNT}" "${DECODE_GPU_COUNT}" "${TOTAL_GPU_COUNT}" "\$concurrency" "${DURATION}" \\
+                printf '{\n  "run_id": "%s-%s",\n  "model_label": "%s",\n  "model": "%s",\n  "vllm_build_ref": "%s",\n  "vllm_build_commit": "%s",\n  "topology": "%s",\n  "prefill_gpu_count": %s,\n  "decode_gpu_count": %s,\n  "total_gpu_count": %s,\n  "concurrency": %s,\n  "repeat_index": %s,\n  "repeat_count": %s,\n  "duration_seconds": %s\n}\n' \\
+                  "${RUN_ID}" "\$run_suffix" "${MODEL_LABEL}" "\$model" "${VLLM_BUILD_REF}" "${VLLM_BUILD_COMMIT}" "${TOPOLOGY}" "${PREFILL_GPU_COUNT}" "${DECODE_GPU_COUNT}" "${TOTAL_GPU_COUNT}" "\$concurrency" "\$repeat_index" "\$repeat_count" "${DURATION}" \\
                   > "\$output/benchmark-metadata.json"
                 if /opt/venv/bin/aiperf profile \\
                 --scenario inferencex-agentx-mvp \\
@@ -381,7 +412,8 @@ kubectl apply -f "$JOB_MANIFEST"
 echo "Job created: ${JOB_NAME}"
 echo "vLLM build: ${VLLM_BUILD_REF} (${VLLM_BUILD_COMMIT})"
 echo "Logs: kubectl logs -n ${NAMESPACE} -f job/${JOB_NAME}"
-for reported_concurrency in "${SWEEP_CONCURRENCIES[@]}"; do
-  echo "Artifacts: ${RESULTS_PVC}:${OUTPUT_PATH}/c${reported_concurrency}"
-  echo "Portable report: ${RESULTS_PVC}:${OUTPUT_PATH}/c${reported_concurrency}/report.html"
+for run_spec in "${RUN_SPECS[@]}"; do
+  IFS=: read -r reported_concurrency reported_repeat reported_count reported_output_name <<< "$run_spec"
+  echo "Artifacts: ${RESULTS_PVC}:${OUTPUT_PATH}/${reported_output_name}"
+  echo "Portable report: ${RESULTS_PVC}:${OUTPUT_PATH}/${reported_output_name}/report.html"
 done

@@ -243,8 +243,7 @@ def metric_picker(runs: list[dict[str, Any]]) -> str:
             concurrency = int(metadata.get("concurrency"))
         except (TypeError, ValueError):
             continue
-        run_id = str(metadata.get("run_id", data["directory"].name))
-        series = run_id.rsplit("-c", 1)[0]
+        series = series_key(data)
         points.append(
             {
                 "series": series,
@@ -367,10 +366,9 @@ def plotly_metric_picker(runs: list[dict[str, Any]]) -> str:
             concurrency = int(data["metadata"].get("concurrency"))
         except (TypeError, ValueError):
             continue
-        run_id = str(data["metadata"].get("run_id", data["directory"].name))
         counts = gpu_counts(data)
         points.append({
-            "series": run_id.rsplit("-c", 1)[0],
+            "series": series_key(data),
             "concurrency": concurrency,
             "metrics": data["profile"],
             "prefill_gpus": counts["prefill_gpus"],
@@ -471,9 +469,8 @@ def multiple_plotly_metric_picker(runs: list[dict[str, Any]]) -> str:
         except (TypeError, ValueError):
             continue
         counts = gpu_counts(data)
-        run_id = str(data["metadata"].get("run_id", data["directory"].name))
         points.append({
-            "series": run_id.rsplit("-c", 1)[0], "concurrency": concurrency,
+            "series": series_key(data), "concurrency": concurrency,
             "metrics": data["profile"], **counts,
         })
     data_json = json.dumps(points, separators=(",", ":")).replace("</", "<\\/")
@@ -559,6 +556,31 @@ def sweep_key(data: dict[str, Any]) -> str:
     return run_id.rsplit("-c", 1)[0]
 
 
+def repeat_number(data: dict[str, Any]) -> int | None:
+    """Return the rerun number when a sweep contains repeated concurrency values."""
+    metadata = data["metadata"]
+    try:
+        repeat_count = int(metadata.get("repeat_count", 1))
+        repeat_index = int(metadata.get("repeat_index", 1))
+    except (TypeError, ValueError):
+        return None
+    return repeat_index if repeat_count > 1 and repeat_index > 0 else None
+
+
+def series_key(data: dict[str, Any]) -> str:
+    """Keep each repeated sample as a distinct chart series."""
+    base = sweep_key(data)
+    repeat = repeat_number(data)
+    return f"{base}-r{repeat}" if repeat is not None else base
+
+
+def run_label(data: dict[str, Any]) -> str:
+    """Human-readable concurrency label, including a rerun number when present."""
+    concurrency = str(data["metadata"].get("concurrency", "unknown"))
+    repeat = repeat_number(data)
+    return f"c{concurrency}-r{repeat}" if repeat is not None else f"c{concurrency}"
+
+
 def sweep_source_details(runs: list[dict[str, Any]]) -> str:
     """Render one shared source bundle per sweep, rather than per concurrency."""
     sweeps: dict[str, list[dict[str, Any]]] = {}
@@ -568,16 +590,14 @@ def sweep_source_details(runs: list[dict[str, Any]]) -> str:
     for name, members in sorted(sweeps.items()):
         members.sort(key=lambda data: int(data["metadata"].get("concurrency", 0)))
         first = members[0]
-        concurrencies = ", ".join(
-            f"c{data['metadata'].get('concurrency', 'unknown')}" for data in members
-        )
+        concurrencies = ", ".join(run_label(data) for data in members)
         shared_metadata = {
             key: value
             for key, value in first["metadata"].items()
-            if key not in {"run_id", "concurrency"}
+            if key not in {"run_id", "concurrency", "repeat_index", "repeat_count"}
         }
         metric_files = "".join(
-            f"<details><summary>c{html.escape(str(data['metadata'].get('concurrency', 'unknown')))} — profile_export_aiperf.json</summary>"
+            f"<details><summary>{html.escape(run_label(data))} — profile_export_aiperf.json</summary>"
             f"{metrics_table(data['profile'])}"
             f"<details><summary>source values</summary><pre>{html.escape(json.dumps(display_json(data['profile']), indent=2, sort_keys=True))}</pre></details>"
             "</details>"
@@ -666,10 +686,14 @@ def write_index(root: Path) -> None:
     metric_units: dict[str, str] = {}
     for data in runs:
         metadata = data["metadata"]
-        config_name = sweep_key(data)
+        config_name = series_key(data)
         counts = gpu_counts(data)
+        repeat = repeat_number(data)
+        source_label = str(metadata.get("vllm_build_ref", config_name))
+        if repeat is not None:
+            source_label += f" — rerun {repeat}"
         config = configs.setdefault(config_name, {
-            "label": str(metadata.get("vllm_build_ref", config_name)),
+            "label": source_label,
             "decode_gpus": counts["decode_gpus"],
             "prefill_gpus": counts["prefill_gpus"],
             "pods": str(metadata.get("topology", "live deployment")),
@@ -734,7 +758,7 @@ def write_index(root: Path) -> None:
 
 def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
     """Build one relative-time dashboard comparison from all saved concurrencies."""
-    paths: list[tuple[int, Path]] = []
+    paths: list[tuple[int, str, Path]] = []
     for data in runs:
         try:
             concurrency = int(data["metadata"]["concurrency"])
@@ -742,7 +766,7 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
             continue
         path = data["directory"] / "dashboard.html"
         if path.is_file():
-            paths.append((concurrency, path))
+            paths.append((concurrency, run_label(data), path))
     if len(paths) < 2:
         return None
     overlay_path = Path(__file__).with_name("overlay_dashboards.py")
@@ -753,8 +777,7 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
     spec.loader.exec_module(overlay)
     file_data = []
     labels = []
-    for concurrency, path in sorted(paths):
-        label = f"c{concurrency}"
+    for concurrency, label, path in sorted(paths, key=lambda item: (item[0], item[1])):
         panels, rows = overlay.extract_data(path)
         file_data.append((panels, rows, label))
         labels.append(label)
