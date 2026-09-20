@@ -71,11 +71,25 @@ def generate_html(merged, rows, labels, plotly_bundle=None):
   .row-header:hover {{ color: #fff; }}
   .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
   .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 8px; }}
-  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; overflow: auto; resize: both; min-width: 400px; min-height: 300px; height: 300px; }}
-  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; cursor: grab; user-select: none; }}
+  .toolbar {{ position: sticky; top: 0; z-index: 20; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+              margin: 0 0 12px; padding: 9px 10px; background: rgba(17,18,23,.96); border: 1px solid #2a2a2e; border-radius: 5px; }}
+  .toolbar-label {{ color: #8e8e8e; font-size: 12px; margin-right: 2px; }}
+  #concurrencyFilters {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+  button {{ border: 1px solid #3a3a3e; border-radius: 4px; background: #1e2127; color: #a9a9a9; padding: 4px 9px; cursor: pointer; }}
+  button:hover {{ color: #fff; border-color: #666; }}
+  .concurrency-filter.active {{ color: #fff; border-color: var(--filter-color); box-shadow: inset 0 0 0 1px var(--filter-color); }}
+  .grid {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
+  .panel {{ position: relative; isolation: isolate; z-index: 0; flex: 0 0 auto; width: calc(50% - 4px); max-width: 100%;
+            min-width: min(420px, 100%); min-height: 300px; height: 380px; background: #181b1f;
+            border: 1px solid #2a2a2e; border-radius: 4px; overflow: hidden; resize: both; }}
+  .panel.wide {{ width: 100% !important; }}
+  @media (max-width: 1000px) {{ .panel {{ width: 100%; }} }}
+  .panel-title {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 36px;
+                  font-size: 13px; font-weight: 500; padding: 5px 8px 5px 12px; color: #d8d9da; cursor: grab; user-select: none; }}
+  .panel-actions {{ display: flex; gap: 4px; flex: 0 0 auto; }}
+  .panel-actions button {{ padding: 2px 7px; font-size: 11px; }}
   .panel.dragging {{ opacity: .45; }}
-  .panel .plot {{ width: 100%; height: calc(100% - 36px); min-height: 260px; }}
+  .panel .plot {{ position: relative; z-index: 0; width: 100%; height: calc(100% - 36px); min-width: 0; min-height: 260px; }}
   .empty {{ color: #555; font-size: 12px; padding: 60px 12px; text-align: center; }}
   .hidden {{ display: none; }}
 </style>
@@ -83,6 +97,7 @@ def generate_html(merged, rows, labels, plotly_bundle=None):
 <body>
 <h1>Overlay Dashboard</h1>
 <div class="subtitle">{', '.join(labels)}</div>
+<div class="toolbar"><span class="toolbar-label">Concurrency</span><span id="concurrencyFilters"></span><button id="showAll">All</button><button id="showNone">None</button></div>
 <div id="root"></div>
 <script>
 const merged = {merged_json};
@@ -95,6 +110,28 @@ const BASE_COLORS = [
   [226,77,66], [31,120,193], [186,67,169], [112,93,160],
 ];
 labels.forEach((l, i) => {{ LABEL_COLORS[l] = BASE_COLORS[i % BASE_COLORS.length]; }});
+const activeLabels = new Set(labels);
+
+function applyConcurrencyFilter() {{
+  document.querySelectorAll('.plot[data-ready="true"]').forEach(plot => {{
+    const visible = (plot._traceConcurrencies || []).map(label => activeLabels.has(label));
+    if (visible.length) Plotly.restyle(plot, {{ visible }});
+  }});
+  document.querySelectorAll('.concurrency-filter').forEach(button => button.classList.toggle('active', activeLabels.has(button.dataset.label)));
+}}
+
+const filterRoot = document.getElementById('concurrencyFilters');
+labels.forEach(label => {{
+  const button = document.createElement('button');
+  button.className = 'concurrency-filter active';
+  button.dataset.label = label;
+  button.textContent = label;
+  button.style.setProperty('--filter-color', rgbStr(LABEL_COLORS[label], 1));
+  button.addEventListener('click', () => {{ activeLabels.has(label) ? activeLabels.delete(label) : activeLabels.add(label); applyConcurrencyFilter(); }});
+  filterRoot.appendChild(button);
+}});
+document.getElementById('showAll').addEventListener('click', () => {{ labels.forEach(label => activeLabels.add(label)); applyConcurrencyFilter(); }});
+document.getElementById('showNone').addEventListener('click', () => {{ activeLabels.clear(); applyConcurrencyFilter(); }});
 
 function seriesName(label, q, s, totalSeries) {{
   let legend = q.legend;
@@ -124,6 +161,11 @@ function makePanelInteractive(panel, plot) {{
     if (!draggedPanel || draggedPanel === panel || draggedPanel.parentElement !== panel.parentElement) return;
     panel.parentElement.insertBefore(draggedPanel, event.clientY < panel.getBoundingClientRect().top + panel.offsetHeight / 2 ? panel : panel.nextSibling);
   }});
+  title.addEventListener('dblclick', event => {{ if (!event.target.closest('button')) panel.classList.toggle('wide'); }});
+  panel.querySelector('[data-action="shorter"]').addEventListener('click', () => {{ panel.style.height = Math.max(300, panel.offsetHeight - 120) + 'px'; }});
+  panel.querySelector('[data-action="taller"]').addEventListener('click', () => {{ panel.style.height = Math.min(1200, panel.offsetHeight + 160) + 'px'; }});
+  panel.querySelector('[data-action="wide"]').addEventListener('click', () => {{ panel.classList.toggle('wide'); }});
+  panel.querySelector('[data-action="legend"]').addEventListener('click', () => {{ Plotly.relayout(plot, {{ showlegend: !plot.layout.showlegend }}); }});
   new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
 }}
 
@@ -160,7 +202,9 @@ if (rows.length === 0) {{
 function renderPanel(container, pid, m) {{
   const div = document.createElement('div');
   div.className = 'panel';
-  div.innerHTML = '<div class="panel-title">' + m.title + '</div>';
+  div.innerHTML = '<div class="panel-title"><span>' + m.title + '</span><span class="panel-actions">' +
+    '<button data-action="shorter" title="Shorter">−</button><button data-action="taller" title="Taller">+</button>' +
+    '<button data-action="wide" title="Toggle full width">↔</button><button data-action="legend" title="Toggle legend">Legend</button></span></div>';
 
   let hasAny = false;
   for (const e of m.entries) {{
@@ -184,15 +228,22 @@ function renderPanel(container, pid, m) {{
   makePanelInteractive(div, plotDiv);
 
   const traces = [];
+  const traceConcurrencies = [];
   const allY = [];
   for (const e of m.entries) for (const q of e.panel.queries) for (const s of q.series)
-    for (const v of s.values) {{ const value = parseFloat(v[1]); if (Number.isFinite(value)) allY.push(Math.abs(value)); }}
-  const largestY = Math.max(...allY, 0);
+    for (const v of s.values) {{ const value = parseFloat(v[1]); if (Number.isFinite(value)) allY.push(value); }}
+  const largestY = allY.reduce((largest, value) => Math.max(largest, value), -Infinity);
+  const smallestY = allY.reduce((smallest, value) => Math.min(smallest, value), Infinity);
+  const spanY = largestY - smallestY;
   // Fixed-point formatting is intentional: monitoring values must never flip
   // to exponent notation.  Keep only precision that remains meaningful.
-  const decimals = largestY >= 100 ? 0 : largestY >= 1 ? 2 : largestY >= 0.01 ? 4 : 6;
+  const magnitudeDecimals = largestY >= 100 ? 0 : largestY >= 1 ? 2 : largestY >= 0.01 ? 4 : 6;
+  const rangeDecimals = spanY > 0 ? Math.max(0, Math.ceil(-Math.log10(spanY / 6)) + 1) : magnitudeDecimals;
+  const decimals = Math.min(8, Math.max(magnitudeDecimals, rangeDecimals));
   const yFormat = `,.${{decimals}}f`;
-  const leftMargin = Math.max(70, (largestY.toFixed(decimals).length + 2) * 8);
+  const formattedLargest = largestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}});
+  const formattedSmallest = smallestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}});
+  const leftMargin = Math.max(76, (Math.max(formattedLargest.length, formattedSmallest.length) + 2) * 8);
   const hoverFormat = '%{{y:' + yFormat + '}}<extra>%{{fullData.name}}</extra>';
   for (const e of m.entries) {{
     const rgb = LABEL_COLORS[e.label] || [200,200,200];
@@ -210,8 +261,10 @@ function renderPanel(container, pid, m) {{
           type: 'scatter',
           mode: 'lines',
           line: {{ width: 1.5, color: rgbStr(rgb, alpha) }},
+          legendgroup: e.label,
           hovertemplate: hoverFormat,
         }});
+        traceConcurrencies.push(e.label);
         si++;
       }}
     }}
@@ -222,12 +275,19 @@ function renderPanel(container, pid, m) {{
     paper_bgcolor: 'transparent',
     plot_bgcolor: 'transparent',
     font: {{ color: '#8e8e8e', size: 10 }},
-    xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', title: 'seconds', tickformat: 'd' }},
-    yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: yFormat, hoverformat: yFormat }},
-    legend: {{ font: {{ size: 9 }}, orientation: 'h', y: -0.35 }},
-    showlegend: true,
+    xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', title: 'seconds', tickformat: ',d', exponentformat: 'none', showexponent: 'none' }},
+    yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: yFormat, hoverformat: yFormat, exponentformat: 'none', showexponent: 'none', separatethousands: true, automargin: true }},
+    legend: {{ font: {{ size: 9 }}, orientation: 'v', x: 1, xanchor: 'right', y: 1, yanchor: 'top', bgcolor: 'rgba(17,18,23,.88)', bordercolor: '#3a3a3e', borderwidth: 1 }},
+    // Long pod/rank names otherwise cover the data; the panel button can
+    // reveal the legend on demand.
+    showlegend: false,
     hovermode: 'x unified',
-  }}, {{ responsive: true, displayModeBar: false }});
+    uirevision: pid,
+  }}, {{ responsive: true, displayModeBar: true, displaylogo: false, scrollZoom: true, modeBarButtonsToRemove: ['lasso2d','select2d'] }}).then(() => {{
+    plotDiv._traceConcurrencies = traceConcurrencies;
+    plotDiv.dataset.ready = 'true';
+    applyConcurrencyFilter();
+  }});
 }}
 </script>
 </body>

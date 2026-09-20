@@ -516,12 +516,19 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
   .row-header:hover {{ color: #fff; }}
   .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
   .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 8px; }}
-  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 0;
-             overflow: hidden; resize: both; min-width: 400px; min-height: 300px; }}
+  .grid {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
+  .panel {{ position: relative; isolation: isolate; z-index: 0; flex: 0 0 auto; width: calc(50% - 4px); max-width: 100%;
+             min-width: min(420px, 100%); background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px;
+             padding: 0; overflow: hidden; resize: both; min-height: 300px; }}
+  .panel.wide {{ width: 100% !important; }}
+  @media (max-width: 1000px) {{ .grid .panel {{ width: 100%; }} }}
   .panel::-webkit-resizable {{ background: transparent; }}
-  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; }}
-  .panel .plot {{ width: 100%; height: calc(100% - 36px); min-height: 250px; }}
+  .panel-title {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 36px; font-size: 13px; font-weight: 500; padding: 5px 8px 5px 12px; color: #d8d9da; }}
+  .panel-actions {{ display: flex; gap: 4px; flex: 0 0 auto; }}
+  .panel-actions button,.conc-filter {{ border: 1px solid #3a3a3e; border-radius: 4px; background: #1e2127; color: #aaa; padding: 3px 8px; cursor: pointer; font-size: 11px; }}
+  .panel-actions button:hover,.conc-filter:hover {{ color: #fff; border-color: #666; }}
+  .conc-filter.active {{ color: #fff; border-color: #58a6ff; box-shadow: inset 0 0 0 1px #58a6ff; }}
+  .panel .plot {{ position: relative; z-index: 0; width: 100%; min-width: 0; height: calc(100% - 36px); min-height: 250px; }}
   .panel .plot .nsewdrag {{ cursor: pointer !important; }}
   .summary {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 16px; margin-bottom: 16px; overflow-x: auto; }}
   .summary table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 900px; }}
@@ -605,6 +612,7 @@ const LAYOUT_DEFAULTS = {{
 const COLORS = {json.dumps(color_map)};
 const CONFIGS = {json.dumps(configs_js)};
 const CONCURRENCIES = {json.dumps(conc_list_js)};
+const ACTIVE_CONCURRENCIES = new Set(CONCURRENCIES);
 const C_LABELS = {json.dumps(c_labels_js)};
 const DATA = {json.dumps(data_js)};
 const DASHBOARDS = {json.dumps(embedded_dashboards)};
@@ -720,14 +728,33 @@ function makePanel(parent, title, cls) {{
   panel.style.height = '500px';
   const t = document.createElement('div');
   t.className = 'panel-title';
-  t.textContent = title;
+  t.innerHTML = `<span>${{title}}</span><span class="panel-actions"><button data-action="shorter">−</button><button data-action="taller">+</button><button data-action="wide">↔</button></span>`;
   const plot = document.createElement('div');
   plot.className = 'plot';
   panel.appendChild(t);
   panel.appendChild(plot);
   parent.appendChild(panel);
-  new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
+  makePanelResizable(panel, plot);
   return plot;
+}}
+
+function makePanelResizable(panel, plot) {{
+  panel.querySelector('[data-action="shorter"]')?.addEventListener('click', () => {{ panel.style.height = Math.max(300, panel.offsetHeight - 120) + 'px'; }});
+  panel.querySelector('[data-action="taller"]')?.addEventListener('click', () => {{ panel.style.height = Math.min(1200, panel.offsetHeight + 160) + 'px'; }});
+  panel.querySelector('[data-action="wide"]')?.addEventListener('click', () => panel.classList.toggle('wide'));
+  new ResizeObserver(() => {{ if (plot.data) Plotly.Plots.resize(plot); }}).observe(panel);
+}}
+
+function fixedAxis(values) {{
+  const finite = values.filter(Number.isFinite);
+  if (!finite.length) return {{ tickformat: ',.2f', exponentformat: 'none', showexponent: 'none', automargin: true }};
+  const low = finite.reduce((value, item) => Math.min(value, item), Infinity);
+  const high = finite.reduce((value, item) => Math.max(value, item), -Infinity);
+  const span = high - low;
+  const magnitude = Math.max(Math.abs(low), Math.abs(high));
+  const base = magnitude >= 100 ? 0 : magnitude >= 1 ? 2 : magnitude >= .01 ? 4 : 6;
+  const ranged = span > 0 ? Math.max(0, Math.ceil(-Math.log10(span / 6)) + 1) : base;
+  return {{ tickformat: `,.${{Math.min(8, Math.max(base, ranged))}}f`, exponentformat: 'none', showexponent: 'none', separatethousands: true, automargin: true }};
 }}
 
 // ── Chart factory ──
@@ -940,7 +967,11 @@ function createChart(container, defaults) {{
   plot.className = 'plot';
   panel.appendChild(plot);
   container.appendChild(panel);
-  new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
+  const panelHeader = document.createElement('div');
+  panelHeader.className = 'panel-title';
+  panelHeader.innerHTML = '<span>Chart size</span><span class="panel-actions"><button data-action="shorter">−</button><button data-action="taller">+</button><button data-action="wide">↔</button></span>';
+  panel.insertBefore(panelHeader, plot);
+  makePanelResizable(panel, plot);
   state.el = plot;
 
   function axisTitle(metric, stat, norm) {{
@@ -955,7 +986,7 @@ function createChart(container, defaults) {{
   function buildTraces() {{
     return CONFIG_KEYS.map(cfg => {{
       const meta = CONFIGS[cfg];
-      const validConcs = CONCURRENCIES.filter(c => DATA[cfg] && DATA[cfg][c]);
+      const validConcs = CONCURRENCIES.filter(c => ACTIVE_CONCURRENCIES.has(c) && DATA[cfg] && DATA[cfg][c]);
       return {{
         x: validConcs.map(c => {{
           const m = DATA[cfg][c][state.xMetric];
@@ -978,13 +1009,15 @@ function createChart(container, defaults) {{
     }});
   }}
 
-  function getLayout() {{
-    const yAxis = {{ ...LAYOUT_DEFAULTS.yaxis, title: {{ text: axisTitle(state.yMetric, state.yStat, state.yNorm), font: {{ size: 11 }} }} }};
+  function getLayout(traces) {{
+    const xValues = traces.flatMap(trace => trace.x).filter(value => value != null);
+    const yValues = traces.flatMap(trace => trace.y).filter(value => value != null);
+    const yAxis = {{ ...LAYOUT_DEFAULTS.yaxis, ...fixedAxis(yValues), title: {{ text: axisTitle(state.yMetric, state.yStat, state.yNorm), font: {{ size: 11 }} }} }};
     if (!state.yNorm.startsWith('cost')) yAxis.rangemode = 'tozero';
     return {{
       ...LAYOUT_DEFAULTS,
       title: {{ text: `${{metricLabel(state.yMetric)}} vs ${{metricLabel(state.xMetric)}}`, font: {{ size: 13, color: '#d8d9da' }} }},
-      xaxis: {{ ...LAYOUT_DEFAULTS.xaxis, title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 11 }} }} }},
+      xaxis: {{ ...LAYOUT_DEFAULTS.xaxis, ...fixedAxis(xValues), title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 11 }} }} }},
       yaxis: yAxis,
       legend: {{ ...LAYOUT_DEFAULTS.legend, x: 0.99, y: 0.99, xanchor: 'right', yanchor: 'top' }},
     }};
@@ -997,10 +1030,11 @@ function createChart(container, defaults) {{
         if (traces[i] && old.visible === 'legendonly') traces[i].visible = 'legendonly';
       }});
     }}
-    Plotly.react(state.el, traces, getLayout(), {{ responsive: true, edits: {{ legendPosition: true }} }});
+    Plotly.react(state.el, traces, getLayout(traces), {{ responsive: true, edits: {{ legendPosition: true }}, displaylogo: false }});
   }}
 
-  Plotly.newPlot(state.el, buildTraces(), getLayout(), {{ responsive: true, edits: {{ legendPosition: true }} }});
+  const initialTraces = buildTraces();
+  Plotly.newPlot(state.el, initialTraces, getLayout(initialTraces), {{ responsive: true, edits: {{ legendPosition: true }}, displaylogo: false }});
   attachClickHandler(state.el);
 
   // Legend sync → table
@@ -1027,6 +1061,25 @@ const hint = document.createElement('span');
 hint.style.cssText = 'color:#ffffff; font-size:15px;';
 hint.textContent = 'Click any data point to open its Prometheus dashboard.';
 topBar.appendChild(hint);
+const concurrencyFilters = document.createElement('div');
+concurrencyFilters.style.cssText = 'display:flex;align-items:center;gap:5px;flex-wrap:wrap;';
+const filterLabel = document.createElement('span');
+filterLabel.textContent = 'Concurrency:';
+filterLabel.style.cssText = 'color:#8e8e8e;font-size:12px;';
+concurrencyFilters.appendChild(filterLabel);
+CONCURRENCIES.forEach(concurrency => {{
+  const button = document.createElement('button');
+  button.className = 'conc-filter active';
+  button.textContent = `c${{C_LABELS[concurrency]}}`;
+  button.addEventListener('click', () => {{
+    ACTIVE_CONCURRENCIES.has(concurrency) ? ACTIVE_CONCURRENCIES.delete(concurrency) : ACTIVE_CONCURRENCIES.add(concurrency);
+    button.classList.toggle('active', ACTIVE_CONCURRENCIES.has(concurrency));
+    allCharts.forEach(chart => chart.update());
+    document.querySelectorAll(`tr[data-conc="${{concurrency}}"]`).forEach(row => row.style.display = ACTIVE_CONCURRENCIES.has(concurrency) ? '' : 'none');
+  }});
+  concurrencyFilters.appendChild(button);
+}});
+topBar.appendChild(concurrencyFilters);
 
 root.appendChild(topBar);
 

@@ -72,10 +72,13 @@ download_report() {
   mv "$partial" "$DESTINATION"
 }
 
-JOB_NAME="$(kubectl get jobs -n "$NAMESPACE" \
-  -l benchmark.llm-d.ai/workload=inferencex-agentx-mvp \
-  --sort-by=.metadata.creationTimestamp \
-  -o name | sed 's#^job.batch/##' | tail -n 1)"
+JOB_NAME="${LIVE_AIPERF_JOB_NAME:-}"
+if [[ -z "$JOB_NAME" ]]; then
+  JOB_NAME="$(kubectl get jobs -n "$NAMESPACE" \
+    -l benchmark.llm-d.ai/workload=inferencex-agentx-mvp \
+    --sort-by=.metadata.creationTimestamp \
+    -o name | sed 's#^job.batch/##' | tail -n 1)"
+fi
 if [[ -z "$JOB_NAME" ]]; then
   echo "No AIPerf Jobs found in ${NAMESPACE}" >&2
   exit 1
@@ -115,6 +118,8 @@ RETRIEVER_POD="aiperf-report-download-$$"
 REPORTER_CONFIGMAP="aiperf-report-download-$$"
 MONITORING_SECRET=""
 JOB_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX")"
+LLMD_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-llmd.XXXXXX.yaml")"
+LLMD_SNAPSHOT_GZ="${LLMD_SNAPSHOT}.gz"
 JOB_LOG_SNAPSHOT=""
 CURRENT_PODS_SNAPSHOT=""
 cleanup() {
@@ -122,6 +127,7 @@ cleanup() {
   kubectl delete configmap -n "$NAMESPACE" "$REPORTER_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
   [[ -z "$MONITORING_SECRET" ]] || kubectl delete secret -n "$NAMESPACE" "$MONITORING_SECRET" --ignore-not-found >/dev/null 2>&1 || true
   rm -f "$JOB_SNAPSHOT"
+  rm -f "$LLMD_SNAPSHOT" "$LLMD_SNAPSHOT_GZ"
   [[ -z "$JOB_LOG_SNAPSHOT" ]] || rm -f "$JOB_LOG_SNAPSHOT"
   [[ -z "$CURRENT_PODS_SNAPSHOT" ]] || rm -f "$CURRENT_PODS_SNAPSHOT"
 }
@@ -131,6 +137,8 @@ trap cleanup EXIT
 # short-lived helper pod, regenerate HTML from persisted AIPerf JSON/YAML,
 # then stream it out. This is independent of the submission-time UI.
 kubectl get job -n "$NAMESPACE" "$JOB_NAME" -o yaml > "$JOB_SNAPSHOT"
+bash "${SCRIPT_DIR}/capture-llmd-resources.sh" "$NAMESPACE" "$MODEL_LABEL" > "$LLMD_SNAPSHOT"
+gzip -c "$LLMD_SNAPSHOT" > "$LLMD_SNAPSHOT_GZ"
 if [[ "$MONITORING" == true ]]; then
   # Do this before creating the helper: container environment is resolved at
   # startup, and the short-lived Secret must exist then.
@@ -168,6 +176,7 @@ REPORTER_FILES=(
   --from-file=overlay_dashboards.py="${SCRIPT_DIR}/../overlay_dashboards.py"
   --from-file=export_dashboard.py="${SCRIPT_DIR}/../export_dashboard.py"
   --from-file=aiperf-job.yaml="$JOB_SNAPSHOT"
+  --from-file=llm-d-deployment.yaml.gz="$LLMD_SNAPSHOT_GZ"
   --from-file=plotly-basic-2.35.2.min.js.gz="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
 )
 [[ -z "$JOB_LOG_SNAPSHOT" ]] || REPORTER_FILES+=(--from-file=aiperf-job.log="$JOB_LOG_SNAPSHOT")
@@ -239,6 +248,8 @@ if [[ "$MONITORING" == true ]]; then
   done < <(kexec find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name 'c*' | sort)
 fi
 kexec cp /reporter/aiperf-job.yaml "${RUN_DIR}/aiperf-job.yaml"
+kexec python3 -c 'import gzip,pathlib,sys; pathlib.Path(sys.argv[2]).write_bytes(gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes()))' \
+  /reporter/llm-d-deployment.yaml.gz "${RUN_DIR}/llm-d-deployment.yaml"
 kexec python3 /reporter/aiperf_report.py index "$RUN_DIR"
 download_report "${RUN_DIR}/index.html"
 test -s "$DESTINATION"

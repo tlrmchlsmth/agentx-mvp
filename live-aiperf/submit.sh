@@ -8,6 +8,8 @@ REPORTER_SCRIPT="${SCRIPT_DIR}/report.py"
 GENERATOR_SCRIPT="${SCRIPT_DIR}/../gen_interactivity_chart.py"
 OVERLAY_SCRIPT="${SCRIPT_DIR}/../overlay_dashboards.py"
 PLOTLY_BUNDLE="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
+RESET_SCRIPT="${SCRIPT_DIR}/reset-prefix-caches.py"
+LLMD_CAPTURE_SCRIPT="${SCRIPT_DIR}/capture-llmd-resources.sh"
 
 CONCURRENCY="${1:-}"
 DURATION="${2:-900}"
@@ -70,7 +72,9 @@ echo "Benchmarking vLLM ${VLLM_BUILD_REF} (${VLLM_BUILD_COMMIT})"
 RUN_TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
 CONCURRENCY_LABEL="$(IFS=-; echo "${SWEEP_CONCURRENCIES[*]}")"
 CONCURRENCY_ARGS="${SWEEP_CONCURRENCIES[*]}"
-if (( ${#SWEEP_CONCURRENCIES[@]} == 1 )); then
+if [[ -n "${LIVE_AIPERF_RUN_ID:-}" ]]; then
+  RUN_ID="$LIVE_AIPERF_RUN_ID"
+elif (( ${#SWEEP_CONCURRENCIES[@]} == 1 )); then
   RUN_ID="agentx-c${CONCURRENCY_LABEL}-vllm-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
 else
   RUN_ID="agentx-sweep-c${CONCURRENCY_LABEL}-vllm-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
@@ -190,16 +194,49 @@ if (( TOTAL_GPU_COUNT == 0 )); then
   exit 1
 fi
 
-# Capture the manifest from the laptop, where kubectl already has the intended
-# credentials. The AIPerf pod receives a read-only copy and writes it into its
-# artifact directory; it does not need Kubernetes API permissions itself.
+# Capture the exact serving and llm-d resources while submitting the run. The
+# AIPerf pod also has narrowly scoped pod-list permission for cache resets.
 POD_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-serving-pods.XXXXXX.yaml")"
 JOB_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX.yaml")"
-trap 'rm -f "$POD_SNAPSHOT" "$JOB_MANIFEST"' EXIT
+LLMD_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-llmd.XXXXXX.yaml")"
+LLMD_SNAPSHOT_GZ="${LLMD_SNAPSHOT}.gz"
+trap 'rm -f "$POD_SNAPSHOT" "$JOB_MANIFEST" "$LLMD_SNAPSHOT" "$LLMD_SNAPSHOT_GZ"' EXIT
 kubectl get pods -n "$NAMESPACE" -l "$BASE_SELECTOR" -o yaml > "$POD_SNAPSHOT"
+bash "$LLMD_CAPTURE_SCRIPT" "$NAMESPACE" "$MODEL_LABEL" > "$LLMD_SNAPSHOT"
+gzip -c "$LLMD_SNAPSHOT" > "$LLMD_SNAPSHOT_GZ"
 
 echo "Submitting ${JOB_NAME} in ${NAMESPACE}"
 cat > "$JOB_MANIFEST" <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiperf-cache-resetter
+  namespace: ${NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aiperf-cache-resetter
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aiperf-cache-resetter
+  namespace: ${NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: aiperf-cache-resetter
+    namespace: ${NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aiperf-cache-resetter
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -226,6 +263,7 @@ spec:
         benchmark.llm-d.ai/vllm-build-ref: "${VLLM_BUILD_REF}"
         benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
     spec:
+      serviceAccountName: aiperf-cache-resetter
       restartPolicy: Never
       containers:
         - name: aiperf
@@ -245,6 +283,8 @@ spec:
               /opt/venv/bin/python3 -c 'from transformers import AutoTokenizer; import sys; AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)' "\$model"
               overall_status=0
               for concurrency in ${CONCURRENCY_ARGS}; do
+                echo "Clearing every prefill and decode vLLM prefix cache before c\$concurrency"
+                /opt/venv/bin/python3 /benchmark-input/reset-prefix-caches.py
                 output="\$output_root/c\$concurrency"
                 mkdir -p "\$output"
                 # Keep the exact source details with the AIPerf output, not
@@ -262,6 +302,7 @@ spec:
                 --public-dataset semianalysis_cc_traces_weka_with_subagents \\
                 --concurrency "\$concurrency" \\
                 --benchmark-duration ${DURATION} \\
+                --dataset-sampling-strategy sequential \\
                 --use-server-token-count \\
                 --streaming \\
                 --random-seed 42 \\
@@ -273,6 +314,8 @@ spec:
                 fi
                 cp /benchmark-input/serving-pods.yaml "\$output/serving-pods.yaml"
                 cp /benchmark-input/aiperf-job.yaml "\$output/aiperf-job.yaml"
+                /opt/venv/bin/python3 -c 'import gzip,pathlib,sys; pathlib.Path(sys.argv[2]).write_bytes(gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes()))' \
+                  /benchmark-input/llm-d-deployment.yaml.gz "\$output/llm-d-deployment.yaml"
                 if [[ -f "\$output/profile_export_aiperf.json" ]]; then
                   /opt/venv/bin/python3 /benchmark-input/aiperf_report.py run "\$output"
                 fi
@@ -296,6 +339,10 @@ spec:
               value: "1800"
             - name: AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT
               value: "1800"
+            - name: AIPERF_NAMESPACE
+              value: "${NAMESPACE}"
+            - name: MODEL_LABEL
+              value: "${MODEL_LABEL}"
           resources:
             requests:
               cpu: "4"
@@ -323,11 +370,13 @@ kubectl create configmap "$ARTIFACT_CONFIGMAP" -n "$NAMESPACE" \
   --from-file=serving-pods.yaml="$POD_SNAPSHOT" \
   --from-file=aiperf-job.yaml="$JOB_MANIFEST" \
   --from-file=aiperf_report.py="$REPORTER_SCRIPT" \
+  --from-file=reset-prefix-caches.py="$RESET_SCRIPT" \
+  --from-file=llm-d-deployment.yaml.gz="$LLMD_SNAPSHOT_GZ" \
   --from-file=gen_interactivity_chart.py="$GENERATOR_SCRIPT" \
   --from-file=overlay_dashboards.py="$OVERLAY_SCRIPT" \
   --from-file=plotly-basic-2.35.2.min.js.gz="$PLOTLY_BUNDLE" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl create -f "$JOB_MANIFEST"
+  --dry-run=client -o yaml | kubectl create -f -
+kubectl apply -f "$JOB_MANIFEST"
 
 echo "Job created: ${JOB_NAME}"
 echo "vLLM build: ${VLLM_BUILD_REF} (${VLLM_BUILD_COMMIT})"

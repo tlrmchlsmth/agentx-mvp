@@ -108,6 +108,9 @@ def run_data(directory: Path) -> dict[str, Any] | None:
     aiperf_job_path = directory / "aiperf-job.yaml"
     if not aiperf_job_path.is_file():
         aiperf_job_path = directory.parent / "aiperf-job.yaml"
+    llmd_yaml_path = directory / "llm-d-deployment.yaml"
+    if not llmd_yaml_path.is_file():
+        llmd_yaml_path = directory.parent / "llm-d-deployment.yaml"
     return {
         "directory": directory,
         "profile": profile,
@@ -118,6 +121,9 @@ def run_data(directory: Path) -> dict[str, Any] | None:
         "aiperf_job_yaml": aiperf_job_path.read_text(encoding="utf-8")
         if aiperf_job_path.is_file()
         else "AIPerf Job manifest was not captured.",
+        "llmd_yaml": llmd_yaml_path.read_text(encoding="utf-8")
+        if llmd_yaml_path.is_file()
+        else "Live llm-d deployment snapshot was not captured.",
         "dashboard": (directory / "dashboard.html").read_bytes()
         if (directory / "dashboard.html").is_file() else None,
     }
@@ -222,6 +228,7 @@ def write_run(directory: Path) -> None:
         f"<h2>Metrics</h2>{metrics_table(data['profile'])}"
         f"<details><summary>AIPerf Job manifest</summary><pre>{html.escape(data['aiperf_job_yaml'])}</pre></details>"
         f"<details><summary>Serving pod YAML snapshot</summary><pre>{html.escape(data['yaml'])}</pre></details>"
+        f"<details><summary>Live llm-d deployment and router YAML</summary><pre>{html.escape(data['llmd_yaml'])}</pre></details>"
         f"<details><summary>AIPerf metrics source values</summary><pre>{html.escape(json.dumps(display_json(data['profile']), indent=2, sort_keys=True))}</pre></details>"
     )
     (directory / "report.html").write_text(document(title, body), encoding="utf-8")
@@ -581,6 +588,7 @@ def sweep_source_details(runs: list[dict[str, Any]]) -> str:
             f"<details><summary>benchmark-metadata.json — shared run settings</summary>{metadata_table(shared_metadata)}</details>"
             f"<details><summary>aiperf-job.yaml — full AIPerf Job YAML</summary><pre>{html.escape(first['aiperf_job_yaml'])}</pre></details>"
             f"<details><summary>serving-pods.yaml — shared deployment snapshot</summary><pre>{html.escape(first['yaml'])}</pre></details>"
+            f"<details><summary>llm-d-deployment.yaml — router and deployed llm-d resources</summary><pre>{html.escape(first['llmd_yaml'])}</pre></details>"
             f"<details><summary>profile_export_aiperf.json — per-concurrency metrics</summary>{metric_files}</details>"
             "</details>"
         )
@@ -670,6 +678,7 @@ def write_index(root: Path) -> None:
             "yamls": {
                 "aiperf-job.yaml": data["aiperf_job_yaml"],
                 "serving-pods.yaml": data["yaml"],
+                "llm-d-deployment.yaml": data["llmd_yaml"],
             },
         })
         try:

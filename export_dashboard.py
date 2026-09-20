@@ -201,6 +201,31 @@ def derive_pod_regex(deployment, pod_regex):
     return "|".join(f"(?:{p})" for p in parts)
 
 
+def pod_regex_for_panel(title, pod_regex):
+    """Restrict phase-specific panels to pods serving that phase.
+
+    Some deployed dashboard revisions omit their old ``job=`` matcher.  The
+    report exporter already knows the exact serving pod names, so use those
+    names instead of trusting a mutable Prometheus job label.
+    """
+    normalized = title.strip().lower()
+    role = None
+    if normalized.startswith("prefill "):
+        role = "prefill"
+    elif normalized.startswith("decode "):
+        role = "decode"
+    if not role or not pod_regex:
+        return pod_regex
+
+    # derive_pod_regex emits each concrete expression as a non-capturing
+    # alternative.  Keep only alternatives naming the requested phase.
+    alternatives = re.findall(r"\(\?:([^()]*)\)", pod_regex)
+    selected = [part for part in alternatives if f"-{role}-" in part]
+    if not selected:
+        return pod_regex
+    return "|".join(f"(?:{part})" for part in selected)
+
+
 def should_scope_metric(metric):
     return metric.startswith(SCOPED_METRIC_PREFIXES)
 
@@ -309,6 +334,7 @@ def export(args):
         pid = panel["id"]
         title = panel.get("title", f"panel-{pid}")
         unit = infer_unit(title, panel.get("fieldConfig", {}).get("defaults", {}).get("unit", ""))
+        panel_pod_regex = pod_regex_for_panel(title, pod_regex)
 
         queries = []
         for target in panel.get("targets", []):
@@ -316,7 +342,7 @@ def export(args):
             if not expr:
                 continue
             expr = substitute_vars(expr, args.deployment)
-            expr = scope_promql_expr(expr, pod_regex)
+            expr = scope_promql_expr(expr, panel_pod_regex)
             legend = target.get("legendFormat", "")
             result = query_prometheus(args.grafana_url, args.auth, ds_uid, expr, start, end, step)
 
@@ -391,11 +417,19 @@ def generate_html(panel_data, row_order, start, end, dashboard_name, plotly_bund
   .row-header:hover {{ color: #fff; }}
   .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
   .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 8px; }}
-  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 0; overflow: auto; resize: both; min-width: 400px; min-height: 280px; height: 280px; }}
-  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; cursor: grab; user-select: none; }}
+  .grid {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
+  .panel {{ position: relative; isolation: isolate; z-index: 0; flex: 0 0 auto; width: calc(50% - 4px); max-width: 100%;
+            min-width: min(420px, 100%); min-height: 300px; height: 380px; background: #181b1f;
+            border: 1px solid #2a2a2e; border-radius: 4px; padding: 0; overflow: hidden; resize: both; }}
+  .panel.wide {{ width: 100% !important; }}
+  @media (max-width: 1000px) {{ .panel {{ width: 100%; }} }}
+  .panel-title {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 36px;
+                  font-size: 13px; font-weight: 500; padding: 5px 8px 5px 12px; color: #d8d9da; cursor: grab; user-select: none; }}
+  .panel-actions {{ display: flex; gap: 4px; flex: 0 0 auto; }}
+  .panel-actions button {{ border: 1px solid #3a3a3e; border-radius: 4px; background: #1e2127; color: #aaa; padding: 2px 7px; cursor: pointer; font-size: 11px; }}
+  .panel-actions button:hover {{ color: #fff; border-color: #666; }}
   .panel.dragging {{ opacity: .45; }}
-  .panel .plot {{ width: 100%; height: calc(100% - 36px); min-height: 240px; }}
+  .panel .plot {{ position: relative; z-index: 0; width: 100%; height: calc(100% - 36px); min-width: 0; min-height: 260px; }}
   .empty {{ color: #555; font-size: 12px; padding: 60px 12px; text-align: center; }}
   .hidden {{ display: none; }}
 </style>
@@ -461,6 +495,11 @@ function makePanelInteractive(panel, plot) {{
     if (!draggedPanel || draggedPanel === panel || draggedPanel.parentElement !== panel.parentElement) return;
     panel.parentElement.insertBefore(draggedPanel, event.clientY < panel.getBoundingClientRect().top + panel.offsetHeight / 2 ? panel : panel.nextSibling);
   }});
+  title.addEventListener('dblclick', event => {{ if (!event.target.closest('button')) panel.classList.toggle('wide'); }});
+  panel.querySelector('[data-action="shorter"]').addEventListener('click', () => {{ panel.style.height = Math.max(300, panel.offsetHeight - 120) + 'px'; }});
+  panel.querySelector('[data-action="taller"]').addEventListener('click', () => {{ panel.style.height = Math.min(1200, panel.offsetHeight + 160) + 'px'; }});
+  panel.querySelector('[data-action="wide"]').addEventListener('click', () => {{ panel.classList.toggle('wide'); }});
+  panel.querySelector('[data-action="legend"]').addEventListener('click', () => {{ if (plot.layout) Plotly.relayout(plot, {{ showlegend: !plot.layout.showlegend }}); }});
   new ResizeObserver(() => {{ if (window.Plotly && plot.data) Plotly.Plots.resize(plot); }}).observe(panel);
 }}
 
@@ -483,24 +522,38 @@ const lazyObserver = new IntersectionObserver((entries) => {{
       }}));
       const fmt = UNIT_FMT[p.unit];
       const yTitle = UNIT_LABEL[p.unit] || p.unit || '';
+      const allY = traces.flatMap(trace => trace.y).filter(Number.isFinite);
+      const largestY = allY.reduce((largest, value) => Math.max(largest, value), -Infinity);
+      const smallestY = allY.reduce((smallest, value) => Math.min(smallest, value), Infinity);
+      const spanY = largestY - smallestY;
+      const magnitude = Math.max(Math.abs(largestY), Math.abs(smallestY));
+      const magnitudeDecimals = magnitude >= 100 ? 0 : magnitude >= 1 ? 2 : magnitude >= 0.01 ? 4 : 6;
+      const rangeDecimals = spanY > 0 ? Math.max(0, Math.ceil(-Math.log10(spanY / 6)) + 1) : magnitudeDecimals;
+      const decimals = Math.min(8, Math.max(magnitudeDecimals, rangeDecimals));
+      const yFormat = `,.${{decimals}}f`;
+      const widestLabel = Math.max(
+        largestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}}).length,
+        smallestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}}).length,
+      );
       if (!window.Plotly) {{
         plotDiv.innerHTML = '<div class="empty">Plotly unavailable</div>';
         return;
       }}
       Plotly.newPlot(plotDiv, traces, {{
-        margin: {{ l: 58, r: 16, t: 4, b: 30 }},
+        margin: {{ l: Math.max(76, (widestLabel + 2) * 8), r: 16, t: 4, b: 40 }},
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: {{ color: '#8e8e8e', size: 10 }},
-        xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: '%H:%M' }},
+        xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: '%H:%M', exponentformat: 'none', showexponent: 'none' }},
         yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e',
                   title: yTitle ? {{ text: yTitle, font: {{ size: 10 }} }} : undefined,
-                  tickformat: fmt ? undefined : '.3s',
-                  hoverformat: '.4g' }},
-        legend: {{ font: {{ size: 9 }}, orientation: 'h', y: -0.3 }},
-        showlegend: traces.length > 1,
+                  tickformat: yFormat, hoverformat: yFormat, exponentformat: 'none', showexponent: 'none', separatethousands: true, automargin: true }},
+        legend: {{ font: {{ size: 9 }}, orientation: 'v', x: 1, xanchor: 'right', y: 1, yanchor: 'top', bgcolor: 'rgba(17,18,23,.88)' }},
+        // Long pod/rank names otherwise cover the data; the panel button can
+        // reveal the legend on demand.
+        showlegend: false,
         hovermode: 'x unified',
-      }}, {{ responsive: true, displayModeBar: false }});
+      }}, {{ responsive: true, displayModeBar: true, displaylogo: false, scrollZoom: true, modeBarButtonsToRemove: ['lasso2d','select2d'] }});
     }}
   }});
 }}, {{ rootMargin: '200px' }});
@@ -508,7 +561,9 @@ const lazyObserver = new IntersectionObserver((entries) => {{
 function renderPanel(container, p) {{
   const div = document.createElement('div');
   div.className = 'panel';
-  div.innerHTML = '<div class="panel-title">' + p.title + '</div>';
+  div.innerHTML = '<div class="panel-title"><span>' + p.title + '</span><span class="panel-actions">' +
+    '<button data-action="shorter" title="Shorter">−</button><button data-action="taller" title="Taller">+</button>' +
+    '<button data-action="wide" title="Toggle full width">↔</button><button data-action="legend" title="Toggle legend">Legend</button></span></div>';
 
   const allSeries = p.queries.flatMap(q => q.series.map(s => ({{q, s}})));
   const hasData = allSeries.some(x => x.s.values.length > 0 && x.s.values.some(v => !isNaN(parseFloat(v[1]))));
