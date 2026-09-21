@@ -42,18 +42,53 @@ kexec() {
   return 1
 }
 upload_input() {
-  local source="$1" remote="$2" attempt=0
-  while (( attempt < EXEC_ATTEMPTS )); do
-    attempt=$((attempt + 1))
-    if kubectl -n "$NAMESPACE" --request-timeout=90s exec -i "$RETRIEVER_POD" -- \
-        sh -c 'cat > "$1"' sh "$remote" < "$source"; then
-      return 0
+  local source="$1" remote="$2" total offset=0 remaining want attempt=0 remote_total chunk_file
+  local chunk_bytes=$((256 * 1024))
+  total="$(local_size "$source")"
+  [[ "$total" =~ ^[0-9]+$ ]] || { echo "Could not size helper input ${source}" >&2; return 1; }
+  chunk_file="$(mktemp "${TMPDIR:-/tmp}/aiperf-input.XXXXXX")"
+  if ! kexec sh -c ': > "$1"' sh "$remote"; then
+    rm -f "$chunk_file"
+    return 1
+  fi
+  while (( offset < total )); do
+    remaining=$((total - offset))
+    want=$chunk_bytes
+    (( remaining < want )) && want=$remaining
+    : > "$chunk_file"
+    if (( want == chunk_bytes )); then
+      dd if="$source" of="$chunk_file" bs="$chunk_bytes" skip=$((offset / chunk_bytes)) count=1 2>/dev/null
+    else
+      dd if="$source" of="$chunk_file" bs=1 skip="$offset" count="$want" 2>/dev/null
     fi
-    (( attempt == EXEC_ATTEMPTS )) && break
-    echo "  helper input upload failed (attempt ${attempt}/${EXEC_ATTEMPTS}); retrying in $(backoff "$attempt")s..." >&2
-    sleep "$(backoff "$attempt")"
+    [[ "$(local_size "$chunk_file")" == "$want" ]] || {
+      echo "Could not prepare helper input chunk at byte ${offset}: ${source}" >&2
+      rm -f "$chunk_file"
+      return 1
+    }
+    attempt=0
+    while :; do
+      attempt=$((attempt + 1))
+      if kubectl -n "$NAMESPACE" --request-timeout=90s exec -i "$RETRIEVER_POD" -- \
+          sh -c 'cat >> "$1"' sh "$remote" < "$chunk_file"; then
+        offset=$((offset + want))
+        break
+      fi
+      if (( attempt == EXEC_ATTEMPTS )); then
+        echo "Helper input upload failed at byte ${offset} of ${total}: ${source}" >&2
+        rm -f "$chunk_file"
+        return 1
+      fi
+      echo "  helper input chunk failed at byte ${offset} (attempt ${attempt}/${EXEC_ATTEMPTS}); retrying in $(backoff "$attempt")s..." >&2
+      sleep "$(backoff "$attempt")"
+    done
   done
-  return 1
+  rm -f "$chunk_file"
+  remote_total="$(kexec sh -c 'wc -c < "$1"' sh "$remote" | tr -d '[:space:]')"
+  [[ "$remote_total" == "$total" ]] || {
+    echo "Helper input upload size mismatch for ${source}: local=${total}, remote=${remote_total:-unknown}" >&2
+    return 1
+  }
 }
 local_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 download_report() {
