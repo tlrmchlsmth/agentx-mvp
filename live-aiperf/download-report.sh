@@ -41,6 +41,20 @@ kexec() {
   done
   return 1
 }
+upload_input() {
+  local source="$1" remote="$2" attempt=0
+  while (( attempt < EXEC_ATTEMPTS )); do
+    attempt=$((attempt + 1))
+    if kubectl -n "$NAMESPACE" --request-timeout=90s exec -i "$RETRIEVER_POD" -- \
+        sh -c 'cat > "$1"' sh "$remote" < "$source"; then
+      return 0
+    fi
+    (( attempt == EXEC_ATTEMPTS )) && break
+    echo "  helper input upload failed (attempt ${attempt}/${EXEC_ATTEMPTS}); retrying in $(backoff "$attempt")s..." >&2
+    sleep "$(backoff "$attempt")"
+  done
+  return 1
+}
 local_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 download_report() {
   local remote="$1" partial="${DESTINATION}.part" remote_size offset remaining want chunk attempt=0
@@ -175,12 +189,8 @@ REPORTER_FILES=(
   --from-file=gen_interactivity_chart.py="${SCRIPT_DIR}/../gen_interactivity_chart.py"
   --from-file=overlay_dashboards.py="${SCRIPT_DIR}/../overlay_dashboards.py"
   --from-file=export_dashboard.py="${SCRIPT_DIR}/../export_dashboard.py"
-  --from-file=aiperf-job.yaml="$JOB_SNAPSHOT"
-  --from-file=llm-d-deployment.yaml.gz="$LLMD_SNAPSHOT_GZ"
   --from-file=plotly-basic-2.35.2.min.js.gz="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
 )
-[[ -z "$JOB_LOG_SNAPSHOT" ]] || REPORTER_FILES+=(--from-file=aiperf-job.log="$JOB_LOG_SNAPSHOT")
-[[ -z "$CURRENT_PODS_SNAPSHOT" ]] || REPORTER_FILES+=(--from-file=current-serving-pods.txt="$CURRENT_PODS_SNAPSHOT")
 kubectl create configmap "$REPORTER_CONFIGMAP" -n "$NAMESPACE" "${REPORTER_FILES[@]}"
 kubectl create -f - <<EOF
 apiVersion: v1
@@ -204,6 +214,8 @@ spec:
       volumeMounts:
         - name: workload
           mountPath: /workload
+        - name: inputs
+          mountPath: /inputs
         - name: reporter
           mountPath: /reporter
           readOnly: true
@@ -211,11 +223,19 @@ spec:
     - name: workload
       persistentVolumeClaim:
         claimName: ${RESULTS_PVC}
+    - name: inputs
+      emptyDir: {}
     - name: reporter
       configMap:
         name: ${REPORTER_CONFIGMAP}
 EOF
 kubectl wait -n "$NAMESPACE" --for=condition=Ready "pod/${RETRIEVER_POD}" --timeout=180s
+upload_input "$JOB_SNAPSHOT" /inputs/aiperf-job.yaml
+upload_input "$LLMD_SNAPSHOT_GZ" /inputs/llm-d-deployment.yaml.gz
+if [[ "$MONITORING" == true ]]; then
+  upload_input "$JOB_LOG_SNAPSHOT" /inputs/aiperf-job.log
+  upload_input "$CURRENT_PODS_SNAPSHOT" /inputs/current-serving-pods.txt
+fi
 if [[ -z "$RUN_ID" ]]; then
   BUILD_SHORT="${BUILD_COMMIT:0:12}"
   RUN_DIR="$(kexec find /workload/aiperf-agentx \
@@ -228,11 +248,11 @@ if [[ -z "$RUN_DIR" ]]; then
   exit 1
 fi
 if [[ "$MONITORING" == true ]]; then
-  kexec cp /reporter/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
+  kexec cp /inputs/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
   # Scope PromQL to the current serving pods of this Job's model in this
   # namespace, not every deployment represented by the Grafana dashboard.
   kexec sh -c '
-    tr "\n" "|" < /reporter/current-serving-pods.txt | sed "s/|\$//" > "$1/pods.txt"
+    tr "\n" "|" < /inputs/current-serving-pods.txt | sed "s/|\$//" > "$1/pods.txt"
     [ -s "$1/pods.txt" ]
   ' sh "$RUN_DIR"
   echo "Capturing Grafana dashboard data for each inferred AIPerf time range..."
@@ -247,9 +267,9 @@ if [[ "$MONITORING" == true ]]; then
     ' sh "$GRAFANA_URL" "$RUN_DIR" "$directory"
   done < <(kexec find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name 'c*' | sort)
 fi
-kexec cp /reporter/aiperf-job.yaml "${RUN_DIR}/aiperf-job.yaml"
+kexec cp /inputs/aiperf-job.yaml "${RUN_DIR}/aiperf-job.yaml"
 kexec python3 -c 'import gzip,pathlib,sys; pathlib.Path(sys.argv[2]).write_bytes(gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes()))' \
-  /reporter/llm-d-deployment.yaml.gz "${RUN_DIR}/llm-d-deployment.yaml"
+  /inputs/llm-d-deployment.yaml.gz "${RUN_DIR}/llm-d-deployment.yaml"
 kexec python3 /reporter/aiperf_report.py index "$RUN_DIR"
 download_report "${RUN_DIR}/index.html"
 test -s "$DESTINATION"
