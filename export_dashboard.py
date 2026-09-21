@@ -618,8 +618,8 @@ if (rows.length === 0) {{
 
 
 def logged_aiperf_window(log_path, directory):
-    """Return the exact AIPerf profiling phase boundaries for this c<N> run."""
-    match = re.fullmatch(r"c(\d+)", os.path.basename(directory))
+    """Return exact profiling boundaries for c<N> or c<N>-r<M> runs."""
+    match = re.fullmatch(r"c(\d+)(?:-r\d+)?", os.path.basename(directory))
     if not match:
         raise RuntimeError(f"Cannot identify concurrency from {directory}")
     wanted = match.group(1)
