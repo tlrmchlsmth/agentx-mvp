@@ -1,6 +1,56 @@
 #!/usr/bin/env bash
-# Optional DeepEP wheel build. Sourced after vLLM is installed by
-# vllm-wheel-build.sh, using the same shared build-cache PVC and lock helpers.
+# Optional DeepEP wheel build. Sourced by the campaign build script with either
+# the image's vLLM or a campaign-built vLLM. Uses the shared build-cache PVC.
+
+# The nightly path skips vLLM's lock setup, so provide the same primitives here.
+# A source build already defined them and can reuse them with DeepEP's lock path.
+if ! declare -F wheel_is_valid >/dev/null; then
+  wheel_is_valid() {
+    python3 -c 'import sys,zipfile; p=sys.argv[1]; sys.exit(0 if zipfile.is_zipfile(p) and zipfile.ZipFile(p).testzip() is None else 1)' "$1" 2>/dev/null
+  }
+fi
+if ! declare -F claim_build_lock >/dev/null; then
+  claim_build_lock() {
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    printf '%s\n' "$LOCK_TOKEN" > "${LOCK_DIR}/token"
+    touch "${LOCK_DIR}/heartbeat"
+    BUILD_LOCK_HELD=1
+  }
+  start_build_lock_heartbeat() {
+    (while [ "$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)" = "$LOCK_TOKEN" ]; do
+      touch "${LOCK_DIR}/heartbeat" || exit 0
+      sleep 30
+    done) &
+    LOCK_HEARTBEAT_PID=$!
+  }
+  release_build_lock() {
+    if [ "$BUILD_LOCK_HELD" = 1 ]; then
+      if [ -n "$LOCK_HEARTBEAT_PID" ]; then
+        kill "$LOCK_HEARTBEAT_PID" 2>/dev/null || true
+        wait "$LOCK_HEARTBEAT_PID" 2>/dev/null || true
+        LOCK_HEARTBEAT_PID=""
+      fi
+      if [ "$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)" = "$LOCK_TOKEN" ]; then
+        rm -rf "$LOCK_DIR"
+      fi
+      BUILD_LOCK_HELD=0
+    fi
+  }
+  recover_restarted_leader_lock() {
+    local owner_host owner_pid previous_token stale_lock
+    [ "$BUILD_LEADER" = 1 ] && [ -d "$LOCK_DIR" ] || return 1
+    owner_host=$(awk -F= '$1 == "host" { print $2; exit }' "${LOCK_DIR}/owner" 2>/dev/null || true)
+    owner_pid=$(awk -F= '$1 == "pid" { print $2; exit }' "${LOCK_DIR}/owner" 2>/dev/null || true)
+    previous_token=$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)
+    if [ "$owner_host" = "${HOSTNAME:-unknown}" ] && [ "$owner_pid" = "$$" ] && \
+       [ -n "$previous_token" ] && [ "$previous_token" != "$LOCK_TOKEN" ]; then
+      stale_lock="${LOCK_DIR}.restarted.${HOSTNAME:-unknown}.$$.$RANDOM"
+      if mv "$LOCK_DIR" "$stale_lock" 2>/dev/null; then
+        rm -rf "$stale_lock"
+      fi
+    fi
+  }
+fi
 
 DEEPEP_REPO=${DEEPEP_BUILD_REPO:?FATAL: DEEPEP_BUILD_REPO is required}
 DEEPEP_REF=${DEEPEP_BUILD_REF:?FATAL: DEEPEP_BUILD_REF is required}

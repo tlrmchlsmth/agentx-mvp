@@ -77,8 +77,8 @@ def git_branch(value: Any, field: str) -> str:
 
 
 def validate_steps(steps: Any, field: str) -> None:
-    if not isinstance(steps, list) or not 1 <= len(steps) <= 32:
-        raise ValueError(f"{field} needs 1-32 entries")
+    if not isinstance(steps, list) or len(steps) > 32:
+        raise ValueError(f"{field} needs 0-32 entries")
     for index, step in enumerate(steps):
         if not isinstance(step, dict) or set(step) != {"ref", "action"}:
             raise ValueError(f"{field}[{index}] needs ref and action")
@@ -129,18 +129,21 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("benchmarks must contain 1-4 entries")
     builds = config.get("builds")
     if builds is not None:
-        git_repo(config.get("build_repo"), "build_repo")
         if not isinstance(builds, list) or not 1 <= len(builds) <= 16:
             raise ValueError("builds must contain 1-16 entries")
+        has_vllm_steps = any(isinstance(build, dict) and bool(build.get("steps")) for build in builds)
+        if has_vllm_steps or "build_repo" in config:
+            git_repo(config.get("build_repo"), "build_repo")
         build_names = set()
         for build in builds:
-            if not isinstance(build, dict) or not {"name", "steps"}.issubset(build) or set(build) - {"name", "steps", "deepep"}:
-                raise ValueError("each build needs name and steps; deepep is optional")
+            if not isinstance(build, dict) or "name" not in build or set(build) - {"name", "steps", "deepep"}:
+                raise ValueError("each build needs a name; steps and deepep are optional")
             name = required_name(build["name"], "build.name")
             if name in build_names:
                 raise ValueError(f"duplicate build: {name}")
             build_names.add(name)
-            validate_steps(build["steps"], f"build {name}.steps")
+            if "steps" in build:
+                validate_steps(build["steps"], f"build {name}.steps")
             if "deepep" in build:
                 validate_deepep(build["deepep"], f"build {name}.deepep")
         if len(builds) * len(overlays) > 128:
@@ -178,10 +181,13 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ValueError("top-level builds cannot be combined with per-overlay build")
         if "build" in overlay:
             build = overlay["build"]
-            if not isinstance(build, dict) or not {"repo", "steps"}.issubset(build) or set(build) - {"repo", "steps", "deepep"}:
-                raise ValueError(f"overlay {name} build needs repo and steps; deepep is optional")
-            git_repo(build["repo"], f"overlay {name} build.repo")
-            validate_steps(build["steps"], f"overlay {name} build.steps")
+            if not isinstance(build, dict) or not build or set(build) - {"repo", "steps", "deepep"}:
+                raise ValueError(f"overlay {name} build may contain repo, steps, or deepep")
+            if "steps" in build:
+                validate_steps(build["steps"], f"overlay {name} build.steps")
+                git_repo(build.get("repo"), f"overlay {name} build.repo")
+            elif "repo" in build:
+                git_repo(build["repo"], f"overlay {name} build.repo")
             if "deepep" in build:
                 validate_deepep(build["deepep"], f"overlay {name} build.deepep")
     tools = set()
@@ -241,15 +247,17 @@ def fetch_source(source: dict[str, str]) -> tuple[Path, str]:
 
 
 def resolve_build(build: dict[str, Any], pins: dict[tuple[str, str], str] | None = None) -> dict[str, Any]:
-    """Pin every moving vLLM branch before calculating the wheel cache key."""
+    """Pin requested source branches; an empty list uses the runtime image."""
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     if pins is None:
         pins = {}
-    refs = [f"refs/heads/{step['ref']}" for step in build["steps"]]
-    unresolved = list(dict.fromkeys(ref for ref in refs if (build["repo"], ref) not in pins))
+    steps = build.get("steps", [])
+    repo = build.get("repo")
+    refs = [f"refs/heads/{step['ref']}" for step in steps]
+    unresolved = list(dict.fromkeys(ref for ref in refs if (repo, ref) not in pins))
     if unresolved:
-        result = call(["git", "ls-remote", "--exit-code", "--heads", build["repo"], *unresolved], env=env, timeout=120)
+        result = call(["git", "ls-remote", "--exit-code", "--heads", repo, *unresolved], env=env, timeout=120)
         resolved = {}
         for line in result.stdout.strip().splitlines():
             fields = line.split("\t")
@@ -258,10 +266,12 @@ def resolve_build(build: dict[str, Any], pins: dict[tuple[str, str], str] | None
             resolved[fields[1]] = fields[0]
         if any(ref not in resolved for ref in unresolved):
             raise RuntimeError(f"could not resolve vLLM branches: {', '.join(ref for ref in unresolved if ref not in resolved)}")
-        pins.update({(build["repo"], ref): commit for ref, commit in resolved.items()})
-    result = {"repo": build["repo"], "steps": [
-        {"ref": step["ref"], "action": step["action"], "commit": pins[(build["repo"], f"refs/heads/{step['ref']}")]}
-        for step in build["steps"]]}
+        pins.update({(repo, ref): commit for ref, commit in resolved.items()})
+    result = {"mode": "source" if steps else "nightly", "steps": [
+        {"ref": step["ref"], "action": step["action"], "commit": pins[(repo, f"refs/heads/{step['ref']}")]}
+        for step in steps]}
+    if steps:
+        result["repo"] = repo
     if "deepep" in build:
         recipe = build["deepep"]
         ref = f"refs/heads/{recipe['ref']}"
@@ -307,6 +317,8 @@ def build_commit(namespace: str) -> str | None:
         return None
     data = json.loads(output)
     commit = data.get("data", {}).get("VLLM_BUILD_COMMIT", "")
+    if not commit:
+        return None
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("vllm-build-ref has no valid commit")
     return commit
@@ -314,6 +326,9 @@ def build_commit(namespace: str) -> str | None:
 
 def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None) -> str:
     """Use the versioned campaign build recipe in both builder and serving Pods."""
+    build = build or {"mode": "nightly", "steps": []}
+    source_build = bool(build.get("steps"))
+    deepep_build = "deepep" in build
     documents = list(yaml.safe_load_all(rendered))
     candidates = []
     for item in documents:
@@ -325,8 +340,8 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
             ):
                 candidates.append((item, key))
     if not candidates:
-        if build:
-            raise ValueError("overlay build steps require a compatible vLLM wheel build script")
+        if source_build or deepep_build:
+            raise ValueError("overlay build requires a compatible vLLM wheel build script")
         return rendered
     if len(candidates) != 1:
         raise ValueError("overlay contains multiple vLLM wheel build scripts")
@@ -344,9 +359,19 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
     }
     ref_map = next((item for item in documents if isinstance(item, dict) and item.get("kind") == "ConfigMap" and
                     item.get("metadata", {}).get("name") == "vllm-build-ref"), None)
-    if ref_map is None:
+    if ref_map is None and source_build:
         raise ValueError("vLLM build script requires a vllm-build-ref ConfigMap")
-    if build:
+    if ref_map is None and deepep_build:
+        ref_map = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "vllm-build-ref"}, "data": {}}
+        documents.append(ref_map)
+    if ref_map is not None:
+        data = ref_map.setdefault("data", {})
+        for key in ("VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_REPO", "VLLM_BUILD_REFS",
+                    "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS", "DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF",
+                    "DEEPEP_BUILD_COMMIT"):
+            data.pop(key, None)
+        data["DEEPEP_BUILD_ENABLED"] = "1" if deepep_build else "0"
+    if source_build:
         steps = build["steps"]
         ref_map.setdefault("data", {}).update({
             "VLLM_BUILD_REF": steps[0]["ref"], "VLLM_BUILD_COMMIT": steps[0]["commit"],
@@ -354,14 +379,13 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
             "VLLM_BUILD_REFS": " ".join(step["ref"] for step in steps),
             "VLLM_BUILD_ACTIONS": " ".join(step["action"] for step in steps),
             "VLLM_BUILD_SHAS": " ".join(step["commit"] for step in steps),
-            "DEEPEP_BUILD_ENABLED": "1" if "deepep" in build else "0",
         })
-        if "deepep" in build:
-            deepep = build["deepep"]
-            ref_map["data"].update({
-                "DEEPEP_BUILD_REPO": deepep["repo"],
-                "DEEPEP_BUILD_REF": deepep["ref"], "DEEPEP_BUILD_COMMIT": deepep["commit"],
-            })
+    if deepep_build:
+        deepep = build["deepep"]
+        ref_map["data"].update({
+            "DEEPEP_BUILD_REPO": deepep["repo"],
+            "DEEPEP_BUILD_REF": deepep["ref"], "DEEPEP_BUILD_COMMIT": deepep["commit"],
+        })
     references = 0
     for item in documents:
         if not isinstance(item, dict) or item.get("kind") != "LeaderWorkerSet":
@@ -383,9 +407,15 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
                     container[field] = [part.replace(old_key, "vllm-wheel-build.sh") for part in container[field]]
             if any("vllm-wheel-build.sh" in part for field in ("command", "args") for part in container.get(field, [])):
                 env = container.setdefault("env", [])
+                managed = {"VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_REPO", "VLLM_BUILD_REFS",
+                           "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS", "VLLM_BUILD_MODE", "DEEPEP_BUILD_ENABLED",
+                           "DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT"}
+                env[:] = [item for item in env if item.get("name") not in managed]
                 existing = {item.get("name") for item in env}
-                for key in ("VLLM_BUILD_REF", "VLLM_BUILD_COMMIT"):
-                    if key not in existing:
+                env.append({"name": "VLLM_BUILD_MODE", "value": "source" if source_build else "nightly"})
+                if source_build:
+                    for key in ("VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_REPO", "VLLM_BUILD_REFS",
+                                "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS"):
                         env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
                 if "VLLM_BUILD_BASE_IMAGE_ID" not in existing:
                     image = container.get("image", "")
@@ -393,14 +423,10 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
                     env.append({"name": "VLLM_BUILD_BASE_IMAGE_ID", "value": image_id})
                 if "VLLM_BUILD_ROLE" not in existing:
                     env.append({"name": "VLLM_BUILD_ROLE", "value": "prefill"})
-                if build:
-                    for key in ("VLLM_BUILD_REPO", "VLLM_BUILD_REFS", "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS"):
-                        env[:] = [item for item in env if item.get("name") != key]
+                env.append({"name": "DEEPEP_BUILD_ENABLED", "value": "1" if deepep_build else "0"})
+                if deepep_build:
+                    for key in ("DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT"):
                         env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
-                    for key in (("DEEPEP_BUILD_ENABLED", "DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT")
-                                if "deepep" in build else ("DEEPEP_BUILD_ENABLED",)):
-                            env[:] = [item for item in env if item.get("name") != key]
-                            env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
     if not references:
         raise ValueError("vLLM build script is not sourced by a LeaderWorkerSet container")
     return yaml.safe_dump_all(documents, sort_keys=False)
@@ -414,8 +440,6 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
     if not script_map or "vllm-wheel-build.sh" not in script_map.get("data", {}):
         return None
     ref_map = maps.get("vllm-build-ref")
-    if not ref_map or not re.fullmatch(r"[0-9a-f]{40}", ref_map.get("data", {}).get("VLLM_BUILD_COMMIT", "")):
-        raise ValueError("vLLM build requires a vllm-build-ref ConfigMap with an immutable commit")
     candidates = []
     for item in documents:
         if item.get("kind") != "LeaderWorkerSet":
@@ -428,6 +452,16 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
     if not candidates:
         raise ValueError("vLLM build needs a worker container that sources the script")
     _, pod, serving = next((candidate for candidate in candidates if candidate[0]), candidates[0])
+    serving_env = {item.get("name"): item for item in serving.get("env", [])}
+    mode = serving_env.get("VLLM_BUILD_MODE", {}).get("value", "source")
+    deepep_enabled = serving_env.get("DEEPEP_BUILD_ENABLED", {}).get("value") == "1"
+    if mode not in {"source", "nightly"}:
+        raise ValueError(f"unknown vLLM build mode: {mode}")
+    if mode == "nightly" and not deepep_enabled:
+        return None
+    if not ref_map or (mode == "source" and not re.fullmatch(
+        r"[0-9a-f]{40}", ref_map.get("data", {}).get("VLLM_BUILD_COMMIT", ""))):
+        raise ValueError("vLLM build requires a vllm-build-ref ConfigMap with an immutable commit")
     mounts = [copy.deepcopy(m) for m in serving.get("volumeMounts", []) if m.get("name") in {"build-cache", "vllm-build"}]
     volumes = [copy.deepcopy(v) for v in pod.get("volumes", []) if v.get("name") in {"build-cache", "vllm-build"}]
     if {m.get("name") for m in mounts} != {"build-cache", "vllm-build"} or {v.get("name") for v in volumes} != {"build-cache", "vllm-build"}:
@@ -436,7 +470,12 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
     if script_volume.get("configMap", {}).get("name") != "vllm-build":
         raise ValueError("vLLM script volume must use the rendered ConfigMap")
     env = [copy.deepcopy(e) for e in serving.get("env", []) if e.get("name", "").startswith(("VLLM_BUILD_", "DEEPEP_BUILD_"))]
-    if not {"VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_BASE_IMAGE_ID", "VLLM_BUILD_ROLE"}.issubset({e["name"] for e in env}):
+    required_env = {"VLLM_BUILD_MODE", "VLLM_BUILD_BASE_IMAGE_ID", "VLLM_BUILD_ROLE"}
+    if mode == "source":
+        required_env |= {"VLLM_BUILD_REF", "VLLM_BUILD_COMMIT"}
+    if deepep_enabled:
+        required_env |= {"DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT"}
+    if not required_env.issubset({e["name"] for e in env}):
         raise ValueError("vLLM prefill worker is missing build identity")
     env = [item for item in env if item["name"] not in {"VLLM_BUILD_ROLE", "LWS_WORKER_INDEX"}]
     env.extend(({"name": "VLLM_BUILD_ROLE", "value": "prefill"}, {"name": "LWS_WORKER_INDEX", "value": "0"}))
@@ -481,7 +520,7 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
                 errors.append(f"{kind}/{resource_name}: {deleted.stderr.strip()}")
         if errors:
             raise CleanupError("prebuild resource cleanup failed: " + "; ".join(errors))
-    return ref_map["data"]["VLLM_BUILD_COMMIT"]
+    return ref_map["data"]["VLLM_BUILD_COMMIT"] if mode == "source" else "nightly"
 
 
 def wait_ready(config: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
@@ -682,7 +721,7 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
         writer.writerows(rows)
     build_rows = []
     for build in summary.get("builds", []):
-        inputs = ", ".join(f"{step['action']} {step['ref']}@{step['commit'][:12]}" for step in build.get("inputs", {}).get("steps", []))
+        inputs = ", ".join(f"{step['action']} {step['ref']}@{step['commit'][:12]}" for step in build.get("inputs", {}).get("steps", [])) or "nightly image"
         deepep = build.get("inputs", {}).get("deepep")
         if deepep:
             inputs += f"; DeepEP {deepep['ref']}@{deepep['commit'][:12]}"
@@ -765,7 +804,8 @@ def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destinatio
         write_summary(destination, summary)
         cleanup_error = False
         try:
-            build = resolve_build({"repo": config["build_repo"], "steps": variant["steps"],
+            build = resolve_build({**({"repo": config["build_repo"]} if "build_repo" in config else {}),
+                                   "steps": variant.get("steps", []),
                                    **({"deepep": variant["deepep"]} if "deepep" in variant else {})}, pins)
             record["inputs"] = build
             resolved[name] = build
@@ -781,11 +821,15 @@ def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destinatio
                     raise RuntimeError(f"prebuild would modify pre-existing resources: {existing}")
                 if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
                     raise RuntimeError("prebuild requires an empty serving namespace")
-                commit = vllm_prebuild(rendered, config, overlay, overlay_folder)
-                if not commit:
+                commit = vllm_prebuild(rendered, config, overlay, overlay_folder) if build["mode"] == "source" or "deepep" in build else None
+                if (build["mode"] == "source" or "deepep" in build) and not commit:
                     raise RuntimeError(f"overlay {overlay['name']} has no compatible vLLM build script")
-                record["prebuilds"].append({"overlay": overlay["name"], "base_commit": commit,
-                                             "log": str(overlay_folder / "build.log")})
+                if commit:
+                    prebuild = {"overlay": overlay["name"], "mode": build["mode"],
+                                "log": str(overlay_folder / "build.log")}
+                    if build["mode"] == "source":
+                        prebuild["base_commit"] = commit
+                    record["prebuilds"].append(prebuild)
                 write_summary(destination, summary)
             record["status"] = "completed"
         except Exception as exc:
@@ -878,6 +922,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
                     resolved_builds[key] = resolve_build(overlay["build"])
                 build = resolved_builds[key]
                 record["vllm_build_inputs"] = build
+            build = build or {"mode": "nightly", "steps": []}
             rendered = inject_vllm_build_script(rendered, build)
             validate_manifest(rendered, config["namespace"])
             manifest.write_text(rendered)
@@ -888,17 +933,20 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
                 raise RuntimeError(f"overlay {name} cannot start while serving Pods already exist in the namespace")
             applied = True  # prebuild or apply may partially succeed; clean up the saved manifest
-            if not variant:
+            if not variant and (build["mode"] == "source" or "deepep" in build):
                 prebuild_commit = vllm_prebuild(rendered, config, overlay, folder)
                 if prebuild_commit:
-                    record["prebuild_commit"] = prebuild_commit
-                    print(f"Overlay {name} build cache prepared for {prebuild_commit[:12]}", flush=True)
+                    if build["mode"] == "source":
+                        record["prebuild_commit"] = prebuild_commit
+                    else:
+                        record["deepep_prebuilt"] = True
+                    print(f"Overlay {name} build cache prepared", flush=True)
             kube(config["namespace"], "apply", "-f", str(manifest))
             baseline = wait_ready(config, overlay)
             print(f"Overlay {name} ready: {len(baseline)} serving Pods", flush=True)
             commit = build_commit(config["namespace"])
             record["serving_pods"] = baseline
-            if commit:
+            if commit and build["mode"] == "source":
                 record["vllm_build_commit"] = commit
             (folder / "serving-pods.json").write_text(kube(config["namespace"], "get", "pods", "-l", overlay["pod_selector"], "-o", "json").stdout)
             for bench in config["benchmarks"]:

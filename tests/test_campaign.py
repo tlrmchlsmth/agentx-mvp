@@ -118,7 +118,7 @@ class CampaignTests(unittest.TestCase):
             def fake_resolve(build, pins=None):
                 name = build["steps"][-1]["ref"]
                 events.append("resolve:" + name)
-                return {"repo": build["repo"], "steps": [
+                return {"mode": "source", "repo": build["repo"], "steps": [
                     {**step, "commit": ("b" if name == "branch2" else "c") * 40} for step in build["steps"]]}
 
             def fake_prebuild(rendered, config, overlay, folder):
@@ -160,6 +160,24 @@ class CampaignTests(unittest.TestCase):
             comparison = (root / "campaigns/test-campaign/comparison.csv").read_text()
             self.assertIn("branch2,baseline,off,pd", comparison)
             self.assertIn("branch3,candidate,on,aggregate", comparison)
+
+    def test_nightly_matrix_skips_vllm_prebuild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["builds"] = [{"name": "nightly"}]
+            manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+            destination = root / "results"
+            destination.mkdir()
+            summary = {"id": config["id"], "status": "running", "overlays": []}
+            with patch.object(runner, "render_overlay", return_value=manifest), \
+                 patch.object(runner, "kube", return_value=SimpleNamespace(stdout="")), \
+                 patch.object(runner, "snapshot", return_value=[]), \
+                 patch.object(runner, "vllm_prebuild", side_effect=AssertionError("unexpected prebuild")):
+                resolved, _, failed, stopped = runner.prepare_matrix_builds(config, root, destination, summary)
+            self.assertEqual(resolved["nightly"], {"mode": "nightly", "steps": []})
+            self.assertEqual(summary["builds"][0]["prebuilds"], [])
+            self.assertFalse(failed or stopped)
 
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -333,6 +351,33 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "branch name"):
                 runner.load_config(path)
 
+    def test_nightly_build_needs_no_vllm_repo_or_git_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["builds"] = [{"name": "nightly"}]
+            path = root / "config.json"
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+            with patch.object(runner, "call", side_effect=AssertionError("unexpected Git call")):
+                self.assertEqual(runner.resolve_build({}), {"mode": "nightly", "steps": []})
+            config["builds"] = [{"name": "nightly", "steps": []}]
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+            config["builds"] = [{"name": "nightly-deepep", "deepep": {
+                "repo": "https://github.com/example/DeepEP.git", "ref": "feature"}}]
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+
+    def test_nightly_script_uses_image_without_build_inputs(self):
+        script = MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh"
+        result = subprocess.run(["bash", "-c", 'source "$1"', "bash", str(script)],
+                                capture_output=True, text=True,
+                                env={**os.environ, "VLLM_BUILD_MODE": "nightly", "DEEPEP_BUILD_ENABLED": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Using vLLM from the runtime image", result.stdout)
+        self.assertNotIn("VLLM_BUILD_REF is not set", result.stderr)
+
     def test_full_build_script_keeps_publisher_commands(self):
         script = MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh"
         deepep_script = MODULE_PATH.parents[1] / "campaign/deepep-wheel-build.sh"
@@ -463,6 +508,22 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("VLLM_BUILD_ACTIONS", {item["name"] for item in job_pod["containers"][0]["env"]})
             self.assertIn("DEEPEP_BUILD_COMMIT", {item["name"] for item in job_pod["containers"][0]["env"]})
             self.assertEqual((root / "build.log").read_text(), "cache hit\n")
+
+            nightly = runner.inject_vllm_build_script(manifest, {"mode": "nightly", "steps": []})
+            nightly_docs = list(yaml.safe_load_all(nightly))
+            self.assertNotIn("VLLM_BUILD_COMMIT", nightly_docs[1]["data"])
+            nightly_env = {item["name"]: item for item in nightly_docs[-1]["spec"]["leaderWorkerTemplate"]
+                           ["workerTemplate"]["spec"]["containers"][0]["env"]}
+            self.assertEqual(nightly_env["VLLM_BUILD_MODE"]["value"], "nightly")
+            self.assertNotIn("VLLM_BUILD_REF", nightly_env)
+            self.assertNotIn("VLLM_BUILD_COMMIT", nightly_env)
+            self.assertIsNone(runner.vllm_prebuild(nightly, config, config["overlays"][0], root))
+
+            nightly_deepep = runner.inject_vllm_build_script(manifest, {
+                "mode": "nightly", "steps": [], "deepep": build["deepep"]})
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                self.assertEqual(runner.vllm_prebuild(nightly_deepep, config, config["overlays"][0], root),
+                                 "nightly")
 
     def test_live_submitters_use_campaign_source_without_build_marker(self):
         with tempfile.TemporaryDirectory() as directory:

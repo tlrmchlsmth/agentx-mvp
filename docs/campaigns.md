@@ -1,8 +1,8 @@
 # Overlay benchmark campaigns
 
-A campaign config is one experiment matrix: named vLLM builds, concrete llm-d
-Kustomize overlays, and AIPerf/nyann sweeps. The runner resolves every build
-branch to an exact commit and warms the shared wheel cache for **all builds
+A campaign config is one experiment matrix: optional named vLLM builds, concrete llm-d
+Kustomize overlays, and AIPerf/nyann sweeps. For branch builds, the runner resolves
+each branch to an exact commit and warms the shared wheel cache for **all builds
 before deploying any serving overlay**. It then benchmarks every build ×
 overlay combination in a dedicated namespace, deploying one at a time and
 removing it before the next. One Kueue campaign
@@ -14,21 +14,22 @@ must never use that queue or it could block its own children.
 
 1. Copy `examples/campaign.example.json`. Set `source.repo` and `source.ref`
    to the llm-d fork and branch/tag/commit that contains the overlays. Set
-   `build_repo` and list named `builds`, each with ordered `steps`. The first
+   `build_repo` and list named `builds` with ordered `steps` when comparing vLLM
+   branches. The first
    action is `checkout`; later actions can be `merge`, `cherry-pick`,
    `cherry-pick-mN`, or `cherry-pick-parent1`. A build may also include
    `"deepep": {"repo": "https://github.com/your-org/DeepEP.git", "ref": "feature-branch"}`.
    Omit it to keep the runtime image's DeepEP installation. When included,
    the campaign pins that branch to an exact commit, builds its wheel after
-   vLLM, and reuses the shared DeepEP wheel cache across compatible builds and
+   the chosen vLLM is available, and reuses the shared DeepEP wheel cache across compatible builds and
    overlays. The build Job and serving Pods install the same cached wheel.
    Increase `rollout_timeout_seconds` if building both wheels needs more time.
    List concrete Kustomize overlay
    paths relative to llm-d. Use `dimensions` to label MTP, offloading,
    topology, PD size, or other settings in the final report. Each overlay also
    needs its serving Pod selector and expected Pod count. The runner fetches
-   llm-d once and resolves every vLLM branch once. Container images referenced
-   by overlays must already be available. Each matrix overlay needs a compatible vLLM wheel build
+   llm-d once and resolves every requested vLLM branch once. Container images referenced
+   by overlays must already be available. A source build needs a compatible vLLM wheel build
    script, a `vllm-build-ref` ConfigMap, and a LeaderWorkerSet that sources the script. The runner
    replaces that script in the rendered manifest with
    [`campaign/vllm-wheel-build.sh`](../campaign/vllm-wheel-build.sh) from this PR.
@@ -71,7 +72,13 @@ repository or cluster permissions.
 The main example shows two builds (`branch0 + branch1 + branch2` and
 `branch0 + branch1 + branch3`) crossed with three overlays. Each overlay path
 must point to a complete Kustomize deployment; `dimensions` are report labels,
-not manifest patches. For a legacy single-overlay campaign without top-level
+not manifest patches. To use each overlay's nightly image, omit `build_repo`
+and `builds` entirely. To compare nightly with source builds, add
+`{"name": "nightly"}` to the `builds` list; that entry has no `steps` and uses
+the image unchanged. A nightly entry can still specify `deepep` to build only
+DeepEP. Nightly runs have no vLLM wheel prebuild; DeepEP-only runs prebuild its
+wheel. The saved `serving-pods.json` records the image ID used by each deployment.
+For a legacy single-overlay campaign without top-level
 `builds`, an overlay may still have its own `build` field:
 
 ```json
@@ -103,15 +110,15 @@ cluster without pushing an integration branch.
 
 The campaign Job runs in the configured namespace. It is queued by Kueue,
 fetches the selected llm-d fork/ref once, saves its resolved commit, then
-renders each overlay with `kubectl kustomize`. For every named build and
-overlay, it prepares the exact runtime wheel in the shared cache and removes
-the temporary build Job and ConfigMaps. Logs are saved under
+renders each overlay with `kubectl kustomize`. For every requested source or
+DeepEP build and overlay, it prepares the runtime wheel in the shared cache and removes
+the temporary build Job and ConfigMaps. Logs for those builds are saved under
 `builds/<build>/<overlay>/build.log`. After all builds finish, it saves each
 combination's rendered manifest and SHA-256 hash, checks that its resources do
 not pre-exist, and applies the
 manifest, waits for the configured Pod selector to match exactly
-`expected_pods` Ready Pods, and records Pod UIDs plus the vLLM build commit.
-After each benchmark it checks that those Pod UIDs and the build commit are
+`expected_pods` Ready Pods, and records Pod UIDs plus any source vLLM build commit.
+After each benchmark it checks that those Pod UIDs and any build commit are
 unchanged. A failed or timed-out benchmark is marked failed; a timed-out child
 Job is deleted before overlay cleanup. Cleanup always attempts to delete the
 saved rendered manifest and waits for serving Pods to disappear. If cleanup

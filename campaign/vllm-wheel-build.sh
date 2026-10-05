@@ -137,6 +137,29 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   exit $?
 fi
 
+VLLM_BUILD_MODE=${VLLM_BUILD_MODE:-source}
+case "$VLLM_BUILD_MODE" in
+  nightly)
+    # No branch recipe: leave the image's vLLM and its dependencies untouched.
+    case "${DEEPEP_BUILD_ENABLED:-0}" in
+      0) echo "Using vLLM from the runtime image."; return 0 ;;
+      1)
+        BASE_RUNTIME_IMAGE_ID=${VLLM_BUILD_BASE_IMAGE_ID:-unspecified}
+        BASE_RUNTIME_TORCH_VERSION=$(cd / && python3 -c 'import torch; print(torch.__version__)')
+        BASE_RUNTIME_CUDA_VERSION=$(cd / && python3 -c 'import torch; print(torch.version.cuda or "none")')
+        BASE_RUNTIME_PYTHON_ABI=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("SOABI") or "unknown")')
+        BUILD_LEADER=0
+        if [ "${VLLM_BUILD_ROLE:-}" = "prefill" ] && [ "${LWS_WORKER_INDEX:-}" = "0" ]; then
+          BUILD_LEADER=1
+        fi
+        source "$(dirname "${BASH_SOURCE[0]}")/deepep-wheel-build.sh"
+        return 0 ;;
+      *) echo "FATAL: DEEPEP_BUILD_ENABLED must be 0 or 1."; exit 1 ;;
+    esac ;;
+  source) ;;
+  *) echo "FATAL: VLLM_BUILD_MODE must be nightly or source."; exit 1 ;;
+esac
+
 BUILD_BRANCH=${VLLM_BUILD_REF:?FATAL: VLLM_BUILD_REF is not set; set a pinned build ref in the overlay first.}
 BUILD_SHA=${VLLM_BUILD_COMMIT:?FATAL: VLLM_BUILD_COMMIT is not set; set a pinned build ref in the overlay first.}
 if ! [[ "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
