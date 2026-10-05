@@ -10,19 +10,21 @@ must never use that queue or it could block its own children.
 
 ## Prepare
 
-1. Put the Kustomize overlay repository into the runner image. The orchestrator
-   Dockerfile accepts `CAMPAIGN_OVERLAY_REPO` and a pinned `CAMPAIGN_OVERLAY_REF`
-   at build time and installs them at `/workspace/overlays`. Alternatively,
-   overlays already under `/workspace/llm-manifesto` can use that as
-   `overlay_root`. Use a fixed revision and immutable image reference for
-   repeatable comparisons.
-2. Copy `examples/campaign.kimi-k3.json` and set the real overlay paths, Pod
-   selectors and expected serving Pod counts. Each overlay must render a
-   **complete, disposable, namespaced** deployment. Resources that already
-   exist are rejected so cleanup cannot delete shared infrastructure. Do not
-   put the results PVC, Kueue objects, namespace, or shared monitoring stack
-   in these overlays. The overlay should include `vllm-build-ref`, because the
-   live benchmark scripts record its published commit.
+1. Copy `examples/campaign.example.json`. Set `source.repo` to the llm-d
+   fork and `source.ref` to the branch, tag, or commit to benchmark. List the
+   Kustomize overlay paths relative to that repository, with each overlay's
+   serving Pod selector and expected Pod count. The campaign Job fetches the
+   source once at run time, resolves it to a commit, and uses that checkout for
+   every overlay. Changing forks or branches does not require rebuilding the
+   campaign image. Container images referenced by those overlays must already
+   be published; the campaign checks out deployment manifests but does not
+   build llm-d images.
+2. Each overlay must render a **complete, disposable, namespaced** deployment.
+   Resources that already exist are rejected so cleanup cannot delete shared
+   infrastructure. Do not put the results PVC, Kueue objects, namespace, or
+   shared monitoring stack in these overlays. The overlay should include
+   `vllm-build-ref`, because the current live benchmark scripts record its
+   published vLLM commit separately from the llm-d source commit.
 3. Ensure the results PVC is ReadWriteMany, mounted by both benchmark Jobs and
    the campaign Job, and that the AIPerf and nyann images/secrets are available.
    `campaign-setup` installs a namespace Role that can apply the resource kinds
@@ -31,24 +33,24 @@ must never use that queue or it could block its own children.
 
 ```bash
 export NAMESPACE=vllm
-export CAMPAIGN_OVERLAY_REPO=https://github.com/your-org/your-overlays.git
-export CAMPAIGN_OVERLAY_REF=<exact-commit-sha>
 export CAMPAIGN_IMAGE=quay.io/your-org/benchmark-orchestrator:<immutable-tag>
 just campaign-build
 just campaign-push
 just live-benchmark-kueue-setup "$NAMESPACE"
 just campaign-setup "$NAMESPACE"
-just campaign-validate examples/campaign.kimi-k3.json
-just campaign-submit examples/campaign.kimi-k3.json
+just campaign-validate examples/campaign.example.json
+just campaign-submit examples/campaign.example.json
 ```
 
-The example overlay paths and model label are placeholders; edit them for the
-actual deployment before submitting. `campaign-validate` checks the experiment
-file locally. It cannot validate paths inside the image or cluster permissions.
+The example fork URL, branch, overlay paths, and model label are placeholders;
+edit them for the actual deployment before submitting. `campaign-validate`
+checks the experiment file locally. It cannot validate paths in the remote
+repository or cluster permissions.
 
 ## Execution and results
 
-The campaign Job runs in the configured namespace. It is queued by Kueue, then
+The campaign Job runs in the configured namespace. It is queued by Kueue,
+fetches the selected llm-d fork/ref once, saves its resolved commit, then
 renders each overlay with `kubectl kustomize`, stores the rendered manifest and
 its SHA-256 hash, and checks that its resources do not pre-exist. It applies the
 manifest, waits for the configured Pod selector to match exactly
@@ -66,7 +68,8 @@ kubectl -n vllm logs -f job/campaign-example-overlay-sweep-001
 
 Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
 
-- `campaign.json`: the exact campaign request.
+- `campaign.json`: the exact campaign request, including fork and ref.
+- `source-commit.txt`: the resolved llm-d commit shared by all overlays.
 - `<overlay>/manifest.yaml`, `serving-pods.json`, and submit logs.
 - `summary.json`: each overlay, benchmark Job, status, artifact path, and AIPerf
   measurements.

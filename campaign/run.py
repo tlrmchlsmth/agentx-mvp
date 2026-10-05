@@ -9,9 +9,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
+import tempfile
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +23,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 JOB_LINE = re.compile(r"^Job queued: ([a-z0-9-]+) ", re.MULTILINE)
+GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 
 
 class CleanupError(RuntimeError):
@@ -27,8 +31,8 @@ class CleanupError(RuntimeError):
 
 
 def call(args: list[str], *, input_text: str | None = None, env: dict[str, str] | None = None,
-         check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, input=input_text, text=True, capture_output=True, env=env)
+         check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(args, input=input_text, text=True, capture_output=True, env=env, timeout=timeout)
     if check and result.returncode:
         raise RuntimeError(f"{' '.join(args)} failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}")
     return result
@@ -50,7 +54,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text())
     if not isinstance(config, dict):
         raise ValueError("campaign must be a JSON object")
-    allowed = {"id", "namespace", "overlay_root", "results_pvc", "benchmark_queue",
+    allowed = {"id", "namespace", "source", "results_pvc", "benchmark_queue",
                "campaign_queue", "overlays", "benchmarks", "rollout_timeout_seconds",
                "admission_timeout_seconds", "cleanup_timeout_seconds", "continue_on_failure"}
     if set(config) - allowed:
@@ -59,9 +63,17 @@ def load_config(path: Path) -> dict[str, Any]:
         required_name(config.get(key), key)
     for key in ("benchmark_queue", "campaign_queue"):
         required_name(config.get(key), key)
-    root = config.get("overlay_root")
-    if not isinstance(root, str) or not Path(root).is_absolute():
-        raise ValueError("overlay_root must be an absolute path inside the runner image")
+    source = config.get("source")
+    if not isinstance(source, dict) or set(source) != {"repo", "ref"}:
+        raise ValueError("source needs repo and ref")
+    repo, ref = source["repo"], source["ref"]
+    if not isinstance(repo, str):
+        raise ValueError("source.repo must be an HTTPS Git URL")
+    parsed = urlsplit(repo)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("source.repo must be an HTTPS Git URL without credentials")
+    if not isinstance(ref, str) or not GIT_REF.fullmatch(ref) or ".." in ref or ref.endswith(".lock"):
+        raise ValueError("source.ref must be a branch, tag, or commit")
     for key, default, low, high in (("rollout_timeout_seconds", 3600, 60, 21600),
                                     ("admission_timeout_seconds", 3600, 60, 21600),
                                     ("cleanup_timeout_seconds", 600, 60, 3600)):
@@ -85,7 +97,7 @@ def load_config(path: Path) -> dict[str, Any]:
         seen.add(name)
         path = overlay["path"]
         if not isinstance(path, str) or not path or Path(path).is_absolute() or ".." in Path(path).parts:
-            raise ValueError(f"overlay {name} path must be relative to overlay_root")
+            raise ValueError(f"overlay {name} path must be relative to the llm-d repository")
         for key in ("model_label", "pod_selector"):
             if not isinstance(overlay[key], str) or not overlay[key].strip() or "\n" in overlay[key]:
                 raise ValueError(f"overlay {name} requires {key}")
@@ -119,6 +131,25 @@ def load_config(path: Path) -> dict[str, Any]:
         if any(len(f"{config['id']}-{overlay['name']}-{tool}") > 120 for tool in tools):
             raise ValueError("campaign/overlay names produce a run ID longer than 120 characters")
     return config
+
+
+def fetch_source(source: dict[str, str]) -> tuple[Path, str]:
+    """Resolve one fork/ref once, so every overlay uses the same exact commit."""
+    checkout = Path(tempfile.mkdtemp(prefix="llmd-campaign-"))
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        call(["git", "init", "-q", str(checkout)], env=env, timeout=60)
+        call(["git", "-C", str(checkout), "remote", "add", "origin", source["repo"]], env=env, timeout=60)
+        call(["git", "-C", str(checkout), "fetch", "--depth", "1", "origin", source["ref"]], env=env, timeout=600)
+        call(["git", "-C", str(checkout), "checkout", "-q", "--detach", "FETCH_HEAD"], env=env, timeout=120)
+        commit = call(["git", "-C", str(checkout), "rev-parse", "HEAD"], env=env, timeout=60).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise RuntimeError("could not resolve source commit")
+        return checkout, commit
+    except Exception:
+        shutil.rmtree(checkout)
+        raise
 
 
 def validate_manifest(rendered: str, namespace: str) -> None:
@@ -297,11 +328,22 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
 
 
 def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
-    overlay_root = Path(config["overlay_root"]).resolve(strict=True)
     destination = results_root / "campaigns" / config["id"]
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "campaign.json").write_text(json.dumps(config, indent=2) + "\n")
     summary: dict[str, Any] = {"id": config["id"], "status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "overlays": []}
+    write_summary(destination, summary)
+    try:
+        overlay_root, source_commit = fetch_source(config["source"])
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["error"] = f"llm-d source checkout failed: {exc}"
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_summary(destination, summary)
+        raise
+    overlay_root = overlay_root.resolve(strict=True)
+    summary["source_commit"] = source_commit
+    (destination / "source-commit.txt").write_text(source_commit + "\n")
     write_summary(destination, summary)
     failed = False
     for overlay in config["overlays"]:
@@ -372,6 +414,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             write_summary(destination, summary)
         if record.get("cleanup_error") or (record["status"] == "failed" and not config["continue_on_failure"]):
             break
+    shutil.rmtree(overlay_root)
     summary["status"] = "failed" if failed else "completed"
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
     write_summary(destination, summary)
@@ -433,7 +476,7 @@ def main() -> int:
             submit(config, args.image, args.service_account)
             return 0
         return run(config)
-    except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+    except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         print(f"campaign: {exc}", file=sys.stderr)
         return 1
 

@@ -10,11 +10,12 @@ with [the service contract and deployment guide](docs/agentx-service.md).
 
 ## Overlay campaigns
 
-To compare several deployment overlays, run a single campaign that deploys each
-Kustomize overlay, waits for serving readiness, runs the same benchmark sweeps,
-saves the results, and tears it down before starting the next. See
+To compare several deployment overlays, point a campaign at an llm-d fork and
+branch or commit, then list its Kustomize overlay paths. The runner deploys each
+overlay, waits for serving readiness, runs the same benchmark sweeps, saves the
+results, and tears it down before starting the next. See
 [overlay campaign setup](docs/campaigns.md) and
-[the campaign configuration example](examples/campaign.kimi-k3.json).
+[the campaign configuration example](examples/campaign.example.json).
 
 ## Live llm-d sweep
 

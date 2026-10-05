@@ -19,13 +19,14 @@ class CampaignTests(unittest.TestCase):
         for name in ("baseline", "candidate"):
             (root / name).mkdir()
         return {
-            "id": "test-campaign", "namespace": "vllm", "overlay_root": str(root),
+            "id": "test-campaign", "namespace": "vllm",
+            "source": {"repo": "https://github.com/example/llm-d.git", "ref": "feature/bench"},
             "results_pvc": "results", "benchmark_queue": "live-benchmark-client",
             "campaign_queue": "benchmark-campaign", "rollout_timeout_seconds": 60,
             "admission_timeout_seconds": 60, "cleanup_timeout_seconds": 60,
             "continue_on_failure": False,
-            "overlays": [{"name": name, "path": name, "model_label": "kimi-k3",
-                          "pod_selector": "app=kimi-k3", "expected_pods": 2}
+            "overlays": [{"name": name, "path": name, "model_label": "test-model",
+                          "pod_selector": "app=test-model", "expected_pods": 2}
                          for name in ("baseline", "candidate")],
             "benchmarks": [{"tool": "aiperf", "concurrencies": [1, 4], "duration_seconds": 60}],
         }
@@ -69,20 +70,61 @@ class CampaignTests(unittest.TestCase):
                 return {"tool": "aiperf", "status": "completed", "job": "job-" + overlay["name"],
                         "artifacts": "/workload/aiperf-agentx/example", "measurements": []}
 
-            with patch.object(runner, "call", side_effect=fake_call), \
+            with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
+                 patch.object(runner.shutil, "rmtree"), \
+                 patch.object(runner, "call", side_effect=fake_call), \
                  patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner, "snapshot", return_value=[]), \
                  patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
                  patch.object(runner, "build_commit", return_value="a" * 40), \
                  patch.object(runner, "submit_benchmark", side_effect=fake_submit), \
                  patch.object(runner, "wait_gone"):
-                self.assertEqual(runner.run(config, root), 0)
+                self.assertEqual(runner.run(config, root), 0, (root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(actions, ["render:baseline", "check", "apply", "get", "benchmark:baseline", "delete",
                                        "render:candidate", "check", "apply", "get", "benchmark:candidate", "delete"])
             summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(summary["status"], "completed")
+            self.assertEqual(summary["source_commit"], "a" * 40)
             self.assertEqual(len(summary["overlays"]), 2)
             self.assertTrue((root / "campaigns/test-campaign/index.html").exists())
+
+    def test_rejects_unsafe_source_and_records_checkout_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            path = root / "config.json"
+            config["source"]["repo"] = "https://user:secret@github.com/example/llm-d.git"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "without credentials"):
+                runner.load_config(path)
+            config["source"]["repo"] = "https://github.com/example/llm-d.git"
+            config["source"]["ref"] = "-unsafe"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "branch, tag, or commit"):
+                runner.load_config(path)
+            config["source"]["ref"] = "feature/bench"
+            with patch.object(runner, "fetch_source", side_effect=RuntimeError("ref not found")):
+                with self.assertRaisesRegex(RuntimeError, "ref not found"):
+                    runner.run(config, root)
+            summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
+            self.assertEqual(summary["status"], "failed")
+            self.assertIn("ref not found", summary["error"])
+
+    def test_fetches_selected_fork_ref_once(self):
+        calls = []
+
+        def fake_call(args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(stdout="b" * 40 + "\n", returncode=0)
+
+        with patch.object(runner, "call", side_effect=fake_call):
+            checkout, commit = runner.fetch_source({"repo": "https://github.com/example/llm-d.git", "ref": "feature/bench"})
+        try:
+            self.assertEqual(commit, "b" * 40)
+            self.assertEqual(calls[1][-2:], ["origin", "https://github.com/example/llm-d.git"])
+            self.assertEqual(calls[2][-2:], ["origin", "feature/bench"])
+        finally:
+            runner.shutil.rmtree(checkout)
 
     def test_submit_uses_separate_campaign_queue_and_results_pvc(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -119,7 +161,9 @@ class CampaignTests(unittest.TestCase):
                     return SimpleNamespace(stdout="", stderr="teardown failed", returncode=1)
                 return SimpleNamespace(stdout="", stderr="", returncode=0)
 
-            with patch.object(runner, "call", return_value=SimpleNamespace(stdout=manifest)), \
+            with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
+                 patch.object(runner.shutil, "rmtree"), \
+                 patch.object(runner, "call", return_value=SimpleNamespace(stdout=manifest)), \
                  patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner, "snapshot", return_value=[]), \
                  patch.object(runner, "wait_ready", side_effect=RuntimeError("not ready")):

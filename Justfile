@@ -37,8 +37,6 @@ orchestrator_image := env_var_or_default('ORCHESTRATOR_IMAGE', 'quay.io/tms/benc
 agentx_service_image := env_var_or_default('AGENTX_SERVICE_IMAGE', 'quay.io/tms/agentx-service:0.1.0')
 orchestrator_manifesto_repo := env_var_or_default('ORCHESTRATOR_MANIFESTO_REPO', 'https://github.com/tlrmchlsmth/llm-manifesto.git')
 orchestrator_manifesto_ref := env_var_or_default('ORCHESTRATOR_MANIFESTO_REF', 'main')
-campaign_overlay_repo := env_var_or_default('CAMPAIGN_OVERLAY_REPO', '')
-campaign_overlay_ref := env_var_or_default('CAMPAIGN_OVERLAY_REF', '')
 campaign_image := env_var_or_default('CAMPAIGN_IMAGE', 'quay.io/tms/benchmark-campaign:amd64')
 orchestrator_deploy := "benchmark-orchestrator"
 orchestrator_spec_configmap := "benchmark-orchestrator-spec"
@@ -85,10 +83,7 @@ campaign-submit config:
 
 campaign-build:
     podman build --platform linux/amd64 \
-      --build-arg MANIFESTO_REPO="{{orchestrator_manifesto_repo}}" \
-      --build-arg MANIFESTO_REF="{{orchestrator_manifesto_ref}}" \
-      --build-arg CAMPAIGN_OVERLAY_REPO="{{campaign_overlay_repo}}" \
-      --build-arg CAMPAIGN_OVERLAY_REF="{{campaign_overlay_ref}}" \
+      --build-arg CAMPAIGN_ONLY=true \
       -f Dockerfile.orchestrator -t {{campaign_image}} .
 
 campaign-push:
