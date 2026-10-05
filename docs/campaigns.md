@@ -16,7 +16,14 @@ must never use that queue or it could block its own children.
    to the llm-d fork and branch/tag/commit that contains the overlays. Set
    `build_repo` and list named `builds`, each with ordered `steps`. The first
    action is `checkout`; later actions can be `merge`, `cherry-pick`,
-   `cherry-pick-mN`, or `cherry-pick-parent1`. List concrete Kustomize overlay
+   `cherry-pick-mN`, or `cherry-pick-parent1`. A build may also include
+   `"deepep": {"repo": "https://github.com/your-org/DeepEP.git", "ref": "feature-branch"}`.
+   Omit it to keep the runtime image's DeepEP installation. When included,
+   the campaign pins that branch to an exact commit, builds its wheel after
+   vLLM, and reuses the shared DeepEP wheel cache across compatible builds and
+   overlays. The build Job and serving Pods install the same cached wheel.
+   Increase `rollout_timeout_seconds` if building both wheels needs more time.
+   List concrete Kustomize overlay
    paths relative to llm-d. Use `dimensions` to label MTP, offloading,
    topology, PD size, or other settings in the final report. Each overlay also
    needs its serving Pod selector and expected Pod count. The runner fetches
@@ -120,7 +127,7 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
 - `campaign.json`: the exact campaign request, including fork and ref.
 - `source-commit.txt`: the resolved llm-d commit shared by all overlays.
 - `builds/<build>/<overlay>/build.log`: cache hit or build details for each
-  build/runtime combination.
+  build/runtime combination, including optional DeepEP builds.
 - `<build>-<overlay>/manifest.yaml`, `serving-pods.json`, and submit logs.
 - `summary.json`: resolved build inputs, every combination, benchmark status,
   artifacts, and per-concurrency AIPerf and nyann measurements.

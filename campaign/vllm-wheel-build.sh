@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # vLLM wheel build for benchmark campaign serving Pods and cache warmup Jobs.
 # Source in the pinned vLLM runtime image; both paths use the same script and
 # shared RWX cache. The build ref and full commit come from the overlay.
@@ -814,125 +815,12 @@ for f in $REUSE_FILES; do
 done
 
 
-#DEEPEP_REPO=https://github.com/elvircrn/DeepEP.git
-#DEEPEP_BRANCH=combine_epilogue_small_batch
-## Bump when the DeepEP build RECIPE changes (part of the cache key).
-#DEEPEP_VARIANT=v9-dispatch-phase-lineinfo
-#
-## Dispatch kernels are JIT-compiled when each worker starts. Keep source-line
-## correlation and compiler resource diagnostics enabled for this profiling
-## branch; these exports persist because this build script is sourced.
-#DEEPEP_SHA=$(git ls-remote "$DEEPEP_REPO" "$DEEPEP_BRANCH" | cut -f1)
-#if [ -z "$DEEPEP_SHA" ]; then
-#  echo "FATAL: could not resolve DeepEP ${DEEPEP_BRANCH} via ls-remote."
-#  exit 1
-#fi
-#
-#echo "DeepEP ${DEEPEP_BRANCH}: ${DEEPEP_SHA}"
-#DEEPEP_KEY="${DEEPEP_SHA:0:12}-${DEEPEP_VARIANT}"
-#DEEPEP_CACHE=/shared/vllm-build/deepep_build/${DEEPEP_KEY}
-#DEEPEP_WHEEL_DIR="${DEEPEP_CACHE}/wheel"
-#
-#DEEPEP_NEED_BUILD=1
-#if ls "${DEEPEP_WHEEL_DIR}"/deep_ep-*.whl >/dev/null 2>&1; then
-#  DEEPEP_WHEEL=$(ls -t "${DEEPEP_WHEEL_DIR}"/deep_ep-*.whl | head -1)
-#  if python3 -c "import zipfile,sys; sys.exit(0 if zipfile.is_zipfile('$DEEPEP_WHEEL') and zipfile.ZipFile('$DEEPEP_WHEEL').testzip() is None else 1)" 2>/dev/null; then
-#    echo "Installing cached DeepEP wheel (${DEEPEP_SHA}): $(basename "$DEEPEP_WHEEL")"
-#    if uv pip install --system --force-reinstall --no-deps "$DEEPEP_WHEEL"; then
-#      DEEPEP_NEED_BUILD=0
-#    else
-#      echo "WARN: cached DeepEP wheel install failed; removing and rebuilding: $DEEPEP_WHEEL"
-#      rm -f "$DEEPEP_WHEEL"
-#    fi
-#  else
-#    echo "WARN: cached DeepEP wheel is corrupt; removing and rebuilding: $DEEPEP_WHEEL"
-#    rm -f "$DEEPEP_WHEEL"
-#  fi
-#fi
-#
-#if [ "$DEEPEP_NEED_BUILD" = 1 ]; then
-#  command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1; }
-#  rm -rf /tmp/deepep-src
-#  mkdir -p /tmp/deepep-src && cd /tmp/deepep-src
-#  git init -q
-#  git fetch --depth=1 -q "$DEEPEP_REPO" "$DEEPEP_SHA" || { echo "FATAL: DeepEP fetch failed"; exit 1; }
-#  git checkout -q FETCH_HEAD || { echo "FATAL: DeepEP checkout failed"; exit 1; }
-#  echo "Building DeepEP ${DEEPEP_BRANCH} (${DEEPEP_SHA})..."
-#  uv pip install --system -q setuptools wheel setuptools_scm ninja cmake || { echo "FATAL: DeepEP build-deps install failed"; exit 1; }
-#  mkdir -p "$DEEPEP_WHEEL_DIR" "${DEEPEP_CACHE}/logs"
-#  DEEPEP_LOCAL=/tmp/deepep-wheel-out
-#  rm -rf "$DEEPEP_LOCAL" && mkdir -p "$DEEPEP_LOCAL"
-#  DEEPEP_LOG="${DEEPEP_CACHE}/logs/build-${HOSTNAME:-$(hostname)}.log"
-#  # DeepEP's JIT wrapper (csrc/jit/compiler.hpp) #includes <nvrtc.h>
-#  # and links libnvrtc, but the base image ships these only under the
-#  # pip nvidia-cuda-nvrtc dir, not /usr/local/cuda/include. Add the
-#  # header dir to CPATH (nvcc's host preprocessor honors it) and the
-#  # lib dir to LIBRARY_PATH so the extension compiles + links.
-#  NVRTC_HDR=$(find /usr/local/cuda* \
-#    /usr/local/lib/python3.12/dist-packages/nvidia \
-#    -name 'nvrtc.h' 2>/dev/null | head -1)
-#  if [ -n "$NVRTC_HDR" ]; then
-#    export CPATH="$(dirname "$NVRTC_HDR"):${CPATH}"
-#    echo "Using nvrtc.h: $NVRTC_HDR"
-#  else
-#    echo "WARN: nvrtc.h not found; DeepEP build may fail."
-#  fi
-#  NVRTC_SO=$(find /usr/local/cuda* \
-#    /usr/local/lib/python3.12/dist-packages/nvidia \
-#    -name 'libnvrtc.so*' 2>/dev/null | sort | head -1)
-#  if [ -n "$NVRTC_SO" ]; then
-#    export LIBRARY_PATH="$(dirname "$NVRTC_SO"):${LIBRARY_PATH}"
-#    export LD_LIBRARY_PATH="$(dirname "$NVRTC_SO"):${LD_LIBRARY_PATH}"
-#    echo "Using libnvrtc: $NVRTC_SO"
-#  fi
-#  # DeepEP links the pip-provided NCCL and NVSHMEM libraries by exact,
-#  # unversioned filenames (-l:libnccl.so and -l:libnvshmem_host.so).
-#  # Runtime images may contain only versioned files, without the development
-#  # symlinks normally supplied by -dev packages. Expose canonical names in a
-#  # private linker directory while retaining the real dirs for runtime lookup.
-#  DEEPEP_LINK_DIR=/tmp/deepep-link
-#  rm -rf "$DEEPEP_LINK_DIR" && mkdir -p "$DEEPEP_LINK_DIR"
-#  NCCL_SO=$(find /usr/local/lib/python3.12/dist-packages/nvidia \
-#    /usr/local/cuda* /usr/lib/x86_64-linux-gnu /usr/lib \
-#    -type f -name 'libnccl.so*' 2>/dev/null | sort | head -1)
-#  if [ -n "$NCCL_SO" ]; then
-#    ln -sf "$NCCL_SO" "$DEEPEP_LINK_DIR/libnccl.so"
-#    ln -sf "$NCCL_SO" "$DEEPEP_LINK_DIR/libnccl.so.2"
-#    export LD_LIBRARY_PATH="$(dirname "$NCCL_SO"):${LD_LIBRARY_PATH:-}"
-#    echo "Using libnccl: $NCCL_SO"
-#  else
-#    echo "WARN: libnccl.so not found; DeepEP link may fail."
-#  fi
-#  NVSHMEM_HOST_SO=$(find /usr/local/lib/python3.12/dist-packages/nvidia \
-#    /usr/local/cuda* /usr/lib/x86_64-linux-gnu /usr/lib \
-#    -type f -name 'libnvshmem_host.so*' 2>/dev/null | sort | head -1)
-#  if [ -n "$NVSHMEM_HOST_SO" ]; then
-#    ln -sf "$NVSHMEM_HOST_SO" "$DEEPEP_LINK_DIR/libnvshmem_host.so"
-#    export LD_LIBRARY_PATH="$(dirname "$NVSHMEM_HOST_SO"):${LD_LIBRARY_PATH:-}"
-#    echo "Using libnvshmem_host: $NVSHMEM_HOST_SO"
-#  else
-#    echo "WARN: libnvshmem_host.so not found; DeepEP link may fail."
-#  fi
-#  export LIBRARY_PATH="${DEEPEP_LINK_DIR}:${LIBRARY_PATH:-}"
-#  set -o pipefail
-#  if TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=${MAX_JOBS:-$(nproc)} NVCC_THREADS=${NVCC_THREADS:-8} \
-#       uv build --wheel --no-build-isolation -o "$DEEPEP_LOCAL" . 2>&1 | tee "$DEEPEP_LOG"; then
-#    for w in "$DEEPEP_LOCAL"/deep_ep-*.whl; do
-#      bn=$(basename "$w")
-#      cp "$w" "${DEEPEP_WHEEL_DIR}/.${bn}.$$.tmp"
-#      mv -f "${DEEPEP_WHEEL_DIR}/.${bn}.$$.tmp" "${DEEPEP_WHEEL_DIR}/${bn}"
-#    done
-#    DEEPEP_WHEEL=$(ls -t "${DEEPEP_WHEEL_DIR}"/deep_ep-*.whl | head -1)
-#    uv pip install --system --force-reinstall --no-deps "$DEEPEP_WHEEL" || { echo "FATAL: built DeepEP wheel install failed"; exit 1; }
-#    echo "Built + published DeepEP ${DEEPEP_BRANCH} (${DEEPEP_SHA}) -> ${DEEPEP_WHEEL_DIR}"
-#  else
-#    echo "FATAL: DeepEP build failed; log at ${DEEPEP_LOG}; not publishing."
-#    exit 1
-#  fi
-#  cd
-#  rm -rf /tmp/deepep-src "$DEEPEP_LOCAL"
-#fi
-
+DEEPEP_BUILD_ENABLED=${DEEPEP_BUILD_ENABLED:-0}
+case "$DEEPEP_BUILD_ENABLED" in
+  0) ;;
+  1) source "$(dirname "${BASH_SOURCE[0]}")/deepep-wheel-build.sh" ;;
+  *) echo "FATAL: DEEPEP_BUILD_ENABLED must be 0 or 1."; exit 1 ;;
+esac
 # Bump the engine<->frontend startup handshake timeout (hardcoded
 # 5 min in vllm/v1/engine/core.py -- no env/flag). Heavy multinode
 # boot + slow W4A8 weight load can blow past 5 min before the

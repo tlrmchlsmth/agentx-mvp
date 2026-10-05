@@ -8,12 +8,12 @@
       {"ref": "branch0", "action": "checkout"},
       {"ref": "branch1", "action": "merge"},
       {"ref": "branch2", "action": "cherry-pick"}
-    ]},
+    ], "deepep": {"repo": "https://github.com/your-org/DeepEP.git", "ref": "your-deepep-branch"}},
     {"name": "branch3", "steps": [
       {"ref": "branch0", "action": "checkout"},
       {"ref": "branch1", "action": "merge"},
       {"ref": "branch3", "action": "cherry-pick"}
-    ]}
+    ], "deepep": {"repo": "https://github.com/your-org/DeepEP.git", "ref": "your-deepep-branch"}}
   ],
   "results_pvc": "agentx-results",
   "benchmark_queue": "live-benchmark-client",

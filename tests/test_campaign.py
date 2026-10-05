@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -114,7 +115,7 @@ class CampaignTests(unittest.TestCase):
             events = []
             manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
 
-            def fake_resolve(build):
+            def fake_resolve(build, pins=None):
                 name = build["steps"][-1]["ref"]
                 events.append("resolve:" + name)
                 return {"repo": build["repo"], "steps": [
@@ -297,10 +298,51 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "action is invalid"):
                 runner.load_config(path)
 
+    def test_optional_deepep_branch_is_validated_and_pinned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["build_repo"] = "https://github.com/example/vllm.git"
+            config["builds"] = [{"name": "candidate", "steps": [{"ref": "base", "action": "checkout"}],
+                                 "deepep": {"repo": "https://github.com/example/DeepEP.git", "ref": "fast-dispatch"}}]
+            path = root / "config.json"
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+            calls = []
+
+            def fake_call(args, **kwargs):
+                calls.append(args)
+                self.assertEqual(args[:2], ["git", "ls-remote"])
+                if any("DeepEP.git" in arg for arg in args):
+                    return SimpleNamespace(stdout="d" * 40 + "\trefs/heads/fast-dispatch\n")
+                return SimpleNamespace(stdout="b" * 40 + "\trefs/heads/base\n")
+
+            with patch.object(runner, "call", side_effect=fake_call):
+                pins = {}
+                resolved = runner.resolve_build({"repo": config["build_repo"],
+                                                 "steps": config["builds"][0]["steps"],
+                                                 "deepep": config["builds"][0]["deepep"]}, pins)
+                again = runner.resolve_build({"repo": config["build_repo"],
+                                              "steps": config["builds"][0]["steps"],
+                                              "deepep": config["builds"][0]["deepep"]}, pins)
+            self.assertEqual(resolved["deepep"]["commit"], "d" * 40)
+            self.assertEqual(again, resolved)
+            self.assertEqual(len(calls), 2)
+            config["builds"][0]["deepep"]["ref"] = "-invalid"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "branch name"):
+                runner.load_config(path)
+
     def test_full_build_script_keeps_publisher_commands(self):
         script = MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh"
-        syntax = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+        deepep_script = MODULE_PATH.parents[1] / "campaign/deepep-wheel-build.sh"
+        syntax = subprocess.run(["bash", "-n", str(script), str(deepep_script)], capture_output=True, text=True)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        invalid_deepep = subprocess.run(["bash", str(deepep_script)], capture_output=True, text=True,
+                                        env={**os.environ, "DEEPEP_BUILD_REPO": "https://github.com/example/DeepEP.git",
+                                             "DEEPEP_BUILD_REF": "fast-dispatch", "DEEPEP_BUILD_COMMIT": "bad"})
+        self.assertNotEqual(invalid_deepep.returncode, 0)
+        self.assertIn("full pinned commit", invalid_deepep.stderr + invalid_deepep.stdout)
         bad_recipe = subprocess.run(["bash", str(script), "publish"], capture_output=True, text=True,
                                     env={**os.environ, "VLLM_BUILD_REFS": "base patch", "VLLM_BUILD_ACTIONS": "checkout"})
         self.assertNotEqual(bad_recipe.returncode, 0)
@@ -309,6 +351,32 @@ class CampaignTests(unittest.TestCase):
                                 env={**os.environ, "VLLM_BUILD_OVERLAY": "/tmp/example"})
         self.assertNotEqual(deploy.returncode, 0)
         self.assertIn("VLLM_BUILD_REF_FILE", deploy.stderr + deploy.stdout)
+
+    def test_optional_deepep_reuses_ready_wheel(self):
+        script = MODULE_PATH.parents[1] / "campaign/deepep-wheel-build.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, ref, commit = "https://github.com/example/DeepEP.git", "fast-dispatch", "d" * 40
+            key = ("variant=v10-pinned-abi-locked\n" + f"repo={repo}\nref={ref}\nsha={commit}\n" +
+                   "base_image=sha256:test\ntorch=2.8\ncuda=12.8\npython_abi=cp312\n")
+            digest = hashlib.sha256(key.encode()).hexdigest()[:20]
+            cache = root / f"{digest}-v10-pinned-abi-locked"
+            wheel = cache / "wheel" / "deep_ep-1.0-py3-none-any.whl"
+            wheel.parent.mkdir(parents=True)
+            wheel.write_bytes(b"test wheel")
+            (cache / "READY").write_text(f"wheel={wheel.name}\ncommit={commit}\n")
+            env = {**os.environ, "DEEPEP_BUILD_REPO": repo, "DEEPEP_BUILD_REF": ref,
+                   "DEEPEP_BUILD_COMMIT": commit, "DEEPEP_BUILD_CACHE_ROOT": str(root),
+                   "BASE_RUNTIME_IMAGE_ID": "sha256:test", "BASE_RUNTIME_TORCH_VERSION": "2.8",
+                   "BASE_RUNTIME_CUDA_VERSION": "12.8", "BASE_RUNTIME_PYTHON_ABI": "cp312"}
+            command = ('set -euo pipefail; BUILD_LEADER=0; '
+                       'wheel_is_valid(){ test -f "$1"; }; uv(){ return 0; }; python3(){ return 0; }; '
+                       'source "$1"')
+            result = subprocess.run(["bash", "-c", command, "bash", str(script)],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Installing cached DeepEP", result.stdout)
+            self.assertNotIn("Building DeepEP", result.stdout)
 
     def test_fetches_selected_fork_ref_once(self):
         calls = []
@@ -365,17 +433,22 @@ class CampaignTests(unittest.TestCase):
             build = {"repo": "https://github.com/example/vllm.git", "steps": [
                 {"ref": "base", "action": "checkout", "commit": "b" * 40},
                 {"ref": "feature", "action": "cherry-pick", "commit": "c" * 40},
-            ]}
+            ], "deepep": {"repo": "https://github.com/example/DeepEP.git",
+                            "ref": "fast-dispatch", "commit": "d" * 40}}
             rendered = runner.inject_vllm_build_script(manifest, build)
             rendered_docs = list(yaml.safe_load_all(rendered))
             self.assertEqual(rendered_docs[0]["metadata"]["name"], "vllm-build")
             self.assertEqual(rendered_docs[0]["data"]["vllm-wheel-build.sh"],
                              (MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh").read_text())
+            self.assertEqual(rendered_docs[0]["data"]["deepep-wheel-build.sh"],
+                             (MODULE_PATH.parents[1] / "campaign/deepep-wheel-build.sh").read_text())
             self.assertEqual(rendered_docs[-1]["spec"]["leaderWorkerTemplate"]["workerTemplate"]["spec"]["containers"][0]["args"],
                              ["source /opt/build-scripts/vllm-wheel-build.sh"])
             self.assertEqual(rendered_docs[1]["data"]["VLLM_BUILD_ACTIONS"], "checkout cherry-pick")
             self.assertEqual(rendered_docs[1]["data"]["VLLM_BUILD_SHAS"], " ".join(["b" * 40, "c" * 40]))
             self.assertEqual(rendered_docs[1]["data"]["VLLM_BUILD_COMMIT"], "b" * 40)
+            self.assertEqual(rendered_docs[1]["data"]["DEEPEP_BUILD_COMMIT"], "d" * 40)
+            self.assertEqual(rendered_docs[1]["data"]["DEEPEP_BUILD_ENABLED"], "1")
             with patch.object(runner, "kube", side_effect=fake_kube):
                 commit = runner.vllm_prebuild(rendered, config, config["overlays"][0], root)
             self.assertEqual(commit, "b" * 40)
@@ -388,6 +461,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(job_pod["containers"][0]["image"], "vllm/example@sha256:abc")
             self.assertEqual(job_pod["containers"][0]["resources"]["requests"]["nvidia.com/gpu"], "8")
             self.assertIn("VLLM_BUILD_ACTIONS", {item["name"] for item in job_pod["containers"][0]["env"]})
+            self.assertIn("DEEPEP_BUILD_COMMIT", {item["name"] for item in job_pod["containers"][0]["env"]})
             self.assertEqual((root / "build.log").read_text(), "cache hit\n")
 
     def test_live_submitters_use_campaign_source_without_build_marker(self):
