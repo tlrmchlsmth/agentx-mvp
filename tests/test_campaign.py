@@ -113,6 +113,39 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(summary["status"], "failed")
             self.assertIn("ref not found", summary["error"])
 
+    def test_build_steps_pin_ordered_actions_and_reject_invalid_recipes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            recipe = {"repo": "https://github.com/example/vllm.git", "steps": [
+                {"ref": "base", "action": "checkout"},
+                {"ref": "feature", "action": "merge"},
+                {"ref": "patch", "action": "cherry-pick-m2"},
+                {"ref": "parent", "action": "cherry-pick-parent1"},
+            ]}
+            config["overlays"][0]["build"] = recipe
+            path = root / "config.json"
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+            shas = [f"{n:x}" * 40 for n in range(1, 5)]
+            calls = []
+
+            def fake_call(args, **kwargs):
+                calls.append(args)
+                return SimpleNamespace(stdout="".join(f"{sha}\t{ref}\n" for sha, ref in zip(shas, args[-4:])))
+
+            with patch.object(runner, "call", side_effect=fake_call):
+                resolved = runner.resolve_build(recipe)
+            self.assertEqual([step["action"] for step in resolved["steps"]],
+                             ["checkout", "merge", "cherry-pick-m2", "cherry-pick-parent1"])
+            self.assertEqual([step["commit"] for step in resolved["steps"]], shas)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][-3], "refs/heads/feature")
+            recipe["steps"][0]["action"] = "merge"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "action is invalid"):
+                runner.load_config(path)
+
     def test_fetches_selected_fork_ref_once(self):
         calls = []
 
@@ -165,16 +198,23 @@ class CampaignTests(unittest.TestCase):
                     created.append(json.loads(kwargs["input_text"]))
                 return SimpleNamespace(stdout="cache hit\n" if args[0] == "logs" else "", stderr="", returncode=0)
 
-            rendered = runner.inject_vllm_build_script(manifest)
+            build = {"repo": "https://github.com/example/vllm.git", "steps": [
+                {"ref": "base", "action": "checkout", "commit": "b" * 40},
+                {"ref": "feature", "action": "cherry-pick", "commit": "c" * 40},
+            ]}
+            rendered = runner.inject_vllm_build_script(manifest, build)
             rendered_docs = list(yaml.safe_load_all(rendered))
             self.assertEqual(rendered_docs[0]["metadata"]["name"], "vllm-build")
             self.assertEqual(rendered_docs[0]["data"]["vllm-wheel-build.sh"],
                              (MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh").read_text())
             self.assertEqual(rendered_docs[-1]["spec"]["leaderWorkerTemplate"]["workerTemplate"]["spec"]["containers"][0]["args"],
                              ["source /opt/build-scripts/vllm-wheel-build.sh"])
+            self.assertEqual(rendered_docs[1]["data"]["VLLM_BUILD_ACTIONS"], "checkout cherry-pick")
+            self.assertEqual(rendered_docs[1]["data"]["VLLM_BUILD_SHAS"], " ".join(["b" * 40, "c" * 40]))
+            self.assertEqual(rendered_docs[1]["data"]["VLLM_BUILD_COMMIT"], "b" * 40)
             with patch.object(runner, "kube", side_effect=fake_kube):
                 commit = runner.vllm_prebuild(rendered, config, config["overlays"][0], root)
-            self.assertEqual(commit, "a" * 40)
+            self.assertEqual(commit, "b" * 40)
             self.assertEqual(actions, ["create", "create", "create", "create", "wait", "logs", "delete"])
             self.assertEqual([item["kind"] for item in created], ["ConfigMap", "ConfigMap", "ServiceAccount", "Job"])
             job_pod = created[-1]["spec"]["template"]["spec"]
@@ -182,6 +222,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(job_pod["nodeSelector"], {"gpu": "h200"})
             self.assertEqual(job_pod["containers"][0]["image"], "vllm/example@sha256:abc")
             self.assertEqual(job_pod["containers"][0]["resources"]["requests"]["nvidia.com/gpu"], "8")
+            self.assertIn("VLLM_BUILD_ACTIONS", {item["name"] for item in job_pod["containers"][0]["env"]})
             self.assertEqual((root / "build.log").read_text(), "cache hit\n")
 
     def test_live_submitters_use_campaign_source_without_build_marker(self):

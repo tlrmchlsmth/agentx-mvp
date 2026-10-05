@@ -12,8 +12,9 @@ if ! [[ "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "FATAL: VLLM_BUILD_COMMIT must be a full 40-character Git SHA."
   exit 1
 fi
-BUILD_BRANCHES=$BUILD_BRANCH
-BUILD_BRANCH_ACTIONS=checkout
+BUILD_BRANCHES=${VLLM_BUILD_REFS:-$BUILD_BRANCH}
+BUILD_BRANCH_ACTIONS=${VLLM_BUILD_ACTIONS:-checkout}
+BUILD_SHA_VALUES=${VLLM_BUILD_SHAS:-$BUILD_SHA}
 
 
 BUILD_FETCH_DEPTH=${VLLM_BUILD_FETCH_DEPTH:-256}
@@ -62,17 +63,47 @@ if [ "${BUILD_BRANCH_ACTION_ARRAY[0]}" != "checkout" ]; then
   echo "FATAL: the first BUILD_BRANCH_ACTIONS entry must be checkout."
   exit 1
 fi
+read -r -a BUILD_SHA_ARRAY <<< "$BUILD_SHA_VALUES"
+if [ "${#BUILD_SHA_ARRAY[@]}" -ne "${#BUILD_BRANCH_ARRAY[@]}" ]; then
+  echo "FATAL: VLLM_BUILD_SHAS must match VLLM_BUILD_REFS length."
+  exit 1
+fi
+for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
+  if ! [[ "${BUILD_SHA_ARRAY[$i]}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "FATAL: build input $i has no full Git SHA."
+    exit 1
+  fi
+  if ! [[ "${BUILD_BRANCH_ARRAY[$i]}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]]; then
+    echo "FATAL: build input $i has an invalid branch name."
+    exit 1
+  fi
+  if [ "$i" -gt 0 ] && ! [[ "${BUILD_BRANCH_ACTION_ARRAY[$i]}" =~ ^(merge|cherry-pick|cherry-pick-parent1|cherry-pick-m[1-9][0-9]*)$ ]]; then
+    echo "FATAL: unsupported build action ${BUILD_BRANCH_ACTION_ARRAY[$i]}."
+    exit 1
+  fi
+done
+if [ "${BUILD_SHA_ARRAY[0]}" != "$BUILD_SHA" ] || [ "${BUILD_BRANCH_ARRAY[0]}" != "$BUILD_BRANCH" ]; then
+  echo "FATAL: first build input differs from VLLM_BUILD_REF/COMMIT."
+  exit 1
+fi
 if ! [[ "$BUILD_FETCH_DEPTH" =~ ^[1-9][0-9]*$ ]]; then
   echo "FATAL: VLLM_BUILD_FETCH_DEPTH must be a positive integer."
   exit 1
 fi
 
-# Fetch the immutable object ID, rather than a branch ref that could advance
-# between resolution and fetch. The remote branch is retained for auditability.
-BUILD_SHA_ARRAY=("$BUILD_SHA")
-BUILD_REMOTE_REF_ARRAY=("$BUILD_SHA")
-BUILD_DESC="${BUILD_BRANCH}@${BUILD_SHA:0:12}"
-echo "Using published build ref: ${BUILD_DESC}"
+# A campaign recipe fetches each branch and verifies it still points to the
+# resolved SHA. A single pinned ref can still fetch its immutable object ID.
+BUILD_REMOTE_REF_ARRAY=()
+BUILD_DESC=""
+for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
+  if [ -n "${VLLM_BUILD_REFS:-}" ]; then
+    BUILD_REMOTE_REF_ARRAY+=("refs/heads/${BUILD_BRANCH_ARRAY[$i]}")
+  else
+    BUILD_REMOTE_REF_ARRAY+=("${BUILD_SHA_ARRAY[$i]}")
+  fi
+  BUILD_DESC+=" ${BUILD_BRANCH_ACTION_ARRAY[$i]}:${BUILD_BRANCH_ARRAY[$i]}@${BUILD_SHA_ARRAY[$i]:0:12}"
+done
+echo "Using pinned build inputs:${BUILD_DESC}"
 
 # The wheel reuses native extensions from the base image, so the cache must be
 # partitioned by that runtime too. This also prevents a floating/misconfigured
@@ -390,15 +421,15 @@ if [ "$NEED_BUILD" = 1 ]; then
   mkdir -p /tmp/vllm-pr && cd /tmp/vllm-pr || exit 1
   git init -q
 
-  # Fetch the published commit object, never a floating branch head.
+  # Fetch all resolved refs and verify that none moved after resolution.
   BUILD_FETCH_REFS=()
   for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
     BUILD_FETCH_REFS+=("${BUILD_REMOTE_REF_ARRAY[$i]}:refs/remotes/llmd-build/${i}")
   done
-  echo "Fetching published commit ${BUILD_SHA} (depth=${BUILD_FETCH_DEPTH})..."
+  echo "Fetching pinned build inputs (depth=${BUILD_FETCH_DEPTH})..."
   git fetch -q --no-tags --depth="$BUILD_FETCH_DEPTH" \
     "$BUILD_REPO" "${BUILD_FETCH_REFS[@]}" || {
-    echo "FATAL: immutable commit fetch failed. Verify ${BUILD_BRANCH} still retains ${BUILD_SHA} on ${BUILD_REPO}."
+    echo "FATAL: pinned build fetch failed. Verify inputs remain available on ${BUILD_REPO}."
     exit 1
   }
 
@@ -433,19 +464,25 @@ if [ "$NEED_BUILD" = 1 ]; then
 
     if [[ "$BRANCH_ACTION" == cherry-pick* ]]; then
       CHERRY_PICK_MAINLINE=()
+      CHERRY_PICK_TARGET=$MERGE_SHA
       if [[ "$BRANCH_ACTION" =~ ^cherry-pick-m([1-9][0-9]*)$ ]]; then
         CHERRY_PICK_MAINLINE=(-m "${BASH_REMATCH[1]}")
+      elif [ "$BRANCH_ACTION" = "cherry-pick-parent1" ]; then
+        CHERRY_PICK_TARGET=$(git rev-parse "${MERGE_SHA}^1") || {
+          echo "FATAL: first parent of ${MERGE_SHA} is unavailable."
+          exit 1
+        }
       elif [ "$BRANCH_ACTION" != "cherry-pick" ]; then
         echo "FATAL: invalid cherry-pick action ${BRANCH_ACTION} for ${MERGE_BRANCH}."
         exit 1
       fi
-      if git merge-base --is-ancestor "${MERGE_SHA}" HEAD; then
+      if git merge-base --is-ancestor "${CHERRY_PICK_TARGET}" HEAD; then
         echo "Patch ${MERGE_BRANCH} (${MERGE_SHA}) is already in the build."
         continue
       fi
 
       echo "Applying ${MERGE_BRANCH} tip (${MERGE_SHA})..."
-      git cherry-pick "${CHERRY_PICK_MAINLINE[@]}" --no-commit "${MERGE_SHA}" || {
+      git cherry-pick "${CHERRY_PICK_MAINLINE[@]}" --no-commit "${CHERRY_PICK_TARGET}" || {
         echo "FATAL: cherry-pick ${MERGE_BRANCH} failed"
         git status || true
         exit 1
@@ -457,7 +494,7 @@ if [ "$NEED_BUILD" = 1 ]; then
         git \
           -c user.name=vllm-build \
           -c user.email=vllm-build@localhost \
-          commit --no-gpg-sign --no-verify -C "${MERGE_SHA}" || {
+          commit --no-gpg-sign --no-verify -C "${CHERRY_PICK_TARGET}" || {
             echo "FATAL: commit ${MERGE_BRANCH} failed"
             git status || true
             exit 1

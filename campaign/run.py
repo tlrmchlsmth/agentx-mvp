@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 JOB_LINE = re.compile(r"^Job queued: ([a-z0-9-]+) ", re.MULTILINE)
 GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+BUILD_ACTION = re.compile(r"^(?:checkout|merge|cherry-pick|cherry-pick-parent1|cherry-pick-m[1-9][0-9]*)$")
 
 
 class CleanupError(RuntimeError):
@@ -51,6 +52,21 @@ def bounded_int(value: Any, field: str, low: int, high: int) -> int:
     return value
 
 
+def git_repo(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an HTTPS Git URL")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(f"{field} must be an HTTPS Git URL without credentials")
+    return value
+
+
+def git_branch(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not GIT_REF.fullmatch(value) or ".." in value or value.endswith(".lock"):
+        raise ValueError(f"{field} must be a Git branch name")
+    return value
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text())
     if not isinstance(config, dict):
@@ -67,12 +83,7 @@ def load_config(path: Path) -> dict[str, Any]:
     source = config.get("source")
     if not isinstance(source, dict) or set(source) != {"repo", "ref"}:
         raise ValueError("source needs repo and ref")
-    repo, ref = source["repo"], source["ref"]
-    if not isinstance(repo, str):
-        raise ValueError("source.repo must be an HTTPS Git URL")
-    parsed = urlsplit(repo)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError("source.repo must be an HTTPS Git URL without credentials")
+    repo, ref = git_repo(source["repo"], "source.repo"), source["ref"]
     if not isinstance(ref, str) or not GIT_REF.fullmatch(ref) or ".." in ref or ref.endswith(".lock"):
         raise ValueError("source.ref must be a branch, tag, or commit")
     for key, default, low, high in (("rollout_timeout_seconds", 3600, 60, 21600),
@@ -90,8 +101,9 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("benchmarks must contain 1-4 entries")
     seen = set()
     for overlay in overlays:
-        if not isinstance(overlay, dict) or set(overlay) != {"name", "path", "model_label", "pod_selector", "expected_pods"}:
-            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods")
+        required = {"name", "path", "model_label", "pod_selector", "expected_pods"}
+        if not isinstance(overlay, dict) or not required.issubset(overlay) or set(overlay) - required - {"build"}:
+            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods; build is optional")
         name = required_name(overlay["name"], "overlay.name")
         if name in seen:
             raise ValueError(f"duplicate overlay: {name}")
@@ -103,6 +115,21 @@ def load_config(path: Path) -> dict[str, Any]:
             if not isinstance(overlay[key], str) or not overlay[key].strip() or "\n" in overlay[key]:
                 raise ValueError(f"overlay {name} requires {key}")
         bounded_int(overlay["expected_pods"], "expected_pods", 1, 1000)
+        if "build" in overlay:
+            build = overlay["build"]
+            if not isinstance(build, dict) or set(build) != {"repo", "steps"}:
+                raise ValueError(f"overlay {name} build needs repo and steps")
+            git_repo(build["repo"], f"overlay {name} build.repo")
+            steps = build["steps"]
+            if not isinstance(steps, list) or not 1 <= len(steps) <= 32:
+                raise ValueError(f"overlay {name} build.steps needs 1-32 entries")
+            for index, step in enumerate(steps):
+                if not isinstance(step, dict) or set(step) != {"ref", "action"}:
+                    raise ValueError(f"overlay {name} build step needs ref and action")
+                git_branch(step["ref"], f"overlay {name} build.steps[{index}].ref")
+                action = step["action"]
+                if not isinstance(action, str) or not BUILD_ACTION.fullmatch(action) or (index == 0) != (action == "checkout"):
+                    raise ValueError(f"overlay {name} build.steps[{index}].action is invalid")
     tools = set()
     for bench in benchmarks:
         if not isinstance(bench, dict):
@@ -153,6 +180,25 @@ def fetch_source(source: dict[str, str]) -> tuple[Path, str]:
         raise
 
 
+def resolve_build(build: dict[str, Any]) -> dict[str, Any]:
+    """Pin every moving vLLM branch before calculating the wheel cache key."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    refs = [f"refs/heads/{step['ref']}" for step in build["steps"]]
+    result = call(["git", "ls-remote", "--exit-code", "--heads", build["repo"], *refs], env=env, timeout=120)
+    resolved = {}
+    for line in result.stdout.strip().splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]) or fields[1] not in refs:
+            raise RuntimeError("vLLM branch resolution returned an unexpected ref")
+        resolved[fields[1]] = fields[0]
+    if any(ref not in resolved for ref in refs):
+        raise RuntimeError(f"could not resolve vLLM branches: {', '.join(ref for ref in refs if ref not in resolved)}")
+    return {"repo": build["repo"], "steps": [
+        {"ref": step["ref"], "action": step["action"], "commit": resolved[f"refs/heads/{step['ref']}"]}
+        for step in build["steps"]]}
+
+
 def validate_manifest(rendered: str, namespace: str) -> None:
     cluster_scoped = {"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
                       "StorageClass", "PersistentVolume", "Node", "ResourceFlavor", "ClusterQueue"}
@@ -190,7 +236,7 @@ def build_commit(namespace: str) -> str | None:
     return commit
 
 
-def inject_vllm_build_script(rendered: str) -> str:
+def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None) -> str:
     """Use the versioned campaign build recipe in both builder and serving Pods."""
     documents = list(yaml.safe_load_all(rendered))
     candidates = []
@@ -203,6 +249,8 @@ def inject_vllm_build_script(rendered: str) -> str:
             ):
                 candidates.append((item, key))
     if not candidates:
+        if build:
+            raise ValueError("overlay build steps require a compatible vLLM wheel build script")
         return rendered
     if len(candidates) != 1:
         raise ValueError("overlay contains multiple vLLM wheel build scripts")
@@ -215,6 +263,19 @@ def inject_vllm_build_script(rendered: str) -> str:
         raise ValueError("overlay already contains a conflicting vllm-build ConfigMap")
     script_map["metadata"]["name"] = "vllm-build"
     script_map["data"] = {"vllm-wheel-build.sh": (ROOT / "campaign" / "vllm-wheel-build.sh").read_text()}
+    if build:
+        ref_map = next((item for item in documents if isinstance(item, dict) and item.get("kind") == "ConfigMap" and
+                        item.get("metadata", {}).get("name") == "vllm-build-ref"), None)
+        if ref_map is None:
+            raise ValueError("build steps require a vllm-build-ref ConfigMap")
+        steps = build["steps"]
+        ref_map.setdefault("data", {}).update({
+            "VLLM_BUILD_REF": steps[0]["ref"], "VLLM_BUILD_COMMIT": steps[0]["commit"],
+            "VLLM_BUILD_REPO": build["repo"],
+            "VLLM_BUILD_REFS": " ".join(step["ref"] for step in steps),
+            "VLLM_BUILD_ACTIONS": " ".join(step["action"] for step in steps),
+            "VLLM_BUILD_SHAS": " ".join(step["commit"] for step in steps),
+        })
     references = 0
     for item in documents:
         if not isinstance(item, dict) or item.get("kind") != "LeaderWorkerSet":
@@ -234,6 +295,11 @@ def inject_vllm_build_script(rendered: str) -> str:
                 if field in container:
                     references += sum(old_key in part for part in container[field])
                     container[field] = [part.replace(old_key, "vllm-wheel-build.sh") for part in container[field]]
+            if build and any("vllm-wheel-build.sh" in part for field in ("command", "args") for part in container.get(field, [])):
+                env = container.setdefault("env", [])
+                for key in ("VLLM_BUILD_REPO", "VLLM_BUILD_REFS", "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS"):
+                    env[:] = [item for item in env if item.get("name") != key]
+                    env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
     if not references:
         raise ValueError("vLLM build script is not sourced by a LeaderWorkerSet container")
     return yaml.safe_dump_all(documents, sort_keys=False)
@@ -470,6 +536,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
     (destination / "source-commit.txt").write_text(source_commit + "\n")
     write_summary(destination, summary)
     failed = False
+    resolved_builds: dict[str, dict[str, Any]] = {}
     for overlay in config["overlays"]:
         name = overlay["name"]
         print(f"Deploying overlay {name}", flush=True)
@@ -486,7 +553,14 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             rendered = call(["kubectl", "kustomize", str(overlay_path)]).stdout
             if not rendered.strip():
                 raise RuntimeError(f"overlay {name} rendered no resources")
-            rendered = inject_vllm_build_script(rendered)
+            build = None
+            if "build" in overlay:
+                key = json.dumps(overlay["build"], sort_keys=True)
+                if key not in resolved_builds:
+                    resolved_builds[key] = resolve_build(overlay["build"])
+                build = resolved_builds[key]
+                record["vllm_build_inputs"] = build
+            rendered = inject_vllm_build_script(rendered, build)
             validate_manifest(rendered, config["namespace"])
             manifest.write_text(rendered)
             record["manifest_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()

@@ -27,8 +27,13 @@ must never use that queue or it could block its own children.
    uses that worker's image, GPU resources, and shared build-cache PVC. The
    script validates and installs an existing wheel or builds and caches it on
    a miss. A failed build stops that overlay before serving Pods are started.
-   The build ref must identify an already published immutable vLLM commit;
-   the runner does not push branches or require Git write credentials.
+   Without a build recipe, the overlay's `vllm-build-ref` supplies one pinned
+   vLLM commit. An optional per-overlay `build` recipe resolves an ordered set
+   of vLLM branches to exact commits before building. It supports `checkout`
+   first, followed by `merge`, `cherry-pick`, `cherry-pick-mN`, or
+   `cherry-pick-parent1`. The order, actions, and resolved commits enter the
+   wheel cache key. No integration branch is pushed, so Git write credentials
+   are unnecessary.
 2. Each overlay must render a **complete, disposable, namespaced** deployment.
    Resources that already exist are rejected so cleanup cannot delete shared
    infrastructure. Do not put the results PVC, Kueue objects, namespace, or
@@ -56,6 +61,24 @@ The example fork URL, branch, overlay paths, and model label are placeholders;
 edit them for the actual deployment before submitting. `campaign-validate`
 checks the experiment file locally. It cannot validate paths in the remote
 repository or cluster permissions.
+
+To compose a vLLM build for one overlay, add this optional field to that
+overlay in the campaign JSON:
+
+```json
+"build": {
+  "repo": "https://github.com/your-org/vllm.git",
+  "steps": [
+    {"ref": "base-branch", "action": "checkout"},
+    {"ref": "feature-branch", "action": "merge"},
+    {"ref": "patch-branch", "action": "cherry-pick-m2"}
+  ]
+}
+```
+
+The campaign resolves those branch heads once, injects the same commit list
+into the build Job and serving Pods, and fails if a branch moves before the
+build fetches it. The resolved inputs are saved in `summary.json`.
 
 ## Execution and results
 
