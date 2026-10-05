@@ -171,9 +171,11 @@ pd)
     exit 1
   fi
   echo "Detected PD topology; the submitted Job will wait for prefill and decode pods"
+  WAIT_SELECTORS="${PREFILL_SELECTOR} ${DECODE_SELECTOR}"
   ;;
 aggregate)
   echo "Detected aggregate topology; the submitted Job will wait for aggregate pods"
+  WAIT_SELECTORS="${AGGREGATE_SELECTOR}"
   ;;
 *)
   echo "TOPOLOGY must be auto, pd, or aggregate (got: ${TOPOLOGY})" >&2
@@ -276,18 +278,29 @@ spec:
         - name: wait-for-serving
           image: ${KUBECTL_IMAGE}
           imagePullPolicy: IfNotPresent
-          command: ["kubectl"]
+          command: ["/bin/sh", "-c"]
           args:
-            - wait
-            - --namespace=${NAMESPACE}
-            - --for=condition=Ready
-            - pod
-            - --selector=${BASE_SELECTOR}
-            # kubectl's zero timeout means "check once"; use a decade so
-            # this Job can wait for a deployment without the laptop staying
-            # connected. The serving Pods already exist when this Job is
-            # submitted, so the selector has concrete resources to watch.
-            - --timeout=87600h
+            - |
+              set -eu
+              for selector in ${WAIT_SELECTORS}; do
+                while :; do
+                  pods=\$(kubectl get pods -n "${NAMESPACE}" -l "\$selector" -o name)
+                  if [ -n "\$pods" ] && kubectl wait -n "${NAMESPACE}" --for=condition=Ready pod -l "\$selector" --timeout=87600h; then
+                    break
+                  fi
+                  sleep 15
+                done
+              done
+              mkdir -p "${OUTPUT_PATH}"
+              : > "${OUTPUT_PATH}/serving-pods.txt"
+              for selector in ${WAIT_SELECTORS}; do
+                kubectl get pods -n "${NAMESPACE}" -l "\$selector" \\
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' >> "${OUTPUT_PATH}/serving-pods.txt"
+              done
+              test -s "${OUTPUT_PATH}/serving-pods.txt"
+          volumeMounts:
+            - name: workload
+              mountPath: /workload
       containers:
         - name: aiperf
           image: ${AIPERF_IMAGE}

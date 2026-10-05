@@ -77,9 +77,12 @@ upload_input() {
 }
 local_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 download_report() {
-  local remote="$1" partial="${DESTINATION}.part" remote_size offset remaining want chunk remote_chunk attempt=0 retry_limit
+  local remote="$1" partial remote_size remote_digest local_digest offset remaining want chunk remote_chunk attempt=0 retry_limit
   remote_size="$(kexec sh -c 'wc -c < "$1"' sh "$remote" | tr -d '[:space:]')"
   [[ "$remote_size" =~ ^[1-9][0-9]*$ ]] || { echo "Remote report is empty or unreadable" >&2; return 1; }
+  remote_digest="$(kexec sha256sum "$remote" | awk '{print $1}')"
+  [[ "$remote_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "Could not hash remote report" >&2; return 1; }
+  partial="${DESTINATION}.${remote_digest}.part"
   [[ -f "$partial" ]] || : > "$partial"
   offset="$(local_size "$partial")"
   if (( offset > remote_size )); then : > "$partial"; offset=0; fi
@@ -114,6 +117,8 @@ download_report() {
     offset=$((offset + want))
   done
   rm -f "${partial}.chunk"
+  local_digest="$(shasum -a 256 "$partial" | awk '{print $1}')"
+  [[ "$local_digest" == "$remote_digest" ]] || { echo "Downloaded report hash mismatch" >&2; rm -f "$partial"; return 1; }
   mv "$partial" "$DESTINATION"
 }
 
@@ -166,7 +171,6 @@ JOB_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job.XXXXXX")"
 LLMD_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-llmd.XXXXXX.yaml")"
 LLMD_SNAPSHOT_GZ="${LLMD_SNAPSHOT}.gz"
 JOB_LOG_SNAPSHOT=""
-CURRENT_PODS_SNAPSHOT=""
 cleanup() {
   kubectl delete pod -n "$NAMESPACE" "$RETRIEVER_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl delete configmap -n "$NAMESPACE" "$REPORTER_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
@@ -174,7 +178,6 @@ cleanup() {
   rm -f "$JOB_SNAPSHOT"
   rm -f "$LLMD_SNAPSHOT" "$LLMD_SNAPSHOT_GZ"
   [[ -z "$JOB_LOG_SNAPSHOT" ]] || rm -f "$JOB_LOG_SNAPSHOT"
-  [[ -z "$CURRENT_PODS_SNAPSHOT" ]] || rm -f "$CURRENT_PODS_SNAPSHOT"
 }
 trap cleanup EXIT
 
@@ -208,12 +211,6 @@ if [[ "$MONITORING" == true ]]; then
   JOB_LOG_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-job-log.XXXXXX")"
   kubectl logs -n "$NAMESPACE" "job/${JOB_NAME}" --timestamps > "$JOB_LOG_SNAPSHOT"
   [[ -n "$MODEL_LABEL" ]] || { echo "AIPerf Job has no model label; cannot scope monitoring safely" >&2; exit 1; }
-  CURRENT_PODS_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/aiperf-serving-pods.XXXXXX")"
-  kubectl get pods -n "$NAMESPACE" \
-    -l "llm-d.ai/model=${MODEL_LABEL},llm-d.ai/inference-serving=true" \
-    -o go-template='{{range .items}}{{.metadata.name}}{{"\n"}}{{end}}' > "$CURRENT_PODS_SNAPSHOT"
-  [[ -s "$CURRENT_PODS_SNAPSHOT" ]] || { echo "No current serving pods for ${MODEL_LABEL} in ${NAMESPACE}" >&2; exit 1; }
-  echo "Monitoring scope: ${NAMESPACE}, model ${MODEL_LABEL}, $(wc -l < "$CURRENT_PODS_SNAPSHOT" | tr -d ' ') current serving pods"
 fi
 REPORTER_FILES=(
   --from-file=aiperf_report.py="${SCRIPT_DIR}/report.py"
@@ -268,7 +265,6 @@ upload_input "$JOB_SNAPSHOT" /inputs/aiperf-job.yaml
 upload_input "$LLMD_SNAPSHOT_GZ" /inputs/llm-d-deployment.yaml.gz
 if [[ "$MONITORING" == true ]]; then
   upload_input "$JOB_LOG_SNAPSHOT" /inputs/aiperf-job.log
-  upload_input "$CURRENT_PODS_SNAPSHOT" /inputs/current-serving-pods.txt
 fi
 if [[ -z "$RUN_ID" ]]; then
   BUILD_SHORT="${BUILD_COMMIT:0:12}"
@@ -282,11 +278,23 @@ if [[ -z "$RUN_DIR" ]]; then
   exit 1
 fi
 if [[ "$MONITORING" == true ]]; then
+  pod_scope_source="$(kexec sh -c '
+    if [ -s "$1/serving-pods.txt" ]; then echo run; exit 0; fi
+    for snapshot in "$1"/c*/serving-pods.yaml; do
+      [ -f "$snapshot" ] || continue
+      awk '\''/^  metadata:$/ { in_metadata=1; next }
+        in_metadata && /^    name: / { print $2; in_metadata=0; next }
+        in_metadata && /^  [^ ]/ { in_metadata=0 }'\'' "$snapshot" > "$1/serving-pods.txt"
+      if [ -s "$1/serving-pods.txt" ]; then echo submission; exit 0; fi
+    done
+    echo missing
+  ' sh "$RUN_DIR")"
+  [[ "$pod_scope_source" != missing ]] || { echo "No serving-pod identity was saved for ${JOB_NAME}; historical monitoring cannot be scoped safely" >&2; exit 1; }
+  echo "Monitoring pod scope: saved ${pod_scope_source} snapshot"
   kexec cp /inputs/aiperf-job.log "${RUN_DIR}/aiperf-job.log"
-  # Scope PromQL to the current serving pods of this Job's model in this
-  # namespace, not every deployment represented by the Grafana dashboard.
+  # Scope PromQL to the saved run identity (or the submission snapshot for older Jobs).
   kexec sh -c '
-    tr "\n" "|" < /inputs/current-serving-pods.txt | sed "s/|\$//" > "$1/pods.txt"
+    tr "\n" "|" < "$1/serving-pods.txt" | sed "s/|\$//" > "$1/pods.txt"
     [ -s "$1/pods.txt" ]
   ' sh "$RUN_DIR"
   echo "Capturing Grafana dashboard data for each inferred AIPerf time range..."

@@ -345,21 +345,23 @@ def export(args):
             expr = scope_promql_expr(expr, panel_pod_regex)
             legend = target.get("legendFormat", "")
             result = query_prometheus(args.grafana_url, args.auth, ds_uid, expr, start, end, step)
+            if result.get("status") != "success":
+                raise RuntimeError(
+                    f"Prometheus query failed for panel {pid} ({title}): "
+                    f"{result.get('error') or result}"
+                )
 
             series = []
-            if result.get("status") == "success":
-                for r in result.get("data", {}).get("result", []):
-                    series.append({
-                        "labels": r.get("metric", {}),
-                        "values": r.get("values", []),
-                    })
+            for r in result.get("data", {}).get("result", []):
+                series.append({
+                    "labels": r.get("metric", {}),
+                    "values": r.get("values", []),
+                })
 
             queries.append({"expr": expr, "legend": legend, "series": series})
 
         total_points = sum(len(s["values"]) for q in queries for s in q["series"])
-        errors = [q.get("error", "") for q in queries if q.get("error")]
-        suffix = f"; ERROR: {errors[0]}" if errors else ""
-        print(f"  [{pid}] {title} ({len(queries)} queries, {total_points} datapoints){suffix}")
+        print(f"  [{pid}] {title} ({len(queries)} queries, {total_points} datapoints)")
 
         return pid, {
             "id": pid,

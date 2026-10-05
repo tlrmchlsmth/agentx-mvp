@@ -625,6 +625,13 @@ const TOTAL_NORMALIZED_METRICS = new Set({json.dumps(total_normalized_metrics)})
 const METRIC_LABELS = {json.dumps(metric_labels)};
 const STAT_KEYS = {json.dumps(STAT_KEYS)};
 const CONFIG_KEYS = Object.keys(CONFIGS);
+const ACTIVE_CONFIGS = new Set(CONFIG_KEYS);
+
+function refreshSummaryVisibility() {{
+  document.querySelectorAll('tr[data-cfg][data-conc]').forEach(row => {{
+    row.style.display = ACTIVE_CONFIGS.has(row.dataset.cfg) && ACTIVE_CONCURRENCIES.has(row.dataset.conc) ? '' : 'none';
+  }});
+}}
 
 const root = document.getElementById('root');
 const sidePanel = document.getElementById('sidePanel');
@@ -1042,11 +1049,10 @@ function createChart(container, defaults) {{
     CONFIG_KEYS.forEach((cfg, i) => {{
       if (!state.el.data[i]) return;
       const vis = state.el.data[i].visible;
-      const show = vis !== 'legendonly' && vis !== false;
-      document.querySelectorAll(`tr[data-cfg="${{cfg}}"]`).forEach(r => {{
-        r.style.display = show ? '' : 'none';
-      }});
+      if (vis === 'legendonly' || vis === false) ACTIVE_CONFIGS.delete(cfg);
+      else ACTIVE_CONFIGS.add(cfg);
     }});
+    refreshSummaryVisibility();
   }});
 
   const chart = {{ state, update }};
@@ -1075,7 +1081,7 @@ CONCURRENCIES.forEach(concurrency => {{
     ACTIVE_CONCURRENCIES.has(concurrency) ? ACTIVE_CONCURRENCIES.delete(concurrency) : ACTIVE_CONCURRENCIES.add(concurrency);
     button.classList.toggle('active', ACTIVE_CONCURRENCIES.has(concurrency));
     allCharts.forEach(chart => chart.update());
-    document.querySelectorAll(`tr[data-conc="${{concurrency}}"]`).forEach(row => row.style.display = ACTIVE_CONCURRENCIES.has(concurrency) ? '' : 'none');
+    refreshSummaryVisibility();
   }});
   concurrencyFilters.appendChild(button);
 }});
