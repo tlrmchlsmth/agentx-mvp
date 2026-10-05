@@ -2,7 +2,7 @@
   "id": "example-overlay-sweep-001",
   "namespace": "vllm",
   "source": {"repo": "https://github.com/your-org/llm-d.git", "ref": "your-branch"},
-  "vllm_image": "quay.io/your-org/vllm:your-nightly-tag",
+  "vllm_image": "vllm/vllm-openai:nightly",
   "build_repo": "https://github.com/your-org/vllm.git",
   "builds": [
     {"name": "branch2", "steps": [

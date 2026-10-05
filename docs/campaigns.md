@@ -84,6 +84,9 @@ and `builds` entirely. To compare that image with source builds, add
 the configured image unchanged. A nightly entry can still specify `deepep` to build only
 DeepEP. Nightly runs have no vLLM wheel prebuild; DeepEP-only runs prebuild its
 wheel. The saved `serving-pods.json` records the image ID used by each deployment.
+`examples/campaign.kimi-nightly.example.json` shows a concrete Kimi aggregate
+overlay using `vllm/vllm-openai:nightly`; set its llm-d fork/ref and cluster
+PVC and queues before submitting.
 For a legacy single-overlay campaign without top-level
 `builds`, an overlay may still have its own `build` field:
 
