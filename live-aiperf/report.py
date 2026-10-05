@@ -27,6 +27,12 @@ DISPLAY_METRICS = (
 )
 
 
+def support_file(name: str) -> Path:
+    """Find helpers next to the copied Job script or in the source checkout."""
+    adjacent = Path(__file__).with_name(name)
+    return adjacent if adjacent.is_file() else adjacent.parent.parent / name
+
+
 def read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -308,21 +314,29 @@ def source_row(data: dict[str, Any]) -> str:
 
 def write_index(root: Path) -> None:
     """Adapt live artifacts to the repository's established v2 renderer."""
-    renderer_path = Path(__file__).with_name("gen_interactivity_chart.py")
-    module_spec = importlib.util.spec_from_file_location("agentx_v2_charts", renderer_path)
-    if module_spec is None or module_spec.loader is None:
-        raise SystemExit(f"Missing shared chart renderer: {renderer_path}")
-    renderer = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(renderer)
-
     runs = [
         data for path in sorted(root.rglob("profile_export_aiperf.json"))
         if (data := run_data(path.parent)) and source_commit(data["metadata"])
     ]
     if not runs:
         raise SystemExit(f"No completed live AIPerf runs in {root}")
+    write_index_from_runs(root, runs)
 
-    overlay_html = monitoring_overlay(root, runs)
+
+def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html: str = "",
+                          model_label: str | None = None, save_monitoring_overlay: bool = True) -> None:
+    """Render selected runs into one portable AIPerf report."""
+    renderer_path = support_file("gen_interactivity_chart.py")
+    module_spec = importlib.util.spec_from_file_location("agentx_v2_charts", renderer_path)
+    if module_spec is None or module_spec.loader is None:
+        raise SystemExit(f"Missing shared chart renderer: {renderer_path}")
+    renderer = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(renderer)
+
+    if not runs:
+        raise SystemExit(f"No completed live AIPerf runs in {root}")
+
+    overlay_html = monitoring_overlay(root, runs, save_file=save_monitoring_overlay)
 
     configs: dict[str, dict[str, Any]] = {}
     metric_units: dict[str, str] = {}
@@ -331,7 +345,7 @@ def write_index(root: Path) -> None:
         config_name = series_key(data)
         counts = gpu_counts(data)
         repeat = repeat_number(data)
-        source_label = source_ref(metadata)
+        source_label = str(metadata.get("campaign_label") or source_ref(metadata))
         if repeat is not None:
             source_label += f" — rerun {repeat}"
         config = configs.setdefault(config_name, {
@@ -365,7 +379,7 @@ def write_index(root: Path) -> None:
     output = root / "index.html"
     renderer.generate_html(
         configs, str(output), str(root), metric_units,
-        model_label=str(first_metadata.get("model_label", "Live llm-d")),
+        model_label=model_label or str(first_metadata.get("model_label", "Live llm-d")),
         chart_defaults={
             "throughput": {"xMetric": "e2e_output_token_throughput", "yMetric": "output_token_throughput", "yNorm": "decode"},
             "latency": {"xMetric": "e2e_output_token_throughput", "yMetric": "input_token_throughput", "yNorm": "prefill"},
@@ -392,7 +406,7 @@ def write_index(root: Path) -> None:
             'for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);'
             'window.open(URL.createObjectURL(new Blob([a],{type:"text/html"})),"_blank");});</script>'
         )
-    page = page.replace('<div id="root"></div>', source + overlay_control + '<div id="root"></div>', 1)
+    page = page.replace('<div id="root"></div>', extra_html + source + overlay_control + '<div id="root"></div>', 1)
     page = page.replace("</body>", pareto_section_html() + "\n</body>", 1)
     output.write_text(page, encoding="utf-8")
 
@@ -618,7 +632,7 @@ def pareto_section_html() -> str:
 '''
 
 
-def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
+def monitoring_overlay(root: Path, runs: list[dict[str, Any]], *, save_file: bool = True) -> bytes | None:
     """Build one relative-time dashboard comparison from all saved concurrencies."""
     paths: list[tuple[int, str, Path]] = []
     for data in runs:
@@ -636,7 +650,7 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
             paths.append((concurrency, f"{source} / {run_label(data)}", path))
     if len(paths) < 2:
         return None
-    overlay_path = Path(__file__).with_name("overlay_dashboards.py")
+    overlay_path = support_file("overlay_dashboards.py")
     spec = importlib.util.spec_from_file_location("agentx_dashboard_overlay", overlay_path)
     if spec is None or spec.loader is None:
         return None
@@ -653,7 +667,8 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
         merged, file_data[0][1], labels,
         str(Path(__file__).with_name("plotly-basic-2.35.2.min.js.gz")),
     )
-    (root / "monitoring-overlay.html").write_text(page, encoding="utf-8")
+    if save_file:
+        (root / "monitoring-overlay.html").write_text(page, encoding="utf-8")
     return page.encode("utf-8")
 
 

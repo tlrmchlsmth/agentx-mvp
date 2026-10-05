@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import json
 import os
 import subprocess
@@ -81,6 +82,7 @@ class CampaignTests(unittest.TestCase):
                  patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
                  patch.object(runner, "build_commit", return_value="a" * 40), \
                  patch.object(runner, "submit_benchmark", side_effect=fake_submit), \
+                 patch.object(runner, "write_final_report", side_effect=lambda destination, summary: runner.write_summary(destination, summary)), \
                  patch.object(runner, "wait_gone"):
                 self.assertEqual(runner.run(config, root), 0, (root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(actions, ["render:baseline", "check", "apply", "get", "benchmark:baseline", "delete",
@@ -145,6 +147,7 @@ class CampaignTests(unittest.TestCase):
                  patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
                  patch.object(runner, "build_commit", return_value="a" * 40), \
                  patch.object(runner, "submit_benchmark", side_effect=fake_submit), \
+                 patch.object(runner, "write_final_report", side_effect=lambda destination, summary: runner.write_summary(destination, summary)), \
                  patch.object(runner, "wait_gone"):
                 self.assertEqual(runner.run(config, root), 0)
             self.assertEqual(len([event for event in events if event.startswith("prebuild:")]), 4)
@@ -195,6 +198,49 @@ class CampaignTests(unittest.TestCase):
                  "benchmarks": [{"tool": "nyann", "status": "completed", "measurements": measurements}]}]})
             comparison = (Path(directory) / "comparison.csv").read_text()
             self.assertIn("build,pd,nyann,stage-1,1,completed,10,1,2.0,req/s,20,tokens/s,30,ms,4,ms", comparison)
+
+    def test_final_html_embeds_all_aiperf_variants_and_nyann_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "campaigns" / "campaign"
+            destination.mkdir(parents=True)
+            records = []
+            for build, throughput in (("branch2", 10), ("branch3", 20)):
+                run_id = f"campaign-{build}-pd-aiperf"
+                sample = root / "aiperf-agentx" / run_id / "c1"
+                sample.mkdir(parents=True)
+                (sample / "benchmark-metadata.json").write_text(json.dumps({
+                    "run_id": f"{run_id}-c1", "concurrency": 1, "source_kind": "llm-d",
+                    "source_ref": "feature", "source_commit": "a" * 40,
+                    "model_label": "test-model", "topology": "pd", "total_gpu_count": 4,
+                    "prefill_gpu_count": 2, "decode_gpu_count": 2}))
+                (sample / "profile_export_aiperf.json").write_text(json.dumps({
+                    "request_throughput": {"avg": throughput, "unit": "req/s"},
+                    "output_token_throughput": {"avg": throughput * 100, "unit": "tokens/s"},
+                    "time_to_first_token": {"p90": 50, "unit": "ms"},
+                    "inter_token_latency": {"p90": 5, "unit": "ms"}}))
+                dashboard = '<script>const panels = {"gpu":{"title":"GPU","unit":"percent"}};\nconst rows = [];\n</script>'
+                (sample / "dashboard.html").write_text(dashboard)
+                records.append({"name": f"{build}-pd", "build": build, "overlay": "pd",
+                                "dimensions": {"mtp": "off"}, "status": "completed",
+                                "benchmarks": [{"tool": "aiperf", "status": "completed",
+                                                "artifacts": str(sample.parent),
+                                                "report": f"/workload/aiperf-agentx/{run_id}/index.html",
+                                                "measurements": []}]})
+            records[0]["benchmarks"].append({"tool": "nyann", "status": "completed",
+                                              "measurements": [{"sample": "stage-1", "concurrency": 4,
+                                                                "metrics": {"request_throughput": {"avg": 7}}}]})
+            summary = {"id": "campaign", "status": "completed", "overlays": records}
+            runner.write_final_report(destination, summary)
+            page = (destination / "index.html").read_text()
+            self.assertIn("branch2 / pd", page)
+            self.assertIn("branch3 / pd", page)
+            self.assertIn("nyann", page)
+            self.assertIn(base64.b64encode(dashboard.encode()).decode(), page)
+            self.assertIn('id="monitoring-overlay"', page)
+            self.assertFalse((destination / "monitoring-overlay.html").exists())
+            self.assertNotIn('src="https://cdn.plot.ly', page)
+            self.assertNotIn("../../aiperf-agentx", page)
 
     def test_rejects_unsafe_source_and_records_checkout_failure(self):
         with tempfile.TemporaryDirectory() as directory:

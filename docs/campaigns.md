@@ -124,12 +124,13 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
 - `<build>-<overlay>/manifest.yaml`, `serving-pods.json`, and submit logs.
 - `summary.json`: resolved build inputs, every combination, benchmark status,
   artifacts, and per-concurrency AIPerf and nyann measurements.
-- `comparison.csv` and `index.html`: one table across builds, overlays,
-  dimensions, and benchmark tools, with throughput and latency metrics from
-  both tools. AIPerf rows use the existing live report reader and link to its
-  generated dashboard, including the saved Grafana views; every requested
-  sample is checked, including repeated concurrencies. Nyann rows come from
-  its per-stage Job summary, which is also saved as `nyann-job.log`.
+- `comparison.csv` and `index.html`: the final HTML is one portable report for
+  every build, overlay, and sweep. Its table includes AIPerf and nyann
+  throughput, latency, dimensions, and status. The existing AIPerf renderer
+  draws cross-variant charts and embeds saved Grafana dashboards in that same
+  HTML file. Every requested AIPerf sample is checked, including repeated
+  concurrencies. Nyann rows come from its per-stage Job summary, also saved
+  as `nyann-job.log`.
 
 Full AIPerf and nyann artifacts stay in their existing `/workload/aiperf-agentx`
 and `/workload/nyann-agentx` directories, keyed by campaign, overlay, and tool.

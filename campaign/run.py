@@ -604,7 +604,7 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
             "measurements": measurements, "status": "completed"}
 
 
-def write_summary(destination: Path, summary: dict[str, Any]) -> None:
+def write_summary(destination: Path, summary: dict[str, Any], *, embedded_reports: bool = False) -> str:
     tmp = destination / "summary.json.tmp"
     tmp.write_text(json.dumps(summary, indent=2) + "\n")
     tmp.replace(destination / "summary.json")
@@ -648,6 +648,8 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
     def html_cell(row: dict[str, Any], field: str) -> str:
         value = str(row.get(field, ""))
         if field == "report" and value:
+            if embedded_reports:
+                return "<td>AIPerf charts below</td>"
             try:
                 relative = Path(value).relative_to("/workload")
             except ValueError:
@@ -658,13 +660,37 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
         return f"<td>{html.escape(value)}</td>"
 
     body = "".join("<tr>" + "".join(html_cell(row, field) for field in fields) + "</tr>" for row in rows)
-    page = "<!doctype html><meta charset='utf-8'><title>Benchmark campaign</title>" + \
-        "<style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #aaa;padding:.5rem;text-align:left}</style>" + \
-        f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + \
+    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + \
         "<h2>Builds</h2><table><tr><th>Build</th><th>Status</th><th>Resolved inputs</th><th>Error</th></tr>" + \
         "".join(build_rows) + "</table>" + \
         "<h2>All configurations</h2><table><tr>" + header + "</tr>" + body + "</table>"
+    page = "<!doctype html><html><head><meta charset='utf-8'><title>Benchmark campaign</title>" + \
+        "<style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #aaa;padding:.5rem;text-align:left}</style>" + \
+        "</head><body>" + fragment + "</body></html>"
     (destination / "index.html").write_text(page)
+    return fragment
+
+
+def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
+    """Embed every completed AIPerf sweep in the same HTML as the matrix and nyann rows."""
+    runs = []
+    for record in summary["overlays"]:
+        for bench in record.get("benchmarks", []):
+            if bench.get("tool") != "aiperf" or bench.get("status") != "completed":
+                continue
+            artifact = Path(bench["artifacts"])
+            for directory in sorted(artifact.iterdir()):
+                data = AIPERF_REPORT.run_data(directory)
+                if data is None:
+                    continue
+                label = f"{record.get('build', 'default')} / {record.get('overlay', record['name'])}"
+                dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
+                data["metadata"]["campaign_label"] = f"{label} ({dimensions})" if dimensions else label
+                runs.append(data)
+    fragment = write_summary(destination, summary, embedded_reports=bool(runs))
+    if runs:
+        AIPERF_REPORT.write_index_from_runs(destination, runs, extra_html=fragment,
+                                            model_label=f"Campaign {summary['id']}", save_monitoring_overlay=False)
 
 
 def render_overlay(overlay_root: Path, overlay: dict[str, Any]) -> str:
@@ -868,7 +894,13 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
     shutil.rmtree(overlay_root)
     summary["status"] = "failed" if failed else "completed"
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-    write_summary(destination, summary)
+    try:
+        write_final_report(destination, summary)
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["report_error"] = str(exc)
+        write_summary(destination, summary)
+        failed = True
     print(f"Campaign {config['id']} {summary['status']}; artifacts: {destination}", flush=True)
     return 1 if failed else 0
 
