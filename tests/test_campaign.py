@@ -26,6 +26,7 @@ class CampaignTests(unittest.TestCase):
         return {
             "id": "test-campaign", "namespace": "vllm",
             "source": {"repo": "https://github.com/example/llm-d.git", "ref": "feature/bench"},
+            "vllm_image": "vllm/example@sha256:abc",
             "results_pvc": "results", "benchmark_queue": "live-benchmark-client",
             "campaign_queue": "benchmark-campaign", "rollout_timeout_seconds": 60,
             "admission_timeout_seconds": 60, "cleanup_timeout_seconds": 60,
@@ -49,6 +50,8 @@ class CampaignTests(unittest.TestCase):
                 runner.validate_manifest("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: vllm\n", "vllm")
             with self.assertRaisesRegex(ValueError, "stay in namespace"):
                 runner.validate_manifest("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: test\n  namespace: other\n", "vllm")
+            with self.assertRaisesRegex(ValueError, "no LeaderWorkerSet vllm container"):
+                runner.apply_vllm_image("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: test\n", "vllm/image:nightly")
 
     def test_runs_overlays_sequentially_and_records_results(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -78,6 +81,7 @@ class CampaignTests(unittest.TestCase):
             with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
                  patch.object(runner.shutil, "rmtree"), \
                  patch.object(runner, "call", side_effect=fake_call), \
+                 patch.object(runner, "apply_vllm_image", side_effect=lambda rendered, image: rendered), \
                  patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner, "snapshot", return_value=[]), \
                  patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
@@ -140,6 +144,7 @@ class CampaignTests(unittest.TestCase):
             with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
                  patch.object(runner.shutil, "rmtree"), \
                  patch.object(runner, "render_overlay", return_value=manifest), \
+                 patch.object(runner, "apply_vllm_image", side_effect=lambda rendered, image: rendered), \
                  patch.object(runner, "resolve_build", side_effect=fake_resolve), \
                  patch.object(runner, "inject_vllm_build_script", side_effect=lambda rendered, build: rendered), \
                  patch.object(runner, "vllm_prebuild", side_effect=fake_prebuild), \
@@ -171,6 +176,7 @@ class CampaignTests(unittest.TestCase):
             destination.mkdir()
             summary = {"id": config["id"], "status": "running", "overlays": []}
             with patch.object(runner, "render_overlay", return_value=manifest), \
+                 patch.object(runner, "apply_vllm_image", side_effect=lambda rendered, image: rendered), \
                  patch.object(runner, "kube", return_value=SimpleNamespace(stdout="")), \
                  patch.object(runner, "snapshot", return_value=[]), \
                  patch.object(runner, "vllm_prebuild", side_effect=AssertionError("unexpected prebuild")):
@@ -359,6 +365,11 @@ class CampaignTests(unittest.TestCase):
             path = root / "config.json"
             path.write_text(json.dumps(config))
             runner.load_config(path)
+            del config["vllm_image"]
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "vllm_image"):
+                runner.load_config(path)
+            config["vllm_image"] = "vllm/example:nightly"
             with patch.object(runner, "call", side_effect=AssertionError("unexpected Git call")):
                 self.assertEqual(runner.resolve_build({}), {"mode": "nightly", "steps": []})
             config["builds"] = [{"name": "nightly", "steps": []}]
@@ -509,6 +520,14 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("DEEPEP_BUILD_COMMIT", {item["name"] for item in job_pod["containers"][0]["env"]})
             self.assertEqual((root / "build.log").read_text(), "cache hit\n")
 
+            selected = runner.apply_vllm_image(manifest, "quay.io/example/vllm:nightly")
+            selected_docs = list(yaml.safe_load_all(runner.inject_vllm_build_script(
+                selected, {"mode": "nightly", "steps": []})))
+            selected_container = selected_docs[-1]["spec"]["leaderWorkerTemplate"]["workerTemplate"]["spec"]["containers"][0]
+            self.assertEqual(selected_container["image"], "quay.io/example/vllm:nightly")
+            self.assertEqual(next(e["value"] for e in selected_container["env"]
+                                  if e["name"] == "VLLM_BUILD_BASE_IMAGE_ID"), "quay.io/example/vllm:nightly")
+
             nightly = runner.inject_vllm_build_script(manifest, {"mode": "nightly", "steps": []})
             nightly_docs = list(yaml.safe_load_all(nightly))
             self.assertNotIn("VLLM_BUILD_COMMIT", nightly_docs[1]["data"])
@@ -597,6 +616,7 @@ class CampaignTests(unittest.TestCase):
             with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
                  patch.object(runner.shutil, "rmtree"), \
                  patch.object(runner, "call", return_value=SimpleNamespace(stdout=manifest)), \
+                 patch.object(runner, "apply_vllm_image", side_effect=lambda rendered, image: rendered), \
                  patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner, "snapshot", return_value=[]), \
                  patch.object(runner, "wait_ready", side_effect=RuntimeError("not ready")):

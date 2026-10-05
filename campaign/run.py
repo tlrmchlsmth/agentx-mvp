@@ -99,7 +99,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text())
     if not isinstance(config, dict):
         raise ValueError("campaign must be a JSON object")
-    allowed = {"id", "namespace", "source", "build_repo", "builds", "results_pvc", "benchmark_queue",
+    allowed = {"id", "namespace", "source", "vllm_image", "build_repo", "builds", "results_pvc", "benchmark_queue",
                "campaign_queue", "overlays", "benchmarks", "rollout_timeout_seconds",
                "admission_timeout_seconds", "cleanup_timeout_seconds", "continue_on_failure"}
     if set(config) - allowed:
@@ -108,6 +108,9 @@ def load_config(path: Path) -> dict[str, Any]:
         required_name(config.get(key), key)
     for key in ("benchmark_queue", "campaign_queue"):
         required_name(config.get(key), key)
+    image = config.get("vllm_image")
+    if not isinstance(image, str) or not image or len(image) > 512 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*", image):
+        raise ValueError("vllm_image must be an explicit container image reference")
     source = config.get("source")
     if not isinstance(source, dict) or set(source) != {"repo", "ref"}:
         raise ValueError("source needs repo and ref")
@@ -324,6 +327,23 @@ def build_commit(namespace: str) -> str | None:
     return commit
 
 
+def apply_vllm_image(rendered: str, image: str) -> str:
+    """Use the campaign's explicit runtime image in every vLLM worker."""
+    documents = list(yaml.safe_load_all(rendered))
+    workers = 0
+    for item in documents:
+        if not isinstance(item, dict) or item.get("kind") != "LeaderWorkerSet":
+            continue
+        pod = item.get("spec", {}).get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec", {})
+        for container in pod.get("containers", []):
+            if container.get("name") == "vllm":
+                container["image"] = image
+                workers += 1
+    if not workers:
+        raise ValueError("overlay has no LeaderWorkerSet vllm container for vllm_image")
+    return yaml.safe_dump_all(documents, sort_keys=False)
+
+
 def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None) -> str:
     """Use the versioned campaign build recipe in both builder and serving Pods."""
     build = build or {"mode": "nightly", "steps": []}
@@ -409,7 +429,7 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
                 env = container.setdefault("env", [])
                 managed = {"VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_REPO", "VLLM_BUILD_REFS",
                            "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS", "VLLM_BUILD_MODE", "DEEPEP_BUILD_ENABLED",
-                           "DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT"}
+                           "DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT", "VLLM_BUILD_BASE_IMAGE_ID"}
                 env[:] = [item for item in env if item.get("name") not in managed]
                 existing = {item.get("name") for item in env}
                 env.append({"name": "VLLM_BUILD_MODE", "value": "source" if source_build else "nightly"})
@@ -417,10 +437,9 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
                     for key in ("VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_REPO", "VLLM_BUILD_REFS",
                                 "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS"):
                         env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
-                if "VLLM_BUILD_BASE_IMAGE_ID" not in existing:
-                    image = container.get("image", "")
-                    image_id = image.split("@", 1)[1] if "@sha256:" in image else image
-                    env.append({"name": "VLLM_BUILD_BASE_IMAGE_ID", "value": image_id})
+                image = container.get("image", "")
+                image_id = image.split("@", 1)[1] if "@sha256:" in image else image
+                env.append({"name": "VLLM_BUILD_BASE_IMAGE_ID", "value": image_id})
                 if "VLLM_BUILD_ROLE" not in existing:
                     env.append({"name": "VLLM_BUILD_ROLE", "value": "prefill"})
                 env.append({"name": "DEEPEP_BUILD_ENABLED", "value": "1" if deepep_build else "0"})
@@ -789,7 +808,8 @@ def render_overlay(overlay_root: Path, overlay: dict[str, Any]) -> str:
 def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destination: Path,
                           summary: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, str], bool, bool]:
     """Build every variant before starting any serving overlay."""
-    base_manifests = {overlay["name"]: render_overlay(overlay_root, overlay) for overlay in config["overlays"]}
+    base_manifests = {overlay["name"]: apply_vllm_image(render_overlay(overlay_root, overlay), config["vllm_image"])
+                      for overlay in config["overlays"]}
     resolved = {}
     pins: dict[tuple[str, str], str] = {}
     failed = False
@@ -912,7 +932,8 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
         manifest = folder / "manifest.yaml"
         applied = False
         try:
-            rendered = base_manifests[base_overlay["name"]] if variant else render_overlay(overlay_root, overlay)
+            rendered = (base_manifests[base_overlay["name"]] if variant else
+                        apply_vllm_image(render_overlay(overlay_root, overlay), config["vllm_image"]))
             build = matrix_builds[variant["name"]] if variant else None
             if build:
                 record["vllm_build_inputs"] = build

@@ -14,6 +14,12 @@ must never use that queue or it could block its own children.
 
 1. Copy `examples/campaign.example.json`. Set `source.repo` and `source.ref`
    to the llm-d fork and branch/tag/commit that contains the overlays. Set
+   the required `vllm_image` to the exact image reference to run, such as your
+   nightly tag or a digest. The campaign applies it to every `vllm` container
+   in the selected LeaderWorkerSet overlays and uses it for prebuild Jobs.
+   The overlays' `imagePullPolicy` still controls whether a moving tag is
+   refreshed; use `Always` for a nightly tag.
+   Set
    `build_repo` and list named `builds` with ordered `steps` when comparing vLLM
    branches. The first
    action is `checkout`; later actions can be `merge`, `cherry-pick`,
@@ -28,8 +34,8 @@ must never use that queue or it could block its own children.
    paths relative to llm-d. Use `dimensions` to label MTP, offloading,
    topology, PD size, or other settings in the final report. Each overlay also
    needs its serving Pod selector and expected Pod count. The runner fetches
-   llm-d once and resolves every requested vLLM branch once. Container images referenced
-   by overlays must already be available. A source build needs a compatible vLLM wheel build
+   llm-d once and resolves every requested vLLM branch once. The configured image
+   must be available to the cluster. A source build needs a compatible vLLM wheel build
    script, a `vllm-build-ref` ConfigMap, and a LeaderWorkerSet that sources the script. The runner
    replaces that script in the rendered manifest with
    [`campaign/vllm-wheel-build.sh`](../campaign/vllm-wheel-build.sh) from this PR.
@@ -72,10 +78,10 @@ repository or cluster permissions.
 The main example shows two builds (`branch0 + branch1 + branch2` and
 `branch0 + branch1 + branch3`) crossed with three overlays. Each overlay path
 must point to a complete Kustomize deployment; `dimensions` are report labels,
-not manifest patches. To use each overlay's nightly image, omit `build_repo`
-and `builds` entirely. To compare nightly with source builds, add
-`{"name": "nightly"}` to the `builds` list; that entry has no `steps` and uses
-the image unchanged. A nightly entry can still specify `deepep` to build only
+not manifest patches. To use `vllm_image` without a source build, omit `build_repo`
+and `builds` entirely. To compare that image with source builds, add
+`{"name": "nightly", "steps": []}` to the `builds` list; that entry uses
+the configured image unchanged. A nightly entry can still specify `deepep` to build only
 DeepEP. Nightly runs have no vLLM wheel prebuild; DeepEP-only runs prebuild its
 wheel. The saved `serving-pods.json` records the image ID used by each deployment.
 For a legacy single-overlay campaign without top-level
