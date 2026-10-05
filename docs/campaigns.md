@@ -80,6 +80,16 @@ The campaign resolves those branch heads once, injects the same commit list
 into the build Job and serving Pods, and fails if a branch moves before the
 build fetches it. The resolved inputs are saved in `summary.json`.
 
+The bundled script also retains the original laptop publishing workflow:
+`bash campaign/vllm-wheel-build.sh publish` merges or cherry-picks its ordered
+inputs, pushes a unique integration branch, and writes `build-ref.env`.
+Set `VLLM_BUILD_REFS` and `VLLM_BUILD_ACTIONS` together to override its
+original branch recipe, and `VLLM_BUILD_REF_FILE` to choose the output path.
+`publish-and-deploy` additionally requires `VLLM_BUILD_OVERLAY` and
+`VLLM_BUILD_REF_FILE`; `NAMESPACE` and `VLLM_BUILD_POD_SELECTOR` control its
+deployment and optional Pod restart. Campaign build recipes run inside the
+cluster without pushing an integration branch.
+
 ## Execution and results
 
 The campaign Job runs in the configured namespace. It is queued by Kueue,

@@ -146,6 +146,19 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "action is invalid"):
                 runner.load_config(path)
 
+    def test_full_build_script_keeps_publisher_commands(self):
+        script = MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh"
+        syntax = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        bad_recipe = subprocess.run(["bash", str(script), "publish"], capture_output=True, text=True,
+                                    env={**os.environ, "VLLM_BUILD_REFS": "base patch", "VLLM_BUILD_ACTIONS": "checkout"})
+        self.assertNotEqual(bad_recipe.returncode, 0)
+        self.assertIn("matching lengths", bad_recipe.stderr + bad_recipe.stdout)
+        deploy = subprocess.run(["bash", str(script), "publish-and-deploy"], capture_output=True, text=True,
+                                env={**os.environ, "VLLM_BUILD_OVERLAY": "/tmp/example"})
+        self.assertNotEqual(deploy.returncode, 0)
+        self.assertIn("VLLM_BUILD_REF_FILE", deploy.stderr + deploy.stdout)
+
     def test_fetches_selected_fork_ref_once(self):
         calls = []
 

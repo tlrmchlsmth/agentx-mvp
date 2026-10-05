@@ -6,6 +6,136 @@ set -x
 
 BUILD_REPO=${VLLM_BUILD_REPO:-https://github.com/elvircrn/vllm.git}
 
+# Run this file directly on the laptop to turn the ordered, moving branch set
+# into one durable benchmark integration branch. The `checkout` action below
+# means only "start the integration commit here"; it is never the branch used
+# by Kubernetes. The generated branch name is intentionally unique, so a later
+# experiment cannot overwrite this benchmark's source history.
+publish_build_ref() {
+  local ref_file target_branch work_dir merged_head remote_head fetch_depth
+  local i action branch
+  local -a source_branches source_actions
+
+  if [ "$#" -ne 0 ]; then
+    echo "Usage: $0"
+    return 1
+  fi
+
+  # These are the original Kimi build inputs. A caller may override both
+  # ordered lists; `checkout` establishes the local merge base and the pushed
+  # benchmark branch is always the final consolidated HEAD.
+  # PR #58372: populate completion_tokens_details.reasoning_tokens for Kimi K3.
+  read -r -a source_actions <<< "${VLLM_BUILD_ACTIONS:-checkout cherry-pick-m2 cherry-pick cherry-pick-m2 cherry-pick-m2 cherry-pick cherry-pick cherry-pick cherry-pick}"
+  read -r -a source_branches <<< "${VLLM_BUILD_REFS:-deepep-triton-epilogue fused-globalize-align-cuda kimi-k3-shard-sp-deepep-v2 humming-0.1.13-no-tuning-hacks fix/flashinfer-h200-backend vllm-profiling-qol dcp_fusion_triton nccl_cg codex/kimi-k3-reasoning-token-count}"
+  if [ "${#source_branches[@]}" -eq 0 ] || [ "${#source_actions[@]}" -ne "${#source_branches[@]}" ] || \
+     [ "${source_actions[0]}" != "checkout" ]; then
+    echo "FATAL: BUILD_BRANCHES and BUILD_BRANCH_ACTIONS must have matching lengths and begin with checkout."
+    return 1
+  fi
+  fetch_depth=${VLLM_BUILD_FETCH_DEPTH:-256}
+  if ! [[ "$fetch_depth" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FATAL: VLLM_BUILD_FETCH_DEPTH must be a positive integer."
+    return 1
+  fi
+
+  target_branch="benchmark/kimi-k3-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  if git ls-remote --exit-code --heads "$BUILD_REPO" "refs/heads/${target_branch}" >/dev/null 2>&1; then
+    echo "FATAL: generated benchmark branch unexpectedly already exists: ${target_branch}"
+    return 1
+  fi
+
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/kimi-k3-consolidate.XXXXXX") || return 1
+  trap 'rm -rf -- "$work_dir"; trap - RETURN' RETURN
+  # This temporary repository only creates and pushes an integration commit.
+  # Keep it sparse (root files only), shallow, and blob-filtered; it never
+  # compiles vLLM. The pod build intentionally uses a full checkout instead.
+  git clone -q --no-checkout --sparse --filter=blob:none --depth="$fetch_depth" \
+    "$BUILD_REPO" "$work_dir/vllm" || return 1
+  git -C "$work_dir/vllm" remote add elvircrn "$BUILD_REPO" || return 1
+
+  # Resolve and fetch all inputs before merging. Remote-tracking refs preserve
+  # exactly the branch/action order requested by the experimenter.
+  for i in "${!source_branches[@]}"; do
+    branch=${source_branches[$i]}
+    git -C "$work_dir/vllm" fetch -q --no-tags --filter=blob:none --depth="$fetch_depth" elvircrn \
+      "refs/heads/${branch}:refs/remotes/benchmark-input/${i}" || {
+      echo "FATAL: could not fetch elvircrn/${branch}."
+      return 1
+    }
+  done
+  git -C "$work_dir/vllm" checkout -q --detach refs/remotes/benchmark-input/0 || return 1
+
+  for ((i = 1; i < ${#source_branches[@]}; i++)); do
+    action=${source_actions[$i]}
+    branch=${source_branches[$i]}
+    case "$action" in
+      merge)
+        git -C "$work_dir/vllm" -c user.name=benchmark-publisher \
+          -c user.email=benchmark-publisher@localhost merge --no-edit "refs/remotes/benchmark-input/${i}" || return 1
+        ;;
+      cherry-pick|cherry-pick-m*)
+        if [ "$action" = "cherry-pick" ]; then
+          git -C "$work_dir/vllm" cherry-pick "refs/remotes/benchmark-input/${i}" || return 1
+        else
+          if ! [[ "${action#cherry-pick-m}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "FATAL: invalid mainline action ${action}."
+            return 1
+          fi
+          git -C "$work_dir/vllm" cherry-pick -m "${action#cherry-pick-m}" "refs/remotes/benchmark-input/${i}" || return 1
+        fi
+        ;;
+      cherry-pick-parent1)
+        # A feature branch may be refreshed by merging main into it. Its first
+        # parent remains the feature tip; cherry-pick that commit, not the
+        # merge delta, which would replay unrelated upstream changes.
+        git -C "$work_dir/vllm" cherry-pick "refs/remotes/benchmark-input/${i}^1" || return 1
+        ;;
+      *)
+        echo "FATAL: unsupported action ${action} for ${branch}."
+        return 1
+        ;;
+    esac
+  done
+
+  merged_head=$(git -C "$work_dir/vllm" rev-parse HEAD) || return 1
+  git -C "$work_dir/vllm" push elvircrn "${merged_head}:refs/heads/${target_branch}" || return 1
+  remote_head=$(git -C "$work_dir/vllm" ls-remote elvircrn "refs/heads/${target_branch}" | awk '{print $1}')
+  if [ "$remote_head" != "$merged_head" ]; then
+    echo "FATAL: remote verification failed for ${target_branch}."
+    return 1
+  fi
+
+  ref_file=${VLLM_BUILD_REF_FILE:-build-ref.env}
+  printf 'VLLM_BUILD_REF=%s\nVLLM_BUILD_COMMIT=%s\n' "$target_branch" "$merged_head" \
+    > "${ref_file}.tmp" && mv "${ref_file}.tmp" "$ref_file" || return 1
+
+  echo "Published ${target_branch} at ${merged_head}"
+}
+
+publish_and_deploy() {
+  local overlay namespace selector
+  overlay=${VLLM_BUILD_OVERLAY:?FATAL: set VLLM_BUILD_OVERLAY to a Kustomize overlay path.}
+  : "${VLLM_BUILD_REF_FILE:?FATAL: set VLLM_BUILD_REF_FILE to the overlay build-ref.env path.}"
+  namespace=${NAMESPACE:-default}
+  publish_build_ref "$@" || return 1
+  kubectl --request-timeout=10m apply -n "$namespace" -k "$overlay" || return 1
+  selector=${VLLM_BUILD_POD_SELECTOR:-}
+  if [ -n "$selector" ]; then
+    kubectl delete pods -n "$namespace" -l "$selector"
+  fi
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  action=${1:-}
+  if [ "$#" -gt 0 ]; then shift; fi
+  case "$action" in
+    publish) publish_build_ref "$@" ;;
+    publish-and-deploy) publish_and_deploy "$@" ;;
+    *) echo "Usage: $0 publish|publish-and-deploy" >&2; exit 2 ;;
+  esac
+  exit $?
+fi
+
 BUILD_BRANCH=${VLLM_BUILD_REF:?FATAL: VLLM_BUILD_REF is not set; set a pinned build ref in the overlay first.}
 BUILD_SHA=${VLLM_BUILD_COMMIT:?FATAL: VLLM_BUILD_COMMIT is not set; set a pinned build ref in the overlay first.}
 if ! [[ "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
