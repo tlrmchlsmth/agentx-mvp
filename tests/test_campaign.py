@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 import tempfile
 import unittest
+import yaml
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -131,6 +132,49 @@ class CampaignTests(unittest.TestCase):
     def test_missing_vllm_build_marker_is_allowed(self):
         with patch.object(runner, "kube", return_value=SimpleNamespace(stdout="")):
             self.assertIsNone(runner.build_commit("vllm"))
+
+    def test_humming_build_prewarms_with_serving_image_and_shared_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            pod = {"serviceAccountName": "kimi-k3", "nodeSelector": {"gpu": "h200"},
+                   "volumes": [{"name": "humming-build", "configMap": {"name": "humming-build"}},
+                               {"name": "build-cache", "persistentVolumeClaim": {"claimName": "kimi-cache"}}],
+                   "containers": [{"name": "vllm", "image": "vllm/example@sha256:abc", "resources": {"requests": {"nvidia.com/gpu": "8"}},
+                                   "env": [{"name": "VLLM_BUILD_ROLE", "value": "prefill"},
+                                           {"name": "VLLM_BUILD_REF", "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": "VLLM_BUILD_REF"}}},
+                                           {"name": "VLLM_BUILD_COMMIT", "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": "VLLM_BUILD_COMMIT"}}},
+                                           {"name": "VLLM_BUILD_BASE_IMAGE_ID", "value": "sha256:abc"}],
+                                   "volumeMounts": [{"name": "humming-build", "mountPath": "/opt/build-scripts"},
+                                                    {"name": "build-cache", "mountPath": "/shared/vllm-build"}]}]}
+            manifest = "\n---\n".join([
+                yaml.safe_dump({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "humming-build"},
+                                "data": {"humming-build.sh": "echo build"}}),
+                yaml.safe_dump({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "vllm-build-ref"},
+                                "data": {"VLLM_BUILD_REF": "benchmark/ref", "VLLM_BUILD_COMMIT": "a" * 40}}),
+                yaml.safe_dump({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": "kimi-k3"}}),
+                yaml.safe_dump({"apiVersion": "leaderworkerset.x-k8s.io/v1", "kind": "LeaderWorkerSet",
+                                "metadata": {"name": "prefill"}, "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": pod}}}})])
+            created = []
+            actions = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                actions.append(args[0])
+                if args[0] == "create":
+                    created.append(json.loads(kwargs["input_text"]))
+                return SimpleNamespace(stdout="cache hit\n" if args[0] == "logs" else "", stderr="", returncode=0)
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                commit = runner.humming_prebuild(manifest, config, config["overlays"][0], root)
+            self.assertEqual(commit, "a" * 40)
+            self.assertEqual(actions, ["create", "create", "create", "create", "wait", "logs", "delete"])
+            self.assertEqual([item["kind"] for item in created], ["ConfigMap", "ConfigMap", "ServiceAccount", "Job"])
+            job_pod = created[-1]["spec"]["template"]["spec"]
+            self.assertEqual(job_pod["serviceAccountName"], "kimi-k3")
+            self.assertEqual(job_pod["nodeSelector"], {"gpu": "h200"})
+            self.assertEqual(job_pod["containers"][0]["image"], "vllm/example@sha256:abc")
+            self.assertEqual(job_pod["containers"][0]["resources"]["requests"]["nvidia.com/gpu"], "8")
+            self.assertEqual((root / "build.log").read_text(), "cache hit\n")
 
     def test_live_submitters_use_campaign_source_without_build_marker(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import html
 import json
@@ -187,6 +188,74 @@ def build_commit(namespace: str) -> str | None:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("vllm-build-ref has no valid commit")
     return commit
+
+
+def humming_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any], folder: Path) -> str | None:
+    """Warm the exact serving wheel cache before starting an LWS, if present."""
+    documents = [item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)]
+    maps = {item.get("metadata", {}).get("name"): item for item in documents if item.get("kind") == "ConfigMap"}
+    script_map = maps.get("humming-build")
+    if not script_map or "humming-build.sh" not in script_map.get("data", {}):
+        return None
+    ref_map = maps.get("vllm-build-ref")
+    if not ref_map or not re.fullmatch(r"[0-9a-f]{40}", ref_map.get("data", {}).get("VLLM_BUILD_COMMIT", "")):
+        raise ValueError("humming-build requires a vllm-build-ref ConfigMap with an immutable commit")
+    candidates = []
+    for item in documents:
+        if item.get("kind") != "LeaderWorkerSet":
+            continue
+        pod = item.get("spec", {}).get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec", {})
+        for container in pod.get("containers", []):
+            if any(env.get("name") == "VLLM_BUILD_ROLE" and env.get("value") == "prefill" for env in container.get("env", [])):
+                candidates.append((pod, container))
+    if len(candidates) != 1:
+        raise ValueError("humming-build needs exactly one prefill worker container")
+    pod, serving = candidates[0]
+    mounts = [copy.deepcopy(m) for m in serving.get("volumeMounts", []) if m.get("name") in {"build-cache", "humming-build"}]
+    volumes = [copy.deepcopy(v) for v in pod.get("volumes", []) if v.get("name") in {"build-cache", "humming-build"}]
+    if {m.get("name") for m in mounts} != {"build-cache", "humming-build"} or {v.get("name") for v in volumes} != {"build-cache", "humming-build"}:
+        raise ValueError("humming-build prefill worker needs script and shared build-cache mounts")
+    script_volume = next(v for v in volumes if v["name"] == "humming-build")
+    if script_volume.get("configMap", {}).get("name") != "humming-build":
+        raise ValueError("humming-build script volume must use the rendered ConfigMap")
+    env = [copy.deepcopy(e) for e in serving.get("env", []) if e.get("name", "").startswith("VLLM_BUILD_")]
+    if not {"VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_BASE_IMAGE_ID", "VLLM_BUILD_ROLE"}.issubset({e["name"] for e in env}):
+        raise ValueError("humming-build prefill worker is missing build identity")
+    env.append({"name": "LWS_WORKER_INDEX", "value": "0"})
+    builder = {"name": "build", "image": serving["image"], "imagePullPolicy": serving.get("imagePullPolicy", "IfNotPresent"),
+               "command": ["/bin/bash", "-c"], "args": ["source /opt/build-scripts/humming-build.sh"],
+               "env": env, "resources": copy.deepcopy(serving.get("resources", {})), "volumeMounts": mounts}
+    if "securityContext" in serving:
+        builder["securityContext"] = copy.deepcopy(serving["securityContext"])
+    name = "campaign-build-" + hashlib.sha256(f"{config['id']}/{overlay['name']}".encode()).hexdigest()[:16]
+    job = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": name, "namespace": config["namespace"]},
+           "spec": {"backoffLimit": 0, "activeDeadlineSeconds": config["rollout_timeout_seconds"],
+                    "template": {"spec": {"restartPolicy": "Never", "serviceAccountName": pod.get("serviceAccountName", "default"),
+                                          "volumes": volumes, "containers": [builder]}}}}
+    for field in ("nodeSelector", "tolerations", "imagePullSecrets", "runtimeClassName", "priorityClassName"):
+        if field in pod:
+            job["spec"]["template"]["spec"][field] = copy.deepcopy(pod[field])
+    # These are owned by the saved overlay manifest and deleted with it on failure.
+    service_account = next((item for item in documents if item.get("kind") == "ServiceAccount" and
+                            item.get("metadata", {}).get("name") == pod.get("serviceAccountName")), None)
+    for item in (script_map, ref_map, service_account):
+        if item is None:
+            continue
+        kube(config["namespace"], "create", "-f", "-", input_text=json.dumps(item))
+    try:
+        kube(config["namespace"], "create", "-f", "-", input_text=json.dumps(job))
+        waited = kube(config["namespace"], "wait", "--for=condition=complete", f"job/{name}",
+                      f"--timeout={config['rollout_timeout_seconds']}s", check=False)
+        logs = kube(config["namespace"], "logs", f"job/{name}", check=False)
+        (folder / "build.log").write_text(logs.stdout + logs.stderr)
+        if waited.returncode:
+            raise RuntimeError(f"humming-build prebuild failed: {waited.stderr.strip()}; see {folder / 'build.log'}")
+    finally:
+        deleted = kube(config["namespace"], "delete", "job", name, "--ignore-not-found", "--wait=true",
+                       f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
+        if deleted.returncode:
+            raise CleanupError(f"prebuild Job {name} cleanup failed: {deleted.stderr.strip()}")
+    return ref_map["data"]["VLLM_BUILD_COMMIT"]
 
 
 def wait_ready(config: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
@@ -376,7 +445,11 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
                 raise RuntimeError(f"overlay {name} would modify pre-existing resources: {existing}")
             if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
                 raise RuntimeError(f"overlay {name} cannot start while serving Pods already exist in the namespace")
-            applied = True  # apply may partially succeed; always clean up its manifest
+            applied = True  # prebuild or apply may partially succeed; clean up the saved manifest
+            prebuild_commit = humming_prebuild(rendered, config, overlay, folder)
+            if prebuild_commit:
+                record["prebuild_commit"] = prebuild_commit
+                print(f"Overlay {name} build cache prepared for {prebuild_commit[:12]}", flush=True)
             kube(config["namespace"], "apply", "-f", str(manifest))
             baseline = wait_ready(config, overlay)
             print(f"Overlay {name} ready: {len(baseline)} serving Pods", flush=True)

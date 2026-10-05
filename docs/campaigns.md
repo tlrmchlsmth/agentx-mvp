@@ -18,7 +18,14 @@ must never use that queue or it could block its own children.
    every overlay. Changing forks or branches does not require rebuilding the
    campaign image. Container images referenced by those overlays must already
    be published; the campaign checks out deployment manifests but does not
-   build llm-d images.
+   build llm-d images. If an overlay contains the `humming-build` script and
+   `vllm-build-ref` ConfigMaps plus a prefill LeaderWorkerSet, the runner
+   automatically starts a build Job before the serving deployment. The Job
+   uses that worker's image, GPU resources, and shared build-cache PVC. The
+   script validates and installs an existing wheel or builds and caches it on
+   a miss. A failed build stops that overlay before serving Pods are started.
+   The build ref must identify an already published immutable vLLM commit;
+   the runner does not push branches or require Git write credentials.
 2. Each overlay must render a **complete, disposable, namespaced** deployment.
    Resources that already exist are rejected so cleanup cannot delete shared
    infrastructure. Do not put the results PVC, Kueue objects, namespace, or
@@ -52,7 +59,9 @@ repository or cluster permissions.
 The campaign Job runs in the configured namespace. It is queued by Kueue,
 fetches the selected llm-d fork/ref once, saves its resolved commit, then
 renders each overlay with `kubectl kustomize`, stores the rendered manifest and
-its SHA-256 hash, and checks that its resources do not pre-exist. It applies the
+its SHA-256 hash, and checks that its resources do not pre-exist. Humming overlays
+first create their build ConfigMaps and run the cache-aware build Job. Its output
+is saved as `<overlay>/build.log`; the Job is removed before deployment. It applies the
 manifest, waits for the configured Pod selector to match exactly
 `expected_pods` Ready Pods, and records Pod UIDs plus the vLLM build commit.
 After each benchmark it checks that those Pod UIDs and the build commit are
