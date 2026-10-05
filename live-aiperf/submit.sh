@@ -53,6 +53,20 @@ MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-1000000000}"
 TOPOLOGY="${TOPOLOGY:-auto}"
 REQUESTED_TOPOLOGY="$TOPOLOGY"
 KUBECTL_IMAGE="${KUBECTL_IMAGE:-registry.k8s.io/kubectl:v1.31.0}"
+BENCHMARK_QUEUE="${LIVE_BENCHMARK_QUEUE:-live-benchmark-client}"
+READY_TIMEOUT_SECONDS="${LIVE_AIPERF_READY_TIMEOUT_SECONDS:-1800}"
+if [[ ! "$BENCHMARK_QUEUE" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || (( ${#BENCHMARK_QUEUE} > 63 )); then
+  echo "invalid LIVE_BENCHMARK_QUEUE: ${BENCHMARK_QUEUE}" >&2
+  exit 2
+fi
+if [[ ! "$READY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || (( READY_TIMEOUT_SECONDS < 60 || READY_TIMEOUT_SECONDS > 7200 )); then
+  echo "LIVE_AIPERF_READY_TIMEOUT_SECONDS must be 60-7200" >&2
+  exit 2
+fi
+kubectl get localqueue "$BENCHMARK_QUEUE" -n "$NAMESPACE" -o name >/dev/null || {
+  echo "Missing Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE}; run just live-benchmark-kueue-setup ${NAMESPACE}" >&2
+  exit 1
+}
 
 # This is the exact commit selected by the PD deployment. Read it before
 # creating the Job so the benchmark source is explicit in both the Job and its
@@ -130,17 +144,6 @@ if [[ -z "${MODEL_LABEL:-}" ]]; then
     exit 1
   fi
   MODEL_LABEL="${DISCOVERED_MODELS[0]}"
-fi
-
-# Stop any currently running aiperf benchmark before starting a new one.
-running_jobs="$(kubectl get jobs -n "$NAMESPACE" \
-  -l benchmark.llm-d.ai/workload=inferencex-agentx-mvp \
-  -o jsonpath='{range .items[?(@.status.active>0)]}{.metadata.name}{"\n"}{end}')"
-if [[ -n "$running_jobs" ]]; then
-  echo "Stopping running aiperf job(s): $running_jobs"
-  while IFS= read -r job; do
-    [[ -z "$job" ]] || kubectl delete job "$job" -n "$NAMESPACE" --wait=false
-  done <<< "$running_jobs"
 fi
 
 BASE_SELECTOR="llm-d.ai/model=${MODEL_LABEL},llm-d.ai/inference-serving=true"
@@ -247,6 +250,7 @@ metadata:
   name: ${JOB_NAME}
   namespace: ${NAMESPACE}
   labels:
+    kueue.x-k8s.io/queue-name: "${BENCHMARK_QUEUE}"
     benchmark.llm-d.ai/workload: inferencex-agentx-mvp
     benchmark.llm-d.ai/model: "${MODEL_LABEL}"
     benchmark.llm-d.ai/concurrency: "${CONCURRENCY_LABEL}"
@@ -256,6 +260,7 @@ metadata:
     benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
     benchmark.llm-d.ai/run-id: "${RUN_ID}"
 spec:
+  suspend: true
   backoffLimit: 0
   template:
     metadata:
@@ -282,10 +287,15 @@ spec:
           args:
             - |
               set -eu
+              deadline=\$(( \$(date +%s) + ${READY_TIMEOUT_SECONDS} ))
               for selector in ${WAIT_SELECTORS}; do
                 while :; do
+                  if [ "\$(date +%s)" -ge "\$deadline" ]; then
+                    echo "Timed out waiting for serving pods matching \$selector" >&2
+                    exit 1
+                  fi
                   pods=\$(kubectl get pods -n "${NAMESPACE}" -l "\$selector" -o name)
-                  if [ -n "\$pods" ] && kubectl wait -n "${NAMESPACE}" --for=condition=Ready pod -l "\$selector" --timeout=87600h; then
+                  if [ -n "\$pods" ] && kubectl wait -n "${NAMESPACE}" --for=condition=Ready pod -l "\$selector" --timeout=15s; then
                     break
                   fi
                   sleep 15
@@ -431,7 +441,7 @@ kubectl create configmap "$ARTIFACT_CONFIGMAP" -n "$NAMESPACE" \
   --dry-run=client -o yaml | kubectl create -f -
 kubectl apply -f "$JOB_MANIFEST"
 
-echo "Job created: ${JOB_NAME}"
+echo "Job queued: ${JOB_NAME} (Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE})"
 echo "vLLM build: ${VLLM_BUILD_REF} (${VLLM_BUILD_COMMIT})"
 echo "Logs: kubectl logs -n ${NAMESPACE} -f job/${JOB_NAME}"
 for run_spec in "${RUN_SPECS[@]}"; do

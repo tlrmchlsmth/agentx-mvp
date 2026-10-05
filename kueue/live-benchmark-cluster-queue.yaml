@@ -1,0 +1,28 @@
+# A single CPU benchmark client can run at a time across both live tools.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: live-benchmark-client
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: live-benchmark-client
+spec:
+  namespaceSelector: {}
+  preemption:
+    withinClusterQueue: Never
+    reclaimWithinCohort: Never
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "ephemeral-storage"]
+      flavors:
+        - name: live-benchmark-client
+          resources:
+            - name: cpu
+              nominalQuota: "4"
+            - name: memory
+              nominalQuota: 8Gi
+            - name: ephemeral-storage
+              nominalQuota: 20Gi
+  queueingStrategy: StrictFIFO

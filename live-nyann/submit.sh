@@ -52,6 +52,15 @@ if [[ -z "$NAMESPACE" ]]; then
   NAMESPACE="${DEPLOYMENT_NAMESPACES[0]}"
 fi
 echo "Using namespace: ${NAMESPACE}"
+BENCHMARK_QUEUE="${LIVE_BENCHMARK_QUEUE:-live-benchmark-client}"
+if [[ ! "$BENCHMARK_QUEUE" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || (( ${#BENCHMARK_QUEUE} > 63 )); then
+  echo "invalid LIVE_BENCHMARK_QUEUE: ${BENCHMARK_QUEUE}" >&2
+  exit 2
+fi
+kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get localqueue "$BENCHMARK_QUEUE" -n "$NAMESPACE" -o name >/dev/null || {
+  echo "Missing Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE}; run just live-benchmark-kueue-setup ${NAMESPACE}" >&2
+  exit 1
+}
 
 BASE_URL="${BASE_URL:-http://llm-d-inference-gateway-istio.${NAMESPACE}.svc.cluster.local/v1}"
 NYANN_IMAGE="${NYANN_IMAGE:-ghcr.io/neuralmagic/nyann-bench:latest}"
@@ -106,15 +115,6 @@ METRICS_SERVICE_NAME="${JOB_NAME}-metrics"
 OUTPUT_PATH="/workload/${OUTPUT_ROOT}/${RUN_ID}"
 
 echo "Preparing the benchmark Job..."
-running_jobs="$(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get jobs -n "$NAMESPACE" \
-  -l benchmark.llm-d.ai/workload=nyann-agentx-mvp \
-  -o jsonpath='{range .items[?(@.status.active>0)]}{.metadata.name}{"\n"}{end}')"
-if [[ -n "$running_jobs" ]]; then
-  echo "Stopping running nyann-bench job(s): $running_jobs"
-  while IFS= read -r job; do
-    [[ -z "$job" ]] || kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" delete job "$job" -n "$NAMESPACE" --wait=false
-  done <<< "$running_jobs"
-fi
 
 POD_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/nyann-serving-pods.XXXXXX.yaml")"
 JOB_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/nyann-job.XXXXXX.yaml")"
@@ -168,6 +168,7 @@ metadata:
   name: ${JOB_NAME}
   namespace: ${NAMESPACE}
   labels:
+    kueue.x-k8s.io/queue-name: "${BENCHMARK_QUEUE}"
     benchmark.llm-d.ai/workload: nyann-agentx-mvp
     benchmark.llm-d.ai/model: "${MODEL_LABEL}"
     benchmark.llm-d.ai/concurrency: "${CONCURRENCY_LABEL}"
@@ -180,6 +181,7 @@ metadata:
     benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
     benchmark.llm-d.ai/run-id: "${RUN_ID}"
 spec:
+  suspend: true
   backoffLimit: 0
   activeDeadlineSeconds: ${TOTAL_DURATION}
   template:
@@ -246,7 +248,7 @@ kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" create configmap "$ARTIFACT
   --dry-run=client -o yaml | kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" create -f -
 kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" apply -f "$JOB_MANIFEST"
 
-echo "Job created: ${JOB_NAME}"
+echo "Job queued: ${JOB_NAME} (Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE})"
 echo "nyann-bench image: ${NYANN_IMAGE}"
 echo "Target: ${BASE_URL} (model ${MODEL_LABEL})"
 echo "Synthetic workload: ISL=${ISL}, OSL=${OSL}"

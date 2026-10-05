@@ -62,6 +62,11 @@ agentx_request := env_var_or_default('AGENTX_REQUEST', 'examples/kimi-k3-a100-fu
 default:
     @just --list
 
+# Install the shared one-at-a-time CPU benchmark queue in the serving namespace.
+live-benchmark-kueue-setup namespace:
+    kubectl apply -f "{{repo_root}}/kueue/live-benchmark-cluster-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/live-benchmark-local-queue.yaml"
+
 # Benchmark the currently deployed llm-d model. This is intentionally a thin
 # deployment-coupled path: it discovers the model/topology, captures the
 # serving spec, and submits one autonomous sweep Job.

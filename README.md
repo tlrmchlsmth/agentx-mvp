@@ -16,6 +16,20 @@ paths: it discovers the live model and topology, records the deployed vLLM
 branch/SHA, captures the serving-pod and AIPerf Job YAML, and submits one
 autonomous Kubernetes Job for the entire concurrency sweep.
 
+Install the dedicated CPU benchmark queue once in the namespace carrying
+`vllm-build-ref` (shown as `vllm` below). This requires permission to create a
+cluster-scoped ResourceFlavor and ClusterQueue:
+
+```bash
+just live-benchmark-kueue-setup vllm
+```
+
+Both live tools submit to the `live-benchmark-client` LocalQueue. Its 4-CPU,
+8-GiB quota admits one benchmark client Job at a time; later AIPerf and nyann
+Jobs wait instead of cancelling an active run. Existing Jobs submitted before
+this change are outside this queue. Set `LIVE_BENCHMARK_QUEUE` only if an
+operator has provisioned another suitable LocalQueue in the serving namespace.
+
 ```bash
 just live-aiperf 1,4,8,16
 just live-aiperf-report
