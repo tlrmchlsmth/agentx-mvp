@@ -190,16 +190,65 @@ def build_commit(namespace: str) -> str | None:
     return commit
 
 
-def humming_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any], folder: Path) -> str | None:
+def inject_vllm_build_script(rendered: str) -> str:
+    """Use the versioned campaign build recipe in both builder and serving Pods."""
+    documents = list(yaml.safe_load_all(rendered))
+    candidates = []
+    for item in documents:
+        if not isinstance(item, dict) or item.get("kind") != "ConfigMap":
+            continue
+        for key, value in item.get("data", {}).items():
+            if key.endswith(".sh") and isinstance(value, str) and all(
+                marker in value for marker in ("VLLM_BUILD_COMMIT", "BUILD_VARIANT=", "/shared/vllm-build")
+            ):
+                candidates.append((item, key))
+    if not candidates:
+        return rendered
+    if len(candidates) != 1:
+        raise ValueError("overlay contains multiple vLLM wheel build scripts")
+    script_map, old_key = candidates[0]
+    old_name = script_map["metadata"]["name"]
+    if old_name != "vllm-build" and any(
+        isinstance(item, dict) and item.get("kind") == "ConfigMap" and item.get("metadata", {}).get("name") == "vllm-build"
+        for item in documents
+    ):
+        raise ValueError("overlay already contains a conflicting vllm-build ConfigMap")
+    script_map["metadata"]["name"] = "vllm-build"
+    script_map["data"] = {"vllm-wheel-build.sh": (ROOT / "campaign" / "vllm-wheel-build.sh").read_text()}
+    references = 0
+    for item in documents:
+        if not isinstance(item, dict) or item.get("kind") != "LeaderWorkerSet":
+            continue
+        pod = item.get("spec", {}).get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec", {})
+        old_volumes = set()
+        for volume in pod.get("volumes", []):
+            if volume.get("configMap", {}).get("name") == old_name:
+                old_volumes.add(volume["name"])
+                volume["name"] = "vllm-build"
+                volume["configMap"]["name"] = "vllm-build"
+        for container in pod.get("containers", []):
+            for mount in container.get("volumeMounts", []):
+                if mount.get("name") in old_volumes:
+                    mount["name"] = "vllm-build"
+            for field in ("command", "args"):
+                if field in container:
+                    references += sum(old_key in part for part in container[field])
+                    container[field] = [part.replace(old_key, "vllm-wheel-build.sh") for part in container[field]]
+    if not references:
+        raise ValueError("vLLM build script is not sourced by a LeaderWorkerSet container")
+    return yaml.safe_dump_all(documents, sort_keys=False)
+
+
+def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any], folder: Path) -> str | None:
     """Warm the exact serving wheel cache before starting an LWS, if present."""
     documents = [item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)]
     maps = {item.get("metadata", {}).get("name"): item for item in documents if item.get("kind") == "ConfigMap"}
-    script_map = maps.get("humming-build")
-    if not script_map or "humming-build.sh" not in script_map.get("data", {}):
+    script_map = maps.get("vllm-build")
+    if not script_map or "vllm-wheel-build.sh" not in script_map.get("data", {}):
         return None
     ref_map = maps.get("vllm-build-ref")
     if not ref_map or not re.fullmatch(r"[0-9a-f]{40}", ref_map.get("data", {}).get("VLLM_BUILD_COMMIT", "")):
-        raise ValueError("humming-build requires a vllm-build-ref ConfigMap with an immutable commit")
+        raise ValueError("vLLM build requires a vllm-build-ref ConfigMap with an immutable commit")
     candidates = []
     for item in documents:
         if item.get("kind") != "LeaderWorkerSet":
@@ -209,21 +258,21 @@ def humming_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, A
             if any(env.get("name") == "VLLM_BUILD_ROLE" and env.get("value") == "prefill" for env in container.get("env", [])):
                 candidates.append((pod, container))
     if len(candidates) != 1:
-        raise ValueError("humming-build needs exactly one prefill worker container")
+        raise ValueError("vLLM build needs exactly one prefill worker container")
     pod, serving = candidates[0]
-    mounts = [copy.deepcopy(m) for m in serving.get("volumeMounts", []) if m.get("name") in {"build-cache", "humming-build"}]
-    volumes = [copy.deepcopy(v) for v in pod.get("volumes", []) if v.get("name") in {"build-cache", "humming-build"}]
-    if {m.get("name") for m in mounts} != {"build-cache", "humming-build"} or {v.get("name") for v in volumes} != {"build-cache", "humming-build"}:
-        raise ValueError("humming-build prefill worker needs script and shared build-cache mounts")
-    script_volume = next(v for v in volumes if v["name"] == "humming-build")
-    if script_volume.get("configMap", {}).get("name") != "humming-build":
-        raise ValueError("humming-build script volume must use the rendered ConfigMap")
+    mounts = [copy.deepcopy(m) for m in serving.get("volumeMounts", []) if m.get("name") in {"build-cache", "vllm-build"}]
+    volumes = [copy.deepcopy(v) for v in pod.get("volumes", []) if v.get("name") in {"build-cache", "vllm-build"}]
+    if {m.get("name") for m in mounts} != {"build-cache", "vllm-build"} or {v.get("name") for v in volumes} != {"build-cache", "vllm-build"}:
+        raise ValueError("vLLM prefill worker needs script and shared build-cache mounts")
+    script_volume = next(v for v in volumes if v["name"] == "vllm-build")
+    if script_volume.get("configMap", {}).get("name") != "vllm-build":
+        raise ValueError("vLLM script volume must use the rendered ConfigMap")
     env = [copy.deepcopy(e) for e in serving.get("env", []) if e.get("name", "").startswith("VLLM_BUILD_")]
     if not {"VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_BASE_IMAGE_ID", "VLLM_BUILD_ROLE"}.issubset({e["name"] for e in env}):
-        raise ValueError("humming-build prefill worker is missing build identity")
+        raise ValueError("vLLM prefill worker is missing build identity")
     env.append({"name": "LWS_WORKER_INDEX", "value": "0"})
     builder = {"name": "build", "image": serving["image"], "imagePullPolicy": serving.get("imagePullPolicy", "IfNotPresent"),
-               "command": ["/bin/bash", "-c"], "args": ["source /opt/build-scripts/humming-build.sh"],
+               "command": ["/bin/bash", "-c"], "args": ["source /opt/build-scripts/vllm-wheel-build.sh"],
                "env": env, "resources": copy.deepcopy(serving.get("resources", {})), "volumeMounts": mounts}
     if "securityContext" in serving:
         builder["securityContext"] = copy.deepcopy(serving["securityContext"])
@@ -249,7 +298,7 @@ def humming_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, A
         logs = kube(config["namespace"], "logs", f"job/{name}", check=False)
         (folder / "build.log").write_text(logs.stdout + logs.stderr)
         if waited.returncode:
-            raise RuntimeError(f"humming-build prebuild failed: {waited.stderr.strip()}; see {folder / 'build.log'}")
+            raise RuntimeError(f"vLLM prebuild failed: {waited.stderr.strip()}; see {folder / 'build.log'}")
     finally:
         deleted = kube(config["namespace"], "delete", "job", name, "--ignore-not-found", "--wait=true",
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
@@ -437,6 +486,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             rendered = call(["kubectl", "kustomize", str(overlay_path)]).stdout
             if not rendered.strip():
                 raise RuntimeError(f"overlay {name} rendered no resources")
+            rendered = inject_vllm_build_script(rendered)
             validate_manifest(rendered, config["namespace"])
             manifest.write_text(rendered)
             record["manifest_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
@@ -446,7 +496,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
                 raise RuntimeError(f"overlay {name} cannot start while serving Pods already exist in the namespace")
             applied = True  # prebuild or apply may partially succeed; clean up the saved manifest
-            prebuild_commit = humming_prebuild(rendered, config, overlay, folder)
+            prebuild_commit = vllm_prebuild(rendered, config, overlay, folder)
             if prebuild_commit:
                 record["prebuild_commit"] = prebuild_commit
                 print(f"Overlay {name} build cache prepared for {prebuild_commit[:12]}", flush=True)

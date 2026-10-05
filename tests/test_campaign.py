@@ -133,23 +133,24 @@ class CampaignTests(unittest.TestCase):
         with patch.object(runner, "kube", return_value=SimpleNamespace(stdout="")):
             self.assertIsNone(runner.build_commit("vllm"))
 
-    def test_humming_build_prewarms_with_serving_image_and_shared_cache(self):
+    def test_vllm_build_script_is_bundled_and_prewarms_shared_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
             pod = {"serviceAccountName": "kimi-k3", "nodeSelector": {"gpu": "h200"},
-                   "volumes": [{"name": "humming-build", "configMap": {"name": "humming-build"}},
+                   "volumes": [{"name": "legacy-build", "configMap": {"name": "legacy-build"}},
                                {"name": "build-cache", "persistentVolumeClaim": {"claimName": "kimi-cache"}}],
                    "containers": [{"name": "vllm", "image": "vllm/example@sha256:abc", "resources": {"requests": {"nvidia.com/gpu": "8"}},
+                                   "args": ["source /opt/build-scripts/legacy-build.sh"],
                                    "env": [{"name": "VLLM_BUILD_ROLE", "value": "prefill"},
                                            {"name": "VLLM_BUILD_REF", "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": "VLLM_BUILD_REF"}}},
                                            {"name": "VLLM_BUILD_COMMIT", "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": "VLLM_BUILD_COMMIT"}}},
                                            {"name": "VLLM_BUILD_BASE_IMAGE_ID", "value": "sha256:abc"}],
-                                   "volumeMounts": [{"name": "humming-build", "mountPath": "/opt/build-scripts"},
+                                   "volumeMounts": [{"name": "legacy-build", "mountPath": "/opt/build-scripts"},
                                                     {"name": "build-cache", "mountPath": "/shared/vllm-build"}]}]}
             manifest = "\n---\n".join([
-                yaml.safe_dump({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "humming-build"},
-                                "data": {"humming-build.sh": "echo build"}}),
+                yaml.safe_dump({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "legacy-build"},
+                                "data": {"legacy-build.sh": "# VLLM_BUILD_COMMIT; BUILD_VARIANT=x; /shared/vllm-build"}}),
                 yaml.safe_dump({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "vllm-build-ref"},
                                 "data": {"VLLM_BUILD_REF": "benchmark/ref", "VLLM_BUILD_COMMIT": "a" * 40}}),
                 yaml.safe_dump({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": "kimi-k3"}}),
@@ -164,8 +165,15 @@ class CampaignTests(unittest.TestCase):
                     created.append(json.loads(kwargs["input_text"]))
                 return SimpleNamespace(stdout="cache hit\n" if args[0] == "logs" else "", stderr="", returncode=0)
 
+            rendered = runner.inject_vllm_build_script(manifest)
+            rendered_docs = list(yaml.safe_load_all(rendered))
+            self.assertEqual(rendered_docs[0]["metadata"]["name"], "vllm-build")
+            self.assertEqual(rendered_docs[0]["data"]["vllm-wheel-build.sh"],
+                             (MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh").read_text())
+            self.assertEqual(rendered_docs[-1]["spec"]["leaderWorkerTemplate"]["workerTemplate"]["spec"]["containers"][0]["args"],
+                             ["source /opt/build-scripts/vllm-wheel-build.sh"])
             with patch.object(runner, "kube", side_effect=fake_kube):
-                commit = runner.humming_prebuild(manifest, config, config["overlays"][0], root)
+                commit = runner.vllm_prebuild(rendered, config, config["overlays"][0], root)
             self.assertEqual(commit, "a" * 40)
             self.assertEqual(actions, ["create", "create", "create", "create", "wait", "logs", "delete"])
             self.assertEqual([item["kind"] for item in created], ["ConfigMap", "ConfigMap", "ServiceAccount", "Job"])
