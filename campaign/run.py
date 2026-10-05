@@ -178,8 +178,11 @@ def snapshot(namespace: str, selector: str) -> list[str]:
     return sorted(f"{pod['metadata']['name']}:{pod['metadata']['uid']}" for pod in data["items"])
 
 
-def build_commit(namespace: str) -> str:
-    data = json.loads(kube(namespace, "get", "configmap", "vllm-build-ref", "-o", "json").stdout)
+def build_commit(namespace: str) -> str | None:
+    output = kube(namespace, "get", "configmap", "vllm-build-ref", "--ignore-not-found", "-o", "json").stdout.strip()
+    if not output:
+        return None
+    data = json.loads(output)
     commit = data.get("data", {}).get("VLLM_BUILD_COMMIT", "")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("vllm-build-ref has no valid commit")
@@ -228,7 +231,7 @@ def wait_job(config: dict[str, Any], name: str, timeout: int) -> None:
 
 
 def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dict[str, Any],
-                     campaign_dir: Path, baseline: list[str], commit: str) -> dict[str, Any]:
+                     campaign_dir: Path, baseline: list[str], commit: str | None, source_commit: str) -> dict[str, Any]:
     tool = bench["tool"]
     run_id = f"{config['id']}-{overlay['name']}-{tool}"
     if len(run_id) > 120:
@@ -237,7 +240,10 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
     env.update({"MODEL_LABEL": overlay["model_label"], "RESULTS_PVC": config["results_pvc"],
                 "LIVE_BENCHMARK_QUEUE": config["benchmark_queue"],
                 "LIVE_AIPERF_NAMESPACE": config["namespace"], "LIVE_NYANN_NAMESPACE": config["namespace"],
-                "LIVE_AIPERF_RUN_ID": run_id, "LIVE_NYANN_RUN_ID": run_id})
+                "LIVE_AIPERF_RUN_ID": run_id, "LIVE_NYANN_RUN_ID": run_id,
+                "LIVE_BENCHMARK_SOURCE_REF": config["source"]["ref"],
+                "LIVE_BENCHMARK_SOURCE_COMMIT": source_commit,
+                "LIVE_BENCHMARK_SOURCE_KIND": "llm-d"})
     concurrencies = ",".join(str(value) for value in bench["concurrencies"])
     if tool == "aiperf":
         cmd = ["bash", str(ROOT / "live-aiperf/submit.sh"), concurrencies, str(bench["duration_seconds"])]
@@ -376,11 +382,12 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             print(f"Overlay {name} ready: {len(baseline)} serving Pods", flush=True)
             commit = build_commit(config["namespace"])
             record["serving_pods"] = baseline
-            record["vllm_build_commit"] = commit
+            if commit:
+                record["vllm_build_commit"] = commit
             (folder / "serving-pods.json").write_text(kube(config["namespace"], "get", "pods", "-l", overlay["pod_selector"], "-o", "json").stdout)
             for bench in config["benchmarks"]:
                 try:
-                    result = submit_benchmark(config, overlay, bench, folder, baseline, commit)
+                    result = submit_benchmark(config, overlay, bench, folder, baseline, commit, source_commit)
                 except Exception as exc:
                     result = {"tool": bench["tool"], "status": "failed", "error": str(exc)}
                     if isinstance(exc, CleanupError):

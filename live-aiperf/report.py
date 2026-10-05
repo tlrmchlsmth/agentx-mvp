@@ -10,7 +10,6 @@ import importlib.util
 import json
 import re
 import sys
-from urllib.parse import quote
 from pathlib import Path
 from typing import Any
 
@@ -285,6 +284,28 @@ def run_label(data: dict[str, Any]) -> str:
     return f"c{concurrency}-r{repeat}" if repeat is not None else f"c{concurrency}"
 
 
+def source_ref(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("source_ref") or metadata.get("vllm_build_ref") or "unknown")
+
+
+def source_commit(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("source_commit") or metadata.get("vllm_build_commit") or "")
+
+
+def source_row(data: dict[str, Any]) -> str:
+    metadata = data["metadata"]
+    ref = source_ref(metadata)
+    commit = source_commit(metadata)
+    kind = str(metadata.get("source_kind") or "vllm")
+    identity = f'{html.escape(kind)} <code>{html.escape(ref)}</code>'
+    counts = gpu_counts(data)
+    return (
+        f'<p>{identity} <code>{html.escape(commit)}</code> '
+        f'— {number(counts["prefill_gpus"])} prefill GPUs, '
+        f'{number(counts["decode_gpus"])} decode GPUs</p>'
+    )
+
+
 def write_index(root: Path) -> None:
     """Adapt live artifacts to the repository's established v2 renderer."""
     renderer_path = Path(__file__).with_name("gen_interactivity_chart.py")
@@ -296,7 +317,7 @@ def write_index(root: Path) -> None:
 
     runs = [
         data for path in sorted(root.rglob("profile_export_aiperf.json"))
-        if (data := run_data(path.parent)) and data["metadata"].get("vllm_build_commit")
+        if (data := run_data(path.parent)) and source_commit(data["metadata"])
     ]
     if not runs:
         raise SystemExit(f"No completed live AIPerf runs in {root}")
@@ -310,7 +331,7 @@ def write_index(root: Path) -> None:
         config_name = series_key(data)
         counts = gpu_counts(data)
         repeat = repeat_number(data)
-        source_label = str(metadata.get("vllm_build_ref", config_name))
+        source_label = source_ref(metadata)
         if repeat is not None:
             source_label += f" — rerun {repeat}"
         config = configs.setdefault(config_name, {
@@ -319,7 +340,7 @@ def write_index(root: Path) -> None:
             "prefill_gpus": counts["prefill_gpus"],
             "pods": str(metadata.get("topology", "live deployment")),
             "runs": {},
-            "version": str(metadata.get("vllm_build_commit", "")),
+            "version": source_commit(metadata),
             "yamls": {
                 "aiperf-job.yaml": data["aiperf_job_yaml"],
                 "serving-pods.yaml": data["yaml"],
@@ -357,9 +378,7 @@ def write_index(root: Path) -> None:
         1,
     )
     source_rows = "".join(
-        f'<p><a href="https://github.com/elvircrn/vllm/tree/{quote(str(data["metadata"].get("vllm_build_ref", "")), safe="/")}">{html.escape(str(data["metadata"].get("vllm_build_ref", "unknown")))}</a> '
-        f'<code>{html.escape(str(data["metadata"].get("vllm_build_commit", "unknown")))}</code> '
-        f'— {number(gpu_counts(data)["prefill_gpus"])} prefill GPUs, {number(gpu_counts(data)["decode_gpus"])} decode GPUs</p>'
+        source_row(data)
         for data in sorted({sweep_key(data): data for data in runs}.values(), key=sweep_key)
     )
     source = '<div class="subtitle">' + source_rows + '</div>'

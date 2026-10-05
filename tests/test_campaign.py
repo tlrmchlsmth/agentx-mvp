@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -65,7 +67,7 @@ class CampaignTests(unittest.TestCase):
                 actions.append(args[0])
                 return SimpleNamespace(stdout="", stderr="", returncode=0)
 
-            def fake_submit(config, overlay, bench, folder, baseline, commit):
+            def fake_submit(config, overlay, bench, folder, baseline, commit, source_commit):
                 actions.append("benchmark:" + overlay["name"])
                 return {"tool": "aiperf", "status": "completed", "job": "job-" + overlay["name"],
                         "artifacts": "/workload/aiperf-agentx/example", "measurements": []}
@@ -125,6 +127,44 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(calls[2][-2:], ["origin", "feature/bench"])
         finally:
             runner.shutil.rmtree(checkout)
+
+    def test_missing_vllm_build_marker_is_allowed(self):
+        with patch.object(runner, "kube", return_value=SimpleNamespace(stdout="")):
+            self.assertIsNone(runner.build_commit("vllm"))
+
+    def test_live_submitters_use_campaign_source_without_build_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kubectl = root / "kubectl"
+            kubectl.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MOCK_KUBECTL_LOG\"\ncase \"$*\" in *wait*) exit 1;; esac\nexit 0\n")
+            kubectl.chmod(0o755)
+            log = root / "kubectl.log"
+            env = os.environ.copy()
+            env.update({"PATH": f"{root}:{env['PATH']}", "MOCK_KUBECTL_LOG": str(log),
+                        "LIVE_AIPERF_NAMESPACE": "vllm", "LIVE_NYANN_NAMESPACE": "vllm",
+                        "LIVE_BENCHMARK_SOURCE_REF": "feature/bench",
+                        "LIVE_BENCHMARK_SOURCE_COMMIT": "a" * 40,
+                        "LIVE_BENCHMARK_SOURCE_KIND": "llm-d", "MODEL_LABEL": "test-model"})
+            for script, args in (("live-aiperf/submit.sh", ["1", "60"]),
+                                 ("live-nyann/submit.sh", ["1", "1024", "512", "60", "0"])):
+                result = subprocess.run(["bash", str(MODULE_PATH.parents[1] / script), *args],
+                                        env=env, text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)  # fake kubectl has no serving Pods
+                self.assertNotIn("source ref/commit is missing", result.stderr)
+            self.assertNotIn("get configmap vllm-build-ref", log.read_text())
+
+    def test_report_source_identity_is_generic(self):
+        report_path = MODULE_PATH.parents[1] / "live-aiperf/report.py"
+        report_spec = importlib.util.spec_from_file_location("live_report", report_path)
+        report = importlib.util.module_from_spec(report_spec)
+        report_spec.loader.exec_module(report)
+        metadata = {"source_kind": "llm-d", "source_ref": "feature/bench", "source_commit": "a" * 40}
+        self.assertEqual(report.source_ref(metadata), "feature/bench")
+        self.assertEqual(report.source_commit(metadata), "a" * 40)
+        row = report.source_row({"metadata": metadata, "yaml": ""})
+        self.assertIn("llm-d", row)
+        self.assertNotIn("github.com/elvircrn/vllm", row)
+        self.assertEqual(report.source_commit({"vllm_build_commit": "b" * 40}), "b" * 40)
 
     def test_submit_uses_separate_campaign_queue_and_results_pvc(self):
         with tempfile.TemporaryDirectory() as directory:

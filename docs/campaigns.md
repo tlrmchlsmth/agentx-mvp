@@ -22,9 +22,9 @@ must never use that queue or it could block its own children.
 2. Each overlay must render a **complete, disposable, namespaced** deployment.
    Resources that already exist are rejected so cleanup cannot delete shared
    infrastructure. Do not put the results PVC, Kueue objects, namespace, or
-   shared monitoring stack in these overlays. The overlay should include
-   `vllm-build-ref`, because the current live benchmark scripts record its
-   published vLLM commit separately from the llm-d source commit.
+   shared monitoring stack in these overlays. The runner records the llm-d
+   source commit for every overlay. If an overlay also publishes
+   `vllm-build-ref`, its vLLM commit is recorded separately.
 3. Ensure the results PVC is ReadWriteMany, mounted by both benchmark Jobs and
    the campaign Job, and that the AIPerf and nyann images/secrets are available.
    `campaign-setup` installs a namespace Role that can apply the resource kinds

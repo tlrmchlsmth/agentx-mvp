@@ -68,18 +68,25 @@ kubectl get localqueue "$BENCHMARK_QUEUE" -n "$NAMESPACE" -o name >/dev/null || 
   exit 1
 }
 
-# This is the exact commit selected by the PD deployment. Read it before
-# creating the Job so the benchmark source is explicit in both the Job and its
-# saved artifacts. An invalid marker means `humming-build.sh publish` has not
-# prepared a reproducible build yet.
-VLLM_BUILD_REF="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
-VLLM_BUILD_COMMIT="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
-if [[ -z "$VLLM_BUILD_REF" ]] || ! [[ "$VLLM_BUILD_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "vllm-build-ref in ${NAMESPACE} is unpublished or malformed; publish and apply the benchmark branch first" >&2
+# Campaigns pin the llm-d deployment source directly. Standalone live runs
+# continue to read the published vLLM build marker from the namespace.
+if [[ -n "${LIVE_BENCHMARK_SOURCE_COMMIT:-}" ]]; then
+  SOURCE_REF="${LIVE_BENCHMARK_SOURCE_REF:-}"
+  SOURCE_COMMIT="$LIVE_BENCHMARK_SOURCE_COMMIT"
+  SOURCE_KIND="${LIVE_BENCHMARK_SOURCE_KIND:-llm-d}"
+else
+  SOURCE_REF="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
+  SOURCE_COMMIT="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
+  SOURCE_KIND=vllm
+fi
+if [[ ! "$SOURCE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
+   ! [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+   ! [[ "$SOURCE_KIND" == vllm || "$SOURCE_KIND" == llm-d ]]; then
+  echo "Benchmark source ref/commit is missing or malformed" >&2
   exit 1
 fi
-VLLM_BUILD_SHORT="${VLLM_BUILD_COMMIT:0:12}"
-echo "Benchmarking vLLM ${VLLM_BUILD_REF} (${VLLM_BUILD_COMMIT})"
+SOURCE_SHORT="${SOURCE_COMMIT:0:12}"
+echo "Benchmarking ${SOURCE_KIND} source ${SOURCE_REF} (${SOURCE_COMMIT})"
 
 RUN_TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
 CONCURRENCY_LABEL="$(IFS=-; echo "${SWEEP_CONCURRENCIES[*]}")"
@@ -112,15 +119,15 @@ RUN_SPECS_ARGS="${RUN_SPECS[*]}"
 if [[ -n "${LIVE_AIPERF_RUN_ID:-}" ]]; then
   RUN_ID="$LIVE_AIPERF_RUN_ID"
 elif (( ${#SWEEP_CONCURRENCIES[@]} == 1 )); then
-  RUN_ID="agentx-c${CONCURRENCY_LABEL}-vllm-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
+  RUN_ID="agentx-c${CONCURRENCY_LABEL}-vllm-${SOURCE_SHORT}-${RUN_TIMESTAMP}"
 else
-  RUN_ID="agentx-sweep-c${CONCURRENCY_LABEL}-vllm-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
+  RUN_ID="agentx-sweep-c${CONCURRENCY_LABEL}-vllm-${SOURCE_SHORT}-${RUN_TIMESTAMP}"
 fi
 # Kubernetes names are limited to 63 characters; keep this stable for long
 # comma-separated sweeps while retaining the complete run identity in output.
-JOB_NAME="aiperf-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
+JOB_NAME="aiperf-${SOURCE_SHORT}-${RUN_TIMESTAMP}"
 OUTPUT_PATH="/workload/${OUTPUT_ROOT}/${RUN_ID}"
-ARTIFACT_CONFIGMAP="aiperf-artifacts-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
+ARTIFACT_CONFIGMAP="aiperf-artifacts-${SOURCE_SHORT}-${RUN_TIMESTAMP}"
 
 # Discover the serving model from the cluster rather than baking a model name
 # into this launcher. More than one model is an ambiguous benchmark target, so
@@ -254,10 +261,11 @@ metadata:
     benchmark.llm-d.ai/workload: inferencex-agentx-mvp
     benchmark.llm-d.ai/model: "${MODEL_LABEL}"
     benchmark.llm-d.ai/concurrency: "${CONCURRENCY_LABEL}"
-    benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+    benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
   annotations:
-    benchmark.llm-d.ai/vllm-build-ref: "${VLLM_BUILD_REF}"
-    benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+    benchmark.llm-d.ai/source-ref: "${SOURCE_REF}"
+    benchmark.llm-d.ai/source-kind: "${SOURCE_KIND}"
+    benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
     benchmark.llm-d.ai/run-id: "${RUN_ID}"
 spec:
   suspend: true
@@ -267,10 +275,11 @@ spec:
       labels:
         benchmark.llm-d.ai/workload: inferencex-agentx-mvp
         benchmark.llm-d.ai/model: "${MODEL_LABEL}"
-        benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+        benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
       annotations:
-        benchmark.llm-d.ai/vllm-build-ref: "${VLLM_BUILD_REF}"
-        benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+        benchmark.llm-d.ai/source-ref: "${SOURCE_REF}"
+        benchmark.llm-d.ai/source-kind: "${SOURCE_KIND}"
+        benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
     spec:
       serviceAccountName: aiperf-cache-resetter
       restartPolicy: Never
@@ -343,8 +352,8 @@ spec:
                 mkdir -p "\$output"
                 # Keep the exact source details with the AIPerf output, not
                 # only in ephemeral Kubernetes metadata.
-                printf '{\n  "run_id": "%s-%s",\n  "model_label": "%s",\n  "model": "%s",\n  "vllm_build_ref": "%s",\n  "vllm_build_commit": "%s",\n  "topology": "%s",\n  "prefill_gpu_count": %s,\n  "decode_gpu_count": %s,\n  "total_gpu_count": %s,\n  "concurrency": %s,\n  "repeat_index": %s,\n  "repeat_count": %s,\n  "duration_seconds": %s\n}\n' \\
-                  "${RUN_ID}" "\$run_suffix" "${MODEL_LABEL}" "\$model" "${VLLM_BUILD_REF}" "${VLLM_BUILD_COMMIT}" "${TOPOLOGY}" "${PREFILL_GPU_COUNT}" "${DECODE_GPU_COUNT}" "${TOTAL_GPU_COUNT}" "\$concurrency" "\$repeat_index" "\$repeat_count" "${DURATION}" \\
+                printf '{\n  "run_id": "%s-%s",\n  "model_label": "%s",\n  "model": "%s",\n  "source_kind": "%s",\n  "source_ref": "%s",\n  "source_commit": "%s",\n  "topology": "%s",\n  "prefill_gpu_count": %s,\n  "decode_gpu_count": %s,\n  "total_gpu_count": %s,\n  "concurrency": %s,\n  "repeat_index": %s,\n  "repeat_count": %s,\n  "duration_seconds": %s\n}\n' \\
+                  "${RUN_ID}" "\$run_suffix" "${MODEL_LABEL}" "\$model" "${SOURCE_KIND}" "${SOURCE_REF}" "${SOURCE_COMMIT}" "${TOPOLOGY}" "${PREFILL_GPU_COUNT}" "${DECODE_GPU_COUNT}" "${TOTAL_GPU_COUNT}" "\$concurrency" "\$repeat_index" "\$repeat_count" "${DURATION}" \\
                   > "\$output/benchmark-metadata.json"
                 # The vLLM Kimi-K3 build now reports reasoning_tokens from
                 # token IDs; use those server counts instead of retokenizing
@@ -442,7 +451,7 @@ kubectl create configmap "$ARTIFACT_CONFIGMAP" -n "$NAMESPACE" \
 kubectl apply -f "$JOB_MANIFEST"
 
 echo "Job queued: ${JOB_NAME} (Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE})"
-echo "vLLM build: ${VLLM_BUILD_REF} (${VLLM_BUILD_COMMIT})"
+echo "Benchmark source: ${SOURCE_KIND} ${SOURCE_REF} (${SOURCE_COMMIT})"
 echo "Logs: kubectl logs -n ${NAMESPACE} -f job/${JOB_NAME}"
 for run_spec in "${RUN_SPECS[@]}"; do
   IFS=: read -r reported_concurrency reported_repeat reported_count reported_output_name <<< "$run_spec"

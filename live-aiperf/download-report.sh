@@ -136,7 +136,11 @@ fi
 RUN_ID="$(kubectl get job -n "$NAMESPACE" "$JOB_NAME" \
   -o jsonpath='{.metadata.annotations.benchmark\.llm-d\.ai/run-id}')"
 BUILD_COMMIT="$(kubectl get job -n "$NAMESPACE" "$JOB_NAME" \
-  -o jsonpath='{.metadata.labels.benchmark\.llm-d\.ai/vllm-build-commit}')"
+  -o jsonpath='{.metadata.labels.benchmark\.llm-d\.ai/source-commit}')"
+if [[ -z "$BUILD_COMMIT" ]]; then
+  BUILD_COMMIT="$(kubectl get job -n "$NAMESPACE" "$JOB_NAME" \
+    -o jsonpath='{.metadata.labels.benchmark\.llm-d\.ai/vllm-build-commit}')"
+fi
 MODEL_LABEL="$(kubectl get job -n "$NAMESPACE" "$JOB_NAME" \
   -o jsonpath='{.metadata.labels.benchmark\.llm-d\.ai/model}')"
 JOB_TIMESTAMP="${JOB_NAME##*-}"

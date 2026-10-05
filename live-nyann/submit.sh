@@ -68,14 +68,23 @@ RESULTS_PVC="${RESULTS_PVC:-kimi-k3-build-cache}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-nyann-agentx}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800s}"
 
-echo "Reading deployed vLLM build metadata..."
-VLLM_BUILD_REF="$(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
-VLLM_BUILD_COMMIT="$(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
-if [[ -z "$VLLM_BUILD_REF" ]] || ! [[ "$VLLM_BUILD_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "vllm-build-ref in ${NAMESPACE} is unpublished or malformed; publish the benchmark branch first" >&2
+if [[ -n "${LIVE_BENCHMARK_SOURCE_COMMIT:-}" ]]; then
+  SOURCE_REF="${LIVE_BENCHMARK_SOURCE_REF:-}"
+  SOURCE_COMMIT="$LIVE_BENCHMARK_SOURCE_COMMIT"
+  SOURCE_KIND="${LIVE_BENCHMARK_SOURCE_KIND:-llm-d}"
+else
+  echo "Reading deployed vLLM build metadata..."
+  SOURCE_REF="$(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
+  SOURCE_COMMIT="$(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
+  SOURCE_KIND=vllm
+fi
+if [[ ! "$SOURCE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
+   ! [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+   ! [[ "$SOURCE_KIND" == vllm || "$SOURCE_KIND" == llm-d ]]; then
+  echo "Benchmark source ref/commit is missing or malformed" >&2
   exit 1
 fi
-VLLM_BUILD_SHORT="${VLLM_BUILD_COMMIT:0:12}"
+SOURCE_SHORT="${SOURCE_COMMIT:0:12}"
 
 DISCOVERED_MODELS=()
 echo "Discovering the serving model..."
@@ -108,9 +117,9 @@ kubectl wait -n "$NAMESPACE" \
 
 RUN_TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
 CONCURRENCY_LABEL="$(IFS=-; echo "${SWEEP_CONCURRENCIES[*]}")"
-RUN_ID="${LIVE_NYANN_RUN_ID:-nyann-sweep-c${CONCURRENCY_LABEL}-isl${ISL}-osl${OSL}-vllm-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}}"
-JOB_NAME="nyann-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
-ARTIFACT_CONFIGMAP="nyann-artifacts-${VLLM_BUILD_SHORT}-${RUN_TIMESTAMP}"
+RUN_ID="${LIVE_NYANN_RUN_ID:-nyann-sweep-c${CONCURRENCY_LABEL}-isl${ISL}-osl${OSL}-vllm-${SOURCE_SHORT}-${RUN_TIMESTAMP}}"
+JOB_NAME="nyann-${SOURCE_SHORT}-${RUN_TIMESTAMP}"
+ARTIFACT_CONFIGMAP="nyann-artifacts-${SOURCE_SHORT}-${RUN_TIMESTAMP}"
 METRICS_SERVICE_NAME="${JOB_NAME}-metrics"
 OUTPUT_PATH="/workload/${OUTPUT_ROOT}/${RUN_ID}"
 
@@ -175,10 +184,11 @@ metadata:
     benchmark.llm-d.ai/isl: "${ISL}"
     benchmark.llm-d.ai/osl: "${OSL}"
     benchmark.llm-d.ai/job: "${JOB_NAME}"
-    benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+    benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
   annotations:
-    benchmark.llm-d.ai/vllm-build-ref: "${VLLM_BUILD_REF}"
-    benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+    benchmark.llm-d.ai/source-ref: "${SOURCE_REF}"
+    benchmark.llm-d.ai/source-kind: "${SOURCE_KIND}"
+    benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
     benchmark.llm-d.ai/run-id: "${RUN_ID}"
 spec:
   suspend: true
@@ -190,13 +200,14 @@ spec:
         benchmark.llm-d.ai/workload: nyann-agentx-mvp
         benchmark.llm-d.ai/model: "${MODEL_LABEL}"
         benchmark.llm-d.ai/job: "${JOB_NAME}"
-        benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+        benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: /metrics
-        benchmark.llm-d.ai/vllm-build-ref: "${VLLM_BUILD_REF}"
-        benchmark.llm-d.ai/vllm-build-commit: "${VLLM_BUILD_COMMIT}"
+        benchmark.llm-d.ai/source-ref: "${SOURCE_REF}"
+        benchmark.llm-d.ai/source-kind: "${SOURCE_KIND}"
+        benchmark.llm-d.ai/source-commit: "${SOURCE_COMMIT}"
     spec:
       restartPolicy: Never
       containers:
