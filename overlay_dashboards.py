@@ -20,9 +20,6 @@ def extract_data(html_path):
 
 def guess_label(path):
     dirname = os.path.basename(os.path.dirname(path))
-    m = re.search(r'c(\d+)', dirname)
-    if m:
-        return f"c{m.group(1)}"
     return dirname
 
 
@@ -47,6 +44,9 @@ def merge(file_data):
 
 
 def generate_html(merged, rows, labels, plotly_bundle=None):
+    # A merged view must keep every input distinguishable.  In particular,
+    # do not collapse repeated c<N> labels into one color/filter entry.
+    labels = list(dict.fromkeys(labels))
     merged_json = json.dumps(merged)
     rows_json = json.dumps(rows)
     labels_json = json.dumps(labels)
@@ -97,7 +97,7 @@ def generate_html(merged, rows, labels, plotly_bundle=None):
 <body>
 <h1>Overlay Dashboard</h1>
 <div class="subtitle">{', '.join(labels)}</div>
-<div class="toolbar"><span class="toolbar-label">Concurrency</span><span id="concurrencyFilters"></span><button id="showAll">All</button><button id="showNone">None</button></div>
+<div class="toolbar"><span class="toolbar-label">Run / concurrency</span><span id="concurrencyFilters"></span><button id="showAll">All</button><button id="showNone">None</button></div>
 <div id="root"></div>
 <script>
 const merged = {merged_json};
@@ -106,11 +106,45 @@ const labels = {labels_json};
 
 const LABEL_COLORS = {{}};
 const BASE_COLORS = [
-  [126,178,109], [234,184,57], [110,208,224], [239,132,60],
-  [226,77,66], [31,120,193], [186,67,169], [112,93,160],
+  [239,83,80], [255,167,38], [255,213,79], [102,187,106],
+  [38,198,218], [66,165,245], [126,87,194], [236,64,122],
+  [0,150,136], [141,110,99], [171,71,188], [124,179,66],
+  [255,112,67], [38,166,154], [92,107,192], [244,143,177],
+  [121,134,203], [255,202,40], [0,172,193], [156,204,101],
 ];
 labels.forEach((l, i) => {{ LABEL_COLORS[l] = BASE_COLORS[i % BASE_COLORS.length]; }});
 const activeLabels = new Set(labels);
+const SERIES_COLORS = {{}};
+let nextSeriesColor = 0;
+function colorForSeries(key) {{
+  if (!SERIES_COLORS[key]) {{
+    SERIES_COLORS[key] = BASE_COLORS[nextSeriesColor % BASE_COLORS.length];
+    nextSeriesColor++;
+  }}
+  return SERIES_COLORS[key];
+}}
+
+// Keep the legend readable without losing the full identity.  A label such
+// as "sweep-id / c4-r1" becomes "c4-r1" when unique, or "run2 · c4-r1"
+// when multiple sweeps contain the same concurrency/rerun point.  The full
+// label remains available as a toolbar tooltip and in each trace hovercard.
+const SHORT_LABELS = {{}};
+const pointCounts = {{}};
+const sourceIds = {{}};
+labels.forEach(label => {{
+  const split = label.lastIndexOf(' / ');
+  const point = split >= 0 ? label.slice(split + 3) : label;
+  pointCounts[point] = (pointCounts[point] || 0) + 1;
+}});
+labels.forEach(label => {{
+  const split = label.lastIndexOf(' / ');
+  if (split < 0) {{ SHORT_LABELS[label] = label; return; }}
+  const source = label.slice(0, split);
+  const point = label.slice(split + 3);
+  if (!sourceIds[source]) sourceIds[source] = Object.keys(sourceIds).length + 1;
+  SHORT_LABELS[label] = pointCounts[point] === 1 ? point : `run${{sourceIds[source]}} · ${{point}}`;
+}});
+function shortLabel(label) {{ return SHORT_LABELS[label] || label; }}
 
 function applyConcurrencyFilter() {{
   document.querySelectorAll('.plot[data-ready="true"]').forEach(plot => {{
@@ -125,7 +159,8 @@ labels.forEach(label => {{
   const button = document.createElement('button');
   button.className = 'concurrency-filter active';
   button.dataset.label = label;
-  button.textContent = label;
+  button.textContent = shortLabel(label);
+  button.title = label;
   button.style.setProperty('--filter-color', rgbStr(LABEL_COLORS[label], 1));
   button.addEventListener('click', () => {{ activeLabels.has(label) ? activeLabels.delete(label) : activeLabels.add(label); applyConcurrencyFilter(); }});
   filterRoot.appendChild(button);
@@ -133,15 +168,27 @@ labels.forEach(label => {{
 document.getElementById('showAll').addEventListener('click', () => {{ labels.forEach(label => activeLabels.add(label)); applyConcurrencyFilter(); }});
 document.getElementById('showNone').addEventListener('click', () => {{ activeLabels.clear(); applyConcurrencyFilter(); }});
 
-function seriesName(label, q, s, totalSeries) {{
+function compactText(value, maxLength = 26) {{
+  const text = String(value || '');
+  return text.length <= maxLength ? text : '…' + text.slice(-(maxLength - 1));
+}}
+
+function seriesName(label, q, s, seriesIndex) {{
+  const base = shortLabel(label);
   let legend = q.legend;
   if (legend) {{
     for (const [k,v] of Object.entries(s.labels)) legend = legend.replace('{{{{'+k+'}}}}', v);
-    if (!legend.includes('{{{{')) return totalSeries > 1 ? label + ' / ' + legend : label;
+    if (!legend.includes('{{{{') && legend.trim()) {{
+      const parts = legend.split('/').map(part => part.trim()).filter(Boolean);
+      if (parts.length) return base + ' / ' + compactText(parts[parts.length - 1]);
+    }}
   }}
-  const parts = Object.entries(s.labels).filter(([k]) => k !== '__name__');
-  const suffix = parts.length ? parts.map(([k,v])=>v).join(',') : '';
-  return suffix ? label + ' / ' + suffix : label;
+  const preferred = ['quantile', 'percentile', 'stat', 'phase', 'pod', 'instance', 'engine'];
+  const parts = preferred
+    .filter(key => s.labels[key] != null && s.labels[key] !== '')
+    .map(key => `${{key}}=${{compactText(s.labels[key])}}`);
+  const suffix = parts.length ? parts.slice(0, 2).join(', ') : `series ${{seriesIndex + 1}}`;
+  return base + ' / ' + suffix;
 }}
 
 function rgbStr(rgb, alpha) {{
@@ -229,6 +276,7 @@ function renderPanel(container, pid, m) {{
 
   const traces = [];
   const traceConcurrencies = [];
+  let traceIndex = 0;
   const allY = [];
   for (const e of m.entries) for (const q of e.panel.queries) for (const s of q.series)
     for (const v of s.values) {{ const value = parseFloat(v[1]); if (Number.isFinite(value)) allY.push(value); }}
@@ -244,27 +292,33 @@ function renderPanel(container, pid, m) {{
   const formattedLargest = largestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}});
   const formattedSmallest = smallestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}});
   const leftMargin = Math.max(76, (Math.max(formattedLargest.length, formattedSmallest.length) + 2) * 8);
-  const hoverFormat = '%{{y:' + yFormat + '}}<extra>%{{fullData.name}}</extra>';
+  const hoverFormat = '%{{y:' + yFormat + '}}<extra>%{{fullData.name}}<br>%{{customdata}}</extra>';
   for (const e of m.entries) {{
-    const rgb = LABEL_COLORS[e.label] || [200,200,200];
-    const totalSeries = e.panel.queries.reduce((n, q) => n + q.series.length, 0);
     let si = 0;
     for (const q of e.panel.queries) {{
       for (const s of q.series) {{
         if (s.values.length === 0) continue;
         const t0 = s.values[0][0];
-        const alpha = totalSeries > 1 ? 0.5 + 0.5 * (si / Math.max(totalSeries - 1, 1)) : 1;
+        const name = seriesName(e.label, q, s, si);
+        const rgb = colorForSeries(`${{e.label}}::${{name}}`);
         traces.push({{
           x: s.values.map(v => (v[0] - t0)),
           y: s.values.map(v => parseFloat(v[1])),
-          name: seriesName(e.label, q, s, totalSeries),
+          name,
           type: 'scatter',
           mode: 'lines',
-          line: {{ width: 1.5, color: rgbStr(rgb, alpha) }},
-          legendgroup: e.label,
+          customdata: s.values.map(() => e.label),
+          // Every Prometheus series from this run/concurrency gets the same
+          // solid color.  The legend label identifies the individual series;
+          // opacity shades make related metrics harder to compare.
+          line: {{ width: 1.5, color: rgbStr(rgb, 1) }},
+          // Keep legend clicks independent.  The toolbar still filters all
+          // traces belonging to the same run/concurrency label together.
+          legendgroup: `${{e.label}}::${{traceIndex}}`,
           hovertemplate: hoverFormat,
         }});
         traceConcurrencies.push(e.label);
+        traceIndex++;
         si++;
       }}
     }}
@@ -277,13 +331,14 @@ function renderPanel(container, pid, m) {{
     font: {{ color: '#8e8e8e', size: 10 }},
     xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', title: 'seconds', tickformat: ',d', exponentformat: 'none', showexponent: 'none' }},
     yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: yFormat, hoverformat: yFormat, exponentformat: 'none', showexponent: 'none', separatethousands: true, automargin: true }},
-    legend: {{ font: {{ size: 9 }}, orientation: 'v', x: 1, xanchor: 'right', y: 1, yanchor: 'top', bgcolor: 'rgba(17,18,23,.88)', bordercolor: '#3a3a3e', borderwidth: 1 }},
-    // Long pod/rank names otherwise cover the data; the panel button can
-    // reveal the legend on demand.
-    showlegend: false,
+    legend: {{ font: {{ size: 10 }}, orientation: 'v', x: 1, xanchor: 'right', y: 1, yanchor: 'top', maxheight: 0.45, itemclick: 'toggle', itemdoubleclick: 'toggleothers', bgcolor: 'rgba(17,18,23,.92)', bordercolor: '#3a3a3e', borderwidth: 1 }},
+    // Keep the legend available so every individual run/concurrency series
+    // can be clicked on or off.  The Legend button remains useful for
+    // compacting dense panels.
+    showlegend: true,
     hovermode: 'x unified',
     uirevision: pid,
-  }}, {{ responsive: true, displayModeBar: true, displaylogo: false, scrollZoom: true, modeBarButtonsToRemove: ['lasso2d','select2d'] }}).then(() => {{
+  }}, {{ responsive: true, edits: {{ legendPosition: true }}, displayModeBar: true, displaylogo: false, scrollZoom: true, modeBarButtonsToRemove: ['lasso2d','select2d'] }}).then(() => {{
     plotDiv._traceConcurrencies = traceConcurrencies;
     plotDiv.dataset.ready = 'true';
     applyConcurrencyFilter();

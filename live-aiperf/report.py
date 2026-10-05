@@ -753,7 +753,229 @@ def write_index(root: Path) -> None:
             'window.open(URL.createObjectURL(new Blob([a],{type:"text/html"})),"_blank");});</script>'
         )
     page = page.replace('<div id="root"></div>', source + overlay_control + '<div id="root"></div>', 1)
+    page = page.replace("</body>", pareto_section_html() + "\n</body>", 1)
     output.write_text(page, encoding="utf-8")
+
+
+def pareto_section_html() -> str:
+    """Return the built-in rerun-reduced concurrency Pareto view."""
+    return r'''
+<section id="pareto-front-section" style="margin:24px 0">
+<h2 style="font-size:18px;font-weight:500;margin:16px 0 4px">Reduced concurrency sequence</h2>
+<p class="subtitle">Select the best rerun at each concurrency over the two displayed metrics. The highlighted sequence keeps every selected concurrency, even when one concurrency dominates another.</p>
+<div id="pareto-controls" class="axis-controls" style="display:flex;flex-wrap:wrap;gap:8px;align-items:end"></div>
+<div id="pareto-range-controls" style="display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin:4px 0 8px"></div>
+<p id="pareto-summary" class="subtitle" aria-live="polite"></p>
+<div id="pareto-plot" class="plot" style="height:580px;cursor:pointer" role="img" aria-label="Reduced concurrency sequence"></div>
+<div class="summary" style="overflow-x:auto">
+<table id="pareto-table">
+<thead><tr><th>Concurrency</th><th>Selected rerun</th><th>X value</th><th>Y value</th></tr></thead>
+<tbody></tbody>
+</table>
+</div>
+</section>
+<script>
+(() => {
+  const section = document.getElementById('pareto-front-section');
+  const controls = document.getElementById('pareto-controls');
+  const rangeControls = document.getElementById('pareto-range-controls');
+  const summary = document.getElementById('pareto-summary');
+  const plot = document.getElementById('pareto-plot');
+  const table = document.getElementById('pareto-table');
+  if (!section || !controls || !rangeControls || !summary || !plot || !table) return;
+
+  const palette = ['#facc15'];
+  const metricState = {
+    xMetric: 'e2e_output_token_throughput', xStat: 'avg', xNorm: 'none', xGoal: 'max',
+    yMetric: 'output_token_throughput', yStat: 'avg', yNorm: 'decode', yGoal: 'max'
+  };
+  const fields = {};
+
+  function addField(key, label, options, selected) {
+    const wrapper = document.createElement('label');
+    wrapper.textContent = label;
+    wrapper.style.cssText = 'display:flex;flex-direction:column;gap:3px;color:#8e8e8e;font-size:12px';
+    const select = document.createElement('select');
+    select.style.cssText = 'background:#181b1f;color:#d8d9da;border:1px solid #3a3a3e;border-radius:4px;padding:4px 6px;font:inherit;max-width:320px';
+    options.forEach(option => {
+      const item = document.createElement('option');
+      item.value = option.value;
+      item.textContent = option.text;
+      select.appendChild(item);
+    });
+    select.value = selected;
+    wrapper.appendChild(select);
+    controls.appendChild(wrapper);
+    fields[key] = select;
+    return select;
+  }
+  function resetSelect(select, options, selected) {
+    select.replaceChildren();
+    options.forEach(option => {
+      const item = document.createElement('option');
+      item.value = option.value;
+      item.textContent = option.text;
+      select.appendChild(item);
+    });
+    select.value = options.some(option => option.value === selected) ? selected : options[0].value;
+    return select.value;
+  }
+  function goalOptions() {
+    return [{value:'max', text:'maximize'}, {value:'min', text:'minimize'}];
+  }
+  function defaultGoal(metric) {
+    return /(latency|time_to_|duration|error_rate|error_count)/.test(metric) ? 'min' : 'max';
+  }
+  addField('xMetric', 'X metric', metricOptions(X_AXIS_METRICS), metricState.xMetric);
+  addField('xStat', 'X statistic', statOptionsForMetric(metricState.xMetric), metricState.xStat);
+  addField('xNorm', 'X normalization', normOptionsForMetric(metricState.xMetric, 'x'), metricState.xNorm);
+  addField('xGoal', 'X objective', goalOptions(), metricState.xGoal);
+  addField('yMetric', 'Y metric', metricOptions(Y_AXIS_METRICS), metricState.yMetric);
+  addField('yStat', 'Y statistic', statOptionsForMetric(metricState.yMetric), metricState.yStat);
+  addField('yNorm', 'Y normalization', normOptionsForMetric(metricState.yMetric, 'y'), metricState.yNorm);
+  addField('yGoal', 'Y objective', goalOptions(), metricState.yGoal);
+
+  function rangeField(label, selected) {
+    const wrapper = document.createElement('label');
+    wrapper.textContent = label;
+    wrapper.style.cssText = 'display:flex;flex-direction:column;gap:3px;color:#8e8e8e;font-size:12px';
+    const select = document.createElement('select');
+    select.style.cssText = 'background:#181b1f;color:#d8d9da;border:1px solid #3a3a3e;border-radius:4px;padding:4px 6px;font:inherit';
+    CONCURRENCIES.forEach(concurrency => {
+      const option = document.createElement('option');
+      option.value = concurrency;
+      option.textContent = concurrency;
+      select.appendChild(option);
+    });
+    select.value = selected;
+    wrapper.appendChild(select);
+    rangeControls.appendChild(wrapper);
+    return select;
+  }
+  const rangeFrom = rangeField('Concurrency from', CONCURRENCIES[0]);
+  const rangeTo = rangeField('Concurrency to', CONCURRENCIES[CONCURRENCIES.length - 1]);
+
+  function activeConcurrencies() {
+    const low = Math.min(Number(rangeFrom.value.replace(/^c/, '')), Number(rangeTo.value.replace(/^c/, '')));
+    const high = Math.max(Number(rangeFrom.value.replace(/^c/, '')), Number(rangeTo.value.replace(/^c/, '')));
+    return CONCURRENCIES.filter(concurrency => {
+      const value = Number(concurrency.replace(/^c/, ''));
+      return value >= low && value <= high;
+    });
+  }
+  function finiteValue(cfg, concurrency, metric, stat, norm) {
+    const sample = DATA[cfg]?.[concurrency]?.[metric];
+    if (!sample || !Number.isFinite(sample[stat])) return null;
+    const value = applyNorm(sample[stat], norm, CONFIGS[cfg]);
+    return Number.isFinite(value) ? value : null;
+  }
+  function chooseBest(points, state) {
+    if (!points.length) return null;
+    const orientedX = point => state.xGoal === 'max' ? point.x : -point.x;
+    const orientedY = point => state.yGoal === 'max' ? point.y : -point.y;
+    const xs = points.map(orientedX), ys = points.map(orientedY);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const scale = (value, low, high) => high === low ? 1 : (value - low) / (high - low);
+    return [...points].sort((a, b) => {
+      const scoreA = scale(orientedX(a), minX, maxX) + scale(orientedY(a), minY, maxY);
+      const scoreB = scale(orientedX(b), minX, maxX) + scale(orientedY(b), minY, maxY);
+      return scoreB - scoreA || orientedX(b) - orientedX(a) || orientedY(b) - orientedY(a) || a.label.localeCompare(b.label);
+    })[0];
+  }
+  function format(value) {
+    return Number(value).toLocaleString(undefined, {maximumFractionDigits: 3});
+  }
+  function drawTable(selected, state) {
+    const body = table.querySelector('tbody');
+    body.replaceChildren();
+    selected.forEach(point => {
+      const row = document.createElement('tr');
+      [point.concurrency, point.label, format(point.x), format(point.y)].forEach(value => {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        row.appendChild(cell);
+      });
+      body.appendChild(row);
+    });
+  }
+  function attachDashboardClick() {
+    if (plot.__paretoDashboardClick || typeof plot.on !== 'function') return;
+    plot.on('plotly_click', eventData => {
+      const point = eventData?.points?.[0];
+      const metadata = point?.customdata;
+      if (!Array.isArray(metadata)) return;
+      const cfg = metadata[0];
+      const concurrency = metadata[1];
+      if (cfg && concurrency) openDashboard(cfg, concurrency);
+    });
+    plot.__paretoDashboardClick = true;
+  }
+  function draw() {
+    const state = {
+      xMetric: fields.xMetric.value, xStat: fields.xStat.value, xNorm: fields.xNorm.value, xGoal: fields.xGoal.value,
+      yMetric: fields.yMetric.value, yStat: fields.yStat.value, yNorm: fields.yNorm.value, yGoal: fields.yGoal.value
+    };
+    const selectedConcurrencies = activeConcurrencies();
+    const points = [];
+    CONFIG_KEYS.forEach(cfg => selectedConcurrencies.forEach(concurrency => {
+      const x = finiteValue(cfg, concurrency, state.xMetric, state.xStat, state.xNorm);
+      const y = finiteValue(cfg, concurrency, state.yMetric, state.yStat, state.yNorm);
+      if (x == null || y == null) return;
+      points.push({cfg, concurrency, n:Number(concurrency.replace(/^c/, '')), label:CONFIGS[cfg].label, x, y});
+    }));
+    const selected = selectedConcurrencies.map(concurrency => chooseBest(points.filter(point => point.concurrency === concurrency), state)).filter(Boolean);
+    selected.sort((a, b) => a.n - b.n);
+    const xTitle = metricLabel(state.xMetric) + (state.xNorm !== 'none' ? ' ' + normSuffix(state.xNorm) : '');
+    const yTitle = metricLabel(state.yMetric) + (state.yNorm !== 'none' ? ' ' + normSuffix(state.yNorm) : '');
+    const traces = [{
+      x: points.map(point => point.x), y: points.map(point => point.y), mode:'markers', name:'All rerun points',
+      customdata: points.map(point => [point.cfg, point.concurrency, point.label]),
+      hovertemplate:'%{customdata[1]}<br>%{customdata[2]}<br>%{x:.4g}<br>%{y:.4g}<extra></extra>',
+      marker:{color:'#59616b', size:8, opacity:0.45}
+    }];
+    if (selected.length) traces.push({
+      x:selected.map(point => point.x), y:selected.map(point => point.y), text:selected.map(point => point.concurrency),
+      customdata:selected.map(point => [point.cfg, point.concurrency, point.label]),
+      mode:selected.length >= 2 ? 'lines+markers+text' : 'markers+text', textposition:'top center',
+      name:selected.length >= 2 ? 'Selected front sequence' : 'Selected concurrency point',
+      hovertemplate:'%{text}<br>%{customdata[2]}<br>%{x:.4g}<br>%{y:.4g}<extra></extra>',
+      line:{color:palette[0], width:4}, marker:{color:palette[0], size:13, symbol:'diamond'}
+    });
+    const layout = {
+      ...LAYOUT_DEFAULTS, title:{text:'Reduced concurrency sequence', font:{size:18}},
+      xaxis:{...LAYOUT_DEFAULTS.xaxis, ...fixedAxis(points.map(point => point.x)), title:{text:xTitle}},
+      yaxis:{...LAYOUT_DEFAULTS.yaxis, ...fixedAxis(points.map(point => point.y)), title:{text:yTitle}},
+      showlegend:true, legend:{orientation:'h', y:1.08, x:0}, hovermode:'closest',
+      margin:{...LAYOUT_DEFAULTS.margin, t:72, b:72}, plot_bgcolor:'#171a1e', paper_bgcolor:'#171a1e'
+    };
+    const rendered = plot.data ? Plotly.react(plot, traces, layout, {responsive:true, displaylogo:false}) : Plotly.newPlot(plot, traces, layout, {responsive:true, displaylogo:false});
+    Promise.resolve(rendered).then(attachDashboardClick);
+    drawTable(selected, state);
+    const first = selectedConcurrencies[0], last = selectedConcurrencies[selectedConcurrencies.length - 1];
+    summary.textContent = 'Range ' + first + '–' + last + ': ' + points.length + ' usable rerun/concurrency points reduced to ' + selected.length + ' selected concurrency point' + (selected.length === 1 ? '' : 's') + '. Each selected point may come from a different rerun.';
+  }
+  fields.xMetric.addEventListener('change', () => {
+    metricState.xMetric = fields.xMetric.value;
+    metricState.xStat = resetSelect(fields.xStat, statOptionsForMetric(metricState.xMetric), metricState.xStat);
+    metricState.xNorm = resetSelect(fields.xNorm, normOptionsForMetric(metricState.xMetric, 'x'), metricState.xNorm);
+    metricState.xGoal = defaultGoal(metricState.xMetric);
+    fields.xGoal.value = metricState.xGoal;
+    draw();
+  });
+  fields.yMetric.addEventListener('change', () => {
+    metricState.yMetric = fields.yMetric.value;
+    metricState.yStat = resetSelect(fields.yStat, statOptionsForMetric(metricState.yMetric), metricState.yStat);
+    metricState.yNorm = resetSelect(fields.yNorm, normOptionsForMetric(metricState.yMetric, 'y'), metricState.yNorm);
+    metricState.yGoal = defaultGoal(metricState.yMetric);
+    fields.yGoal.value = metricState.yGoal;
+    draw();
+  });
+  [fields.xStat, fields.xNorm, fields.xGoal, fields.yStat, fields.yNorm, fields.yGoal, rangeFrom, rangeTo].forEach(select => select.addEventListener('change', draw));
+  draw();
+})();
+</script>
+'''
 
 
 def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
@@ -766,7 +988,12 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]]) -> bytes | None:
             continue
         path = data["directory"] / "dashboard.html"
         if path.is_file():
-            paths.append((concurrency, run_label(data), path))
+            # The concurrency alone is not a unique identity in a merged
+            # Prometheus view: reruns (and even separate sweeps) can contain
+            # the same c<N>. Keep both the sweep and c<N>-r<M> visible so
+            # colors, legend items, and filters cannot collide.
+            source = sweep_key(data)
+            paths.append((concurrency, f"{source} / {run_label(data)}", path))
     if len(paths) < 2:
         return None
     overlay_path = Path(__file__).with_name("overlay_dashboards.py")

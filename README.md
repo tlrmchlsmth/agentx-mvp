@@ -29,13 +29,41 @@ argument. Each repeated sample is retained separately, for example
 appears only once keeps the normal `c<N>` directory name.
 
 The first command returns after submitting the Job, so the laptop can close.
-The second command downloads `~/Downloads/aiperf-history.html`; it rebuilds the
-self-contained report from persisted artifacts for the newest completed Job.
+The Job waits in an init container for the selected serving Pods to appear and
+become Ready, then runs the complete sweep autonomously. The second command
+downloads `~/Downloads/aiperf-history.html`; it rebuilds the self-contained
+report from persisted artifacts for the newest completed Job.
 Passing `true` performs a post-hoc query of the deployed `llmd-grafana` dashboard
 for each saved AIPerf time range, then embeds those offline dashboards in the same
 downloaded HTML. The range is exactly the measured AIPerf request/response window
 (no pre-run padding, so warm-up is excluded). It auto-discovers the monitoring
 service and does not query it by default.
+
+## Live nyann-bench synthetic sweep
+
+Use nyann-bench when you want fixed synthetic input/output sequence lengths
+instead of a dataset trace. The first argument is a comma-separated concurrency
+sweep; ISL, OSL, and stage duration are positional arguments with defaults of
+1024, 512, and 900 seconds:
+
+```bash
+just live-nyann 1,4,8 1024 512
+# Equivalent direct invocation:
+./live-nyann/submit.sh 1,4,8 1024 512 900 60
+```
+
+This submits one Kubernetes Job with one measured stage per concurrency. It
+uses the published `ghcr.io/neuralmagic/nyann-bench:latest` image by default.
+Override `NYANN_IMAGE` to pin a commit-SHA image in production. Raw
+nyann-bench JSONL and timestamp artifacts are written under the configured
+results PVC at `/workload/nyann-agentx/<run-id>`. You can also override
+`RESULTS_PVC`, `BASE_URL`, `MODEL_LABEL`, or `LIVE_NYANN_NAMESPACE` when needed.
+The default 60-second warmup runs once at the maximum requested concurrency
+before the measured stages; pass `0` as the fifth argument to disable it. The
+Job exposes client metrics at `/metrics` on port 9090 and adds both pod and
+Service Prometheus annotations. Nyann auto-detects the model ID from the
+endpoint’s `/v1/models` response; `MODEL_LABEL` is only used for Kubernetes
+selection and metadata.
 
 ## Prerequisites
 

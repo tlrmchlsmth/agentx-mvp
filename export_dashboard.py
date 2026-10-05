@@ -623,12 +623,14 @@ def logged_aiperf_window(log_path, directory):
     if not match:
         raise RuntimeError(f"Cannot identify concurrency from {directory}")
     wanted = match.group(1)
+    repeat_match = re.fullmatch(r"c\d+-r(\d+)", os.path.basename(directory))
+    occurrence = int(repeat_match.group(1)) if repeat_match else 1
     try:
         lines = open(log_path, encoding="utf-8", errors="replace")
     except OSError as exc:
         raise RuntimeError(f"Cannot read AIPerf Job log {log_path}: {exc}") from exc
     pending_concurrency = None
-    active_concurrency = None
+    active_window = None
     windows = {}
     with lines:
         for line in lines:
@@ -640,18 +642,32 @@ def logged_aiperf_window(log_path, directory):
             lanes = PROFILE_LANES_RE.search(message)
             if lanes:
                 pending_concurrency = lanes["concurrency"]
-            if "Phase profiling started" in message:
-                active_concurrency = pending_concurrency
-                if active_concurrency:
-                    windows[active_concurrency] = [timestamp, None]
-            elif "Phase profiling complete" in message and active_concurrency:
-                windows[active_concurrency][1] = timestamp
-                active_concurrency = None
-    start, end = windows.get(wanted, (None, None))
+            # AIPerf now emits "Phase profiling (profiling) started" and
+            # "Phase profiling (profiling) complete".  Keep the match
+            # specific so the intermediate "sending complete" line does not
+            # close the monitoring window early.
+            if re.search(r"Phase profiling(?: \([^)]*\))? started\b", message):
+                if pending_concurrency:
+                    active_window = [pending_concurrency, timestamp, None]
+                    windows.setdefault(pending_concurrency, []).append(active_window)
+            elif (
+                re.search(r"Phase profiling(?: \([^)]*\))? complete\b", message)
+                and active_window is not None
+            ):
+                active_window[2] = timestamp
+                active_window = None
+
+    concurrency_windows = windows.get(wanted, [])
+    if occurrence > len(concurrency_windows):
+        raise RuntimeError(
+            f"No profiling window #{occurrence} for c{wanted} in {log_path}; "
+            f"found {len(concurrency_windows)} window(s)"
+        )
+    _, start, end = concurrency_windows[occurrence - 1]
     if start is not None and end is not None and end > start:
         return start, end
     raise RuntimeError(
-        f"No complete timestamped profiling phase for c{wanted} in {log_path}; "
+        f"No complete timestamped profiling phase for c{wanted}-r{occurrence} in {log_path}; "
         "refusing to guess a monitoring range"
     )
 

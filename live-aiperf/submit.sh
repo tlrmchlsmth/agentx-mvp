@@ -29,8 +29,6 @@ if [[ ! "$DURATION" =~ ^[1-9][0-9]*$ ]] || (( DURATION < 60 || DURATION > 7200 )
   exit 2
 fi
 
-KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config.kermit}"
-export KUBECONFIG
 # Do not inherit the repository's legacy NAMESPACE setting. The live workflow
 # targets the namespace currently carrying one valid deployed vLLM build.
 NAMESPACE="${LIVE_AIPERF_NAMESPACE:-}"
@@ -52,9 +50,9 @@ HF_SECRET="${HF_SECRET:-llm-d-hf-token}"
 RESULTS_PVC="${RESULTS_PVC:-kimi-k3-build-cache}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-aiperf-agentx}"
 MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-1000000000}"
-READY_TIMEOUT="${READY_TIMEOUT:-1800s}"
 TOPOLOGY="${TOPOLOGY:-auto}"
 REQUESTED_TOPOLOGY="$TOPOLOGY"
+KUBECTL_IMAGE="${KUBECTL_IMAGE:-registry.k8s.io/kubectl:v1.31.0}"
 
 # This is the exact commit selected by the PD deployment. Read it before
 # creating the Job so the benchmark source is explicit in both the Job and its
@@ -172,30 +170,10 @@ pd)
     echo "Set TOPOLOGY=pd explicitly to benchmark PD during a rollout" >&2
     exit 1
   fi
-  if [[ -z "$prefill_pods" || -z "$decode_pods" ]]; then
-    echo "PD topology requires both prefill and decode pods in ${NAMESPACE}" >&2
-    exit 1
-  fi
-  echo "Detected PD topology; waiting up to ${READY_TIMEOUT} for prefill and decode pods"
-  kubectl wait -n "$NAMESPACE" \
-    --for=condition=Ready pod \
-    -l "$PREFILL_SELECTOR" \
-    --timeout="$READY_TIMEOUT"
-  kubectl wait -n "$NAMESPACE" \
-    --for=condition=Ready pod \
-    -l "$DECODE_SELECTOR" \
-    --timeout="$READY_TIMEOUT"
+  echo "Detected PD topology; the submitted Job will wait for prefill and decode pods"
   ;;
 aggregate)
-  if [[ -z "$aggregate_pods" ]]; then
-    echo "No aggregate ${MODEL_LABEL} pods found in ${NAMESPACE}" >&2
-    exit 1
-  fi
-  echo "Detected aggregate topology; waiting up to ${READY_TIMEOUT} for aggregate pods"
-  kubectl wait -n "$NAMESPACE" \
-    --for=condition=Ready pod \
-    -l "$AGGREGATE_SELECTOR" \
-    --timeout="$READY_TIMEOUT"
+  echo "Detected aggregate topology; the submitted Job will wait for aggregate pods"
   ;;
 *)
   echo "TOPOLOGY must be auto, pd, or aggregate (got: ${TOPOLOGY})" >&2
@@ -215,8 +193,7 @@ PREFILL_GPU_COUNT="$(gpu_count "$PREFILL_SELECTOR")"
 DECODE_GPU_COUNT="$(gpu_count "$DECODE_SELECTOR")"
 TOTAL_GPU_COUNT="$(gpu_count "$BASE_SELECTOR")"
 if (( TOTAL_GPU_COUNT == 0 )); then
-  echo "Serving pods have no nvidia.com/gpu limits; cannot record chart normalization capacity" >&2
-  exit 1
+  echo "Serving pods are not present yet; GPU counts will be recorded as zero in the submission snapshot"
 fi
 
 # Capture the exact serving and llm-d resources while submitting the run. The
@@ -246,7 +223,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -290,6 +267,27 @@ spec:
     spec:
       serviceAccountName: aiperf-cache-resetter
       restartPolicy: Never
+      # The shared results PVC is root-owned from the legacy AIPerf image;
+      # the NGC image otherwise runs as UID 1000 and cannot create artifacts.
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      initContainers:
+        - name: wait-for-serving
+          image: ${KUBECTL_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["kubectl"]
+          args:
+            - wait
+            - --namespace=${NAMESPACE}
+            - --for=condition=Ready
+            - pod
+            - --selector=${BASE_SELECTOR}
+            # kubectl's zero timeout means "check once"; use a decade so
+            # this Job can wait for a deployment without the laptop staying
+            # connected. The serving Pods already exist when this Job is
+            # submitted, so the selector has concrete resources to watch.
+            - --timeout=87600h
       containers:
         - name: aiperf
           image: ${AIPERF_IMAGE}
@@ -299,18 +297,20 @@ spec:
             - |
               set -euo pipefail
               output_root=${OUTPUT_PATH}
+              aiperf_python=/opt/venv/bin/python3
+              aiperf_bin=/opt/venv/bin/aiperf
               schema=/aiperf/src/aiperf/common/models/export_models.py
-              if grep -qx '    hostname: str | None' "\$schema"; then
+              if [[ -f "\$schema" ]] && grep -qx '    hostname: str | None' "\$schema"; then
                 sed -i 's/^    hostname: str | None$/    hostname: str | None = None/' "\$schema"
               fi
               export HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0
-              model=\$(/opt/venv/bin/python3 -c 'import json,sys,urllib.request; payload=json.load(urllib.request.urlopen(sys.argv[1], timeout=30)); models=payload.get("data", []); assert len(models) == 1, f"expected exactly one served model, got {models!r}"; print(models[0]["id"])' "${BASE_URL}/models")
-              /opt/venv/bin/python3 -c 'from transformers import AutoTokenizer; import sys; AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)' "\$model"
+              model=\$("\$aiperf_python" -c 'import json,sys,urllib.request; payload=json.load(urllib.request.urlopen(sys.argv[1], timeout=30)); models=payload.get("data", []); assert len(models) == 1, f"expected exactly one served model, got {models!r}"; print(models[0]["id"])' "${BASE_URL}/models")
+              "\$aiperf_python" -c 'from transformers import AutoTokenizer; import sys; AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)' "\$model"
               overall_status=0
               for run_spec in ${RUN_SPECS_ARGS}; do
                 IFS=: read -r concurrency repeat_index repeat_count output_name <<< "\$run_spec"
                 echo "Clearing every prefill and decode vLLM prefix cache before c\$concurrency"
-                /opt/venv/bin/python3 /benchmark-input/reset-prefix-caches.py
+                "\$aiperf_python" /benchmark-input/reset-prefix-caches.py
                 output="\$output_root/\$output_name"
                 if (( repeat_count > 1 )); then
                   run_suffix="c\$concurrency-r\$repeat_index"
@@ -323,20 +323,29 @@ spec:
                 printf '{\n  "run_id": "%s-%s",\n  "model_label": "%s",\n  "model": "%s",\n  "vllm_build_ref": "%s",\n  "vllm_build_commit": "%s",\n  "topology": "%s",\n  "prefill_gpu_count": %s,\n  "decode_gpu_count": %s,\n  "total_gpu_count": %s,\n  "concurrency": %s,\n  "repeat_index": %s,\n  "repeat_count": %s,\n  "duration_seconds": %s\n}\n' \\
                   "${RUN_ID}" "\$run_suffix" "${MODEL_LABEL}" "\$model" "${VLLM_BUILD_REF}" "${VLLM_BUILD_COMMIT}" "${TOPOLOGY}" "${PREFILL_GPU_COUNT}" "${DECODE_GPU_COUNT}" "${TOTAL_GPU_COUNT}" "\$concurrency" "\$repeat_index" "\$repeat_count" "${DURATION}" \\
                   > "\$output/benchmark-metadata.json"
-                if /opt/venv/bin/aiperf profile \\
+                # The vLLM Kimi-K3 build now reports reasoning_tokens from
+                # token IDs; use those server counts instead of retokenizing
+                # stripped XTML reasoning/content text in AIPerf.
+                # Bound the AgentX synthesized warmup drain; without this,
+                # one slow priming request can block the entire sweep forever.
+                # Raw export preserves the parsed streamed response messages
+                # needed to diagnose inter-chunk accounting. It also implies
+                # the concatenated outputs.json export.
+                if "\$aiperf_bin" profile \\
                 --scenario inferencex-agentx-mvp \\
                 --url ${BASE_URL} \\
                 --model "\$model" \\
                 --max-context-length ${MAX_CONTEXT_LENGTH} \\
                 --tokenizer-trust-remote-code \\
                 --endpoint-type chat \\
-                --public-dataset semianalysis_cc_traces_weka_with_subagents \\
+                --public-dataset semianalysis_cc_traces_weka_062126 \\
                 --concurrency "\$concurrency" \\
                 --benchmark-duration ${DURATION} \\
                 --dataset-sampling-strategy sequential \\
                 --use-server-token-count \\
                 --streaming \\
                 --random-seed 42 \\
+                --export-level raw \\
                 --output-artifact-dir "\$output" \\
                 --ui simple; then
                   status=0
@@ -345,14 +354,14 @@ spec:
                 fi
                 cp /benchmark-input/serving-pods.yaml "\$output/serving-pods.yaml"
                 cp /benchmark-input/aiperf-job.yaml "\$output/aiperf-job.yaml"
-                /opt/venv/bin/python3 -c 'import gzip,pathlib,sys; pathlib.Path(sys.argv[2]).write_bytes(gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes()))' \
+                "\$aiperf_python" -c 'import gzip,pathlib,sys; pathlib.Path(sys.argv[2]).write_bytes(gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes()))' \
                   /benchmark-input/llm-d-deployment.yaml.gz "\$output/llm-d-deployment.yaml"
                 if [[ -f "\$output/profile_export_aiperf.json" ]]; then
-                  /opt/venv/bin/python3 /benchmark-input/aiperf_report.py run "\$output"
+                  "\$aiperf_python" /benchmark-input/aiperf_report.py run "\$output"
                 fi
                 (( status == 0 )) || overall_status=\$status
               done
-              /opt/venv/bin/python3 /benchmark-input/aiperf_report.py index "\$output_root"
+              "\$aiperf_python" /benchmark-input/aiperf_report.py index "\$output_root"
               exit "\$overall_status"
           env:
             - name: HF_HOME

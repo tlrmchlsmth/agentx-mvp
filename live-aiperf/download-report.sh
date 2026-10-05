@@ -2,8 +2,6 @@
 set -euo pipefail
 
 # Download the self-contained report from the newest submitted AIPerf Job.
-KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config.kermit}"
-export KUBECONFIG
 # Do not inherit the repository's legacy NAMESPACE setting. The live workflow
 # targets the namespace currently carrying one valid deployed vLLM build.
 NAMESPACE="${LIVE_AIPERF_NAMESPACE:-}"
@@ -25,27 +23,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONITORING="${LIVE_AIPERF_MONITORING:-false}"
 case "$MONITORING" in true|false) ;; *) echo "LIVE_AIPERF_MONITORING must be true or false" >&2; exit 2 ;; esac
 decode_base64() { base64 --decode 2>/dev/null || base64 -D; }
-EXEC_ATTEMPTS="${LIVE_AIPERF_EXEC_ATTEMPTS:-6}"
-TRANSFER_CHUNK_BYTES=$((4 * 1024 * 1024))
+# Zero means retry forever. Set LIVE_AIPERF_EXEC_ATTEMPTS to a positive
+# number only when an operator explicitly wants a finite retry cap.
+EXEC_ATTEMPTS="${LIVE_AIPERF_EXEC_ATTEMPTS:-0}"
+if [[ ! "$EXEC_ATTEMPTS" =~ ^[0-9]+$ ]]; then
+  echo "LIVE_AIPERF_EXEC_ATTEMPTS must be a non-negative integer (0 means unlimited)" >&2
+  exit 2
+fi
+# Keep report transfers below the websocket stream size at which kubectl exec
+# commonly closes with an unexpected EOF.  Each chunk is copied with kubectl
+# cp and the completed partial file remains resumable.
+TRANSFER_CHUNK_BYTES=$((1 * 1024 * 1024))
 backoff() { local seconds=$(( $1 * 2 )); (( seconds > 15 )) && seconds=15; echo "$seconds"; }
 kexec() {
-  local attempt=0
-  while (( attempt < EXEC_ATTEMPTS )); do
+  local attempt=0 retry_limit
+  while :; do
     attempt=$((attempt + 1))
     if kubectl -n "$NAMESPACE" --request-timeout=90s exec "$RETRIEVER_POD" -- "$@"; then
       return 0
     fi
-    (( attempt == EXEC_ATTEMPTS )) && break
-    echo "  helper exec failed (attempt ${attempt}/${EXEC_ATTEMPTS}); retrying in $(backoff "$attempt")s..." >&2
+    if (( EXEC_ATTEMPTS > 0 && attempt >= EXEC_ATTEMPTS )); then
+      echo "  helper exec failed after ${attempt} attempts" >&2
+      return 1
+    fi
+    retry_limit="unlimited"
+    (( EXEC_ATTEMPTS > 0 )) && retry_limit="$EXEC_ATTEMPTS"
+    echo "  helper exec failed (attempt ${attempt}/${retry_limit}); retrying in $(backoff "$attempt")s..." >&2
     sleep "$(backoff "$attempt")"
   done
-  return 1
 }
 upload_input() {
-  local source="$1" remote="$2" total remote_total attempt=0
+  local source="$1" remote="$2" total remote_total attempt=0 retry_limit
   total="$(local_size "$source")"
   [[ "$total" =~ ^[0-9]+$ ]] || { echo "Could not size helper input ${source}" >&2; return 1; }
-  while (( attempt < EXEC_ATTEMPTS )); do
+  while :; do
     attempt=$((attempt + 1))
     if kubectl --request-timeout=90s -n "$NAMESPACE" cp "$source" "${RETRIEVER_POD}:${remote}"; then
       remote_total="$(kexec sh -c 'wc -c < "$1"' sh "$remote" | tr -d '[:space:]')"
@@ -54,38 +65,50 @@ upload_input() {
       fi
       echo "Helper input size mismatch for ${source}: local=${total}, remote=${remote_total:-unknown}" >&2
     fi
-    if (( attempt == EXEC_ATTEMPTS )); then
-      echo "Helper input upload failed: ${source}" >&2
+    if (( EXEC_ATTEMPTS > 0 && attempt >= EXEC_ATTEMPTS )); then
+      echo "Helper input upload failed after ${attempt} attempts: ${source}" >&2
       return 1
     fi
-    echo "  helper input copy failed (attempt ${attempt}/${EXEC_ATTEMPTS}); retrying in $(backoff "$attempt")s..." >&2
+    retry_limit="unlimited"
+    (( EXEC_ATTEMPTS > 0 )) && retry_limit="$EXEC_ATTEMPTS"
+    echo "  helper input copy failed (attempt ${attempt}/${retry_limit}); retrying in $(backoff "$attempt")s..." >&2
     sleep "$(backoff "$attempt")"
   done
-  return 1
 }
 local_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 download_report() {
-  local remote="$1" partial="${DESTINATION}.part" remote_size offset remaining want chunk attempt=0
+  local remote="$1" partial="${DESTINATION}.part" remote_size offset remaining want chunk remote_chunk attempt=0 retry_limit
   remote_size="$(kexec sh -c 'wc -c < "$1"' sh "$remote" | tr -d '[:space:]')"
   [[ "$remote_size" =~ ^[1-9][0-9]*$ ]] || { echo "Remote report is empty or unreadable" >&2; return 1; }
   [[ -f "$partial" ]] || : > "$partial"
   offset="$(local_size "$partial")"
   if (( offset > remote_size )); then : > "$partial"; offset=0; fi
+  remote_chunk="/tmp/aiperf-report-download-${RETRIEVER_POD}.chunk"
   while (( offset < remote_size )); do
     remaining=$((remote_size - offset)); want=$TRANSFER_CHUNK_BYTES; (( remaining < want )) && want=$remaining
     chunk="${partial}.chunk"
-    : > "$chunk"
+    rm -f "$chunk"
     attempt=0
     while :; do
       attempt=$((attempt + 1))
-      if kubectl -n "$NAMESPACE" --request-timeout=90s exec "$RETRIEVER_POD" -- sh -c \
-          'tail -c +"$1" "$2" | head -c "$3"' sh "$((offset + 1))" "$remote" "$want" > "$chunk" \
+      if kexec sh -c \
+          'tail -c +"$1" "$2" | head -c "$3" > "$4"' \
+          sh "$((offset + 1))" "$remote" "$want" "$remote_chunk" \
+          && kubectl -n "$NAMESPACE" --request-timeout=90s cp \
+               "$RETRIEVER_POD:${remote_chunk}" "$chunk" \
           && [[ "$(local_size "$chunk")" == "$want" ]]; then
+        kexec rm -f "$remote_chunk" >/dev/null 2>&1 || true
         cat "$chunk" >> "$partial"
         break
       fi
-      (( attempt == EXEC_ATTEMPTS )) && { echo "Report transfer failed at byte ${offset}" >&2; return 1; }
-      echo "  report transfer failed at byte ${offset}; retrying in $(backoff "$attempt")s..." >&2
+      kexec rm -f "$remote_chunk" >/dev/null 2>&1 || true
+      if (( EXEC_ATTEMPTS > 0 && attempt >= EXEC_ATTEMPTS )); then
+        echo "Report transfer failed at byte ${offset} after ${attempt} attempts" >&2
+        return 1
+      fi
+      retry_limit="unlimited"
+      (( EXEC_ATTEMPTS > 0 )) && retry_limit="$EXEC_ATTEMPTS"
+      echo "  report chunk transfer failed at byte ${offset} (attempt ${attempt}/${retry_limit}); retrying in $(backoff "$attempt")s..." >&2
       sleep "$(backoff "$attempt")"
     done
     offset=$((offset + want))
@@ -211,7 +234,10 @@ spec:
   containers:
     - name: retrieve
       image: python:3.12-alpine
-      command: ["sh", "-c", "sleep 600"]
+      # A monitoring export can query many dashboards for many repeated
+      # profiles before the final report transfer begins. Keep the helper
+      # alive for the whole export/transfer window; cleanup() deletes it.
+      command: ["sh", "-c", "sleep 3600"]
       env:
         - name: GRAFANA_AUTH
           valueFrom:

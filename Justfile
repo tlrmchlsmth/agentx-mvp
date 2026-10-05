@@ -13,6 +13,7 @@ set export
 #   just logs / just shell # inspect the typed service
 #   just clean             # delete typed Jobs and service resources
 #   just live-aiperf 1,4,8,16 # benchmark the deployed llm-d model
+#   just live-nyann 1,4,8 1024 512 # synthetic nyann-bench sweep
 #   just live-aiperf-report   # download the newest portable report
 
 NAMESPACE := env_var_or_default('NAMESPACE', 'vllm')
@@ -28,6 +29,7 @@ manifesto_user := env_var_or_default('MANIFESTO_USER', env_var_or_default('USER'
 manifesto_args := env_var_or_default('MANIFESTO_ARGS', '')
 kueue_queue := env_var_or_default('KUEUE_QUEUE', 'nightly-eval')
 aiperf_image := env_var_or_default('AIPERF_IMAGE', 'quay.io/tms/aiperf:agentx-v0')
+nyann_image := env_var_or_default('NYANN_IMAGE', 'ghcr.io/neuralmagic/nyann-bench:latest')
 lustre_claim := env_var_or_default('LUSTRE_CLAIM', 'lustre-pvc-vllm')
 lustre_mount := env_var_or_default('LUSTRE_MOUNT', '/mnt/lustre')
 lustre_prefix := env_var_or_default('LUSTRE_PREFIX', '/mnt/lustre/agentx-mvp')
@@ -65,6 +67,10 @@ default:
 # serving spec, and submits one autonomous sweep Job.
 live-aiperf concurrencies:
     ./live-aiperf/submit.sh "{{concurrencies}}"
+
+# Run a synthetic ISL/OSL benchmark against the currently deployed llm-d model.
+live-nyann concurrencies isl="1024" osl="512" duration="900" warmup="60":
+    NYANN_IMAGE="{{nyann_image}}" ./live-nyann/submit.sh "{{concurrencies}}" "{{isl}}" "{{osl}}" "{{duration}}" "{{warmup}}"
 
 # Regenerate and download the newest completed live-aiperf report.
 live-aiperf-report monitoring="false":
