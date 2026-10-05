@@ -1,39 +1,38 @@
 # Overlay benchmark campaigns
 
-A campaign deploys Kustomize overlays **one at a time** in a dedicated serving
-namespace. For each overlay it waits for the exact expected number of Ready
-serving Pods, runs the configured AIPerf and/or nyann sweeps, records results,
-and deletes the rendered overlay before moving to the next. One Kueue campaign
+A campaign config is one experiment matrix: named vLLM builds, concrete llm-d
+Kustomize overlays, and AIPerf/nyann sweeps. The runner resolves every build
+branch to an exact commit and warms the shared wheel cache for **all builds
+before deploying any serving overlay**. It then benchmarks every build ×
+overlay combination in a dedicated namespace, deploying one at a time and
+removing it before the next. One Kueue campaign
 queue slot prevents two campaign runners from changing the deployment at once.
 The separate benchmark queue admits the child benchmark Jobs; the campaign Job
 must never use that queue or it could block its own children.
 
 ## Prepare
 
-1. Copy `examples/campaign.example.json`. Set `source.repo` to the llm-d
-   fork and `source.ref` to the branch, tag, or commit to benchmark. List the
-   Kustomize overlay paths relative to that repository, with each overlay's
-   serving Pod selector and expected Pod count. The campaign Job fetches the
-   source once at run time, resolves it to a commit, and uses that checkout for
-   every overlay. Changing forks or branches does not require rebuilding the
-   campaign image. Container images referenced by those overlays must already
-   be published; the campaign checks out deployment manifests but does not
-   build llm-d images. If an overlay contains a compatible vLLM wheel build
-   script, a `vllm-build-ref` ConfigMap, and a prefill LeaderWorkerSet, the runner
+1. Copy `examples/campaign.example.json`. Set `source.repo` and `source.ref`
+   to the llm-d fork and branch/tag/commit that contains the overlays. Set
+   `build_repo` and list named `builds`, each with ordered `steps`. The first
+   action is `checkout`; later actions can be `merge`, `cherry-pick`,
+   `cherry-pick-mN`, or `cherry-pick-parent1`. List concrete Kustomize overlay
+   paths relative to llm-d. Use `dimensions` to label MTP, offloading,
+   topology, PD size, or other settings in the final report. Each overlay also
+   needs its serving Pod selector and expected Pod count. The runner fetches
+   llm-d once and resolves every vLLM branch once. Container images referenced
+   by overlays must already be available. Each matrix overlay needs a compatible vLLM wheel build
+   script, a `vllm-build-ref` ConfigMap, and a LeaderWorkerSet that sources the script. The runner
    replaces that script in the rendered manifest with
    [`campaign/vllm-wheel-build.sh`](../campaign/vllm-wheel-build.sh) from this PR.
    The prebuild Job and serving Pods therefore use the same versioned recipe.
    The runner starts the build Job before the serving deployment. The Job
    uses that worker's image, GPU resources, and shared build-cache PVC. The
    script validates and installs an existing wheel or builds and caches it on
-   a miss. A failed build stops that overlay before serving Pods are started.
-   Without a build recipe, the overlay's `vllm-build-ref` supplies one pinned
-   vLLM commit. An optional per-overlay `build` recipe resolves an ordered set
-   of vLLM branches to exact commits before building. It supports `checkout`
-   first, followed by `merge`, `cherry-pick`, `cherry-pick-mN`, or
-   `cherry-pick-parent1`. The order, actions, and resolved commits enter the
-   wheel cache key. No integration branch is pushed, so Git write credentials
-   are unnecessary.
+   a miss. A failed build is recorded before any serving Pods are started.
+   The order, actions, and resolved commits enter the wheel cache key. Repeated
+   overlays with the same build and runtime reuse the READY wheel. The runner
+   does not push an integration branch, so Git write credentials are unnecessary.
 2. Each overlay must render a **complete, disposable, namespaced** deployment.
    Resources that already exist are rejected so cleanup cannot delete shared
    infrastructure. Do not put the results PVC, Kueue objects, namespace, or
@@ -62,8 +61,11 @@ edit them for the actual deployment before submitting. `campaign-validate`
 checks the experiment file locally. It cannot validate paths in the remote
 repository or cluster permissions.
 
-To compose a vLLM build for one overlay, add this optional field to that
-overlay in the campaign JSON:
+The main example shows two builds (`branch0 + branch1 + branch2` and
+`branch0 + branch1 + branch3`) crossed with three overlays. Each overlay path
+must point to a complete Kustomize deployment; `dimensions` are report labels,
+not manifest patches. For a legacy single-overlay campaign without top-level
+`builds`, an overlay may still have its own `build` field:
 
 ```json
 "build": {
@@ -94,11 +96,12 @@ cluster without pushing an integration branch.
 
 The campaign Job runs in the configured namespace. It is queued by Kueue,
 fetches the selected llm-d fork/ref once, saves its resolved commit, then
-renders each overlay with `kubectl kustomize`, stores the rendered manifest and
-its SHA-256 hash, and checks that its resources do not pre-exist. For compatible
-vLLM build overlays, it creates the build ConfigMaps and runs the cache-aware
-build Job. Its output is saved as `<overlay>/build.log`; the Job is removed
-before deployment. The runner then applies the
+renders each overlay with `kubectl kustomize`. For every named build and
+overlay, it prepares the exact runtime wheel in the shared cache and removes
+the temporary build Job and ConfigMaps. Logs are saved under
+`builds/<build>/<overlay>/build.log`. After all builds finish, it saves each
+combination's rendered manifest and SHA-256 hash, checks that its resources do
+not pre-exist, and applies the
 manifest, waits for the configured Pod selector to match exactly
 `expected_pods` Ready Pods, and records Pod UIDs plus the vLLM build commit.
 After each benchmark it checks that those Pod UIDs and the build commit are
@@ -116,10 +119,17 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
 
 - `campaign.json`: the exact campaign request, including fork and ref.
 - `source-commit.txt`: the resolved llm-d commit shared by all overlays.
-- `<overlay>/manifest.yaml`, `serving-pods.json`, and submit logs.
-- `summary.json`: each overlay, benchmark Job, status, artifact path, and AIPerf
-  measurements.
-- `index.html`: a compact cross-overlay AIPerf comparison table.
+- `builds/<build>/<overlay>/build.log`: cache hit or build details for each
+  build/runtime combination.
+- `<build>-<overlay>/manifest.yaml`, `serving-pods.json`, and submit logs.
+- `summary.json`: resolved build inputs, every combination, benchmark status,
+  artifacts, and per-concurrency AIPerf and nyann measurements.
+- `comparison.csv` and `index.html`: one table across builds, overlays,
+  dimensions, and benchmark tools, with throughput and latency metrics from
+  both tools. AIPerf rows use the existing live report reader and link to its
+  generated dashboard, including the saved Grafana views; every requested
+  sample is checked, including repeated concurrencies. Nyann rows come from
+  its per-stage Job summary, which is also saved as `nyann-job.log`.
 
 Full AIPerf and nyann artifacts stay in their existing `/workload/aiperf-agentx`
 and `/workload/nyann-agentx` directories, keyed by campaign, overlay, and tool.

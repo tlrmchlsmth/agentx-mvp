@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import copy
+import csv
 import hashlib
 import html
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,7 +25,13 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+REPORT_SPEC = importlib.util.spec_from_file_location("live_aiperf_report", ROOT / "live-aiperf" / "report.py")
+if REPORT_SPEC is None or REPORT_SPEC.loader is None:
+    raise RuntimeError("Could not load the live AIPerf report reader")
+AIPERF_REPORT = importlib.util.module_from_spec(REPORT_SPEC)
+REPORT_SPEC.loader.exec_module(AIPERF_REPORT)
 NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+DIMENSION_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 JOB_LINE = re.compile(r"^Job queued: ([a-z0-9-]+) ", re.MULTILINE)
 GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 BUILD_ACTION = re.compile(r"^(?:checkout|merge|cherry-pick|cherry-pick-parent1|cherry-pick-m[1-9][0-9]*)$")
@@ -67,11 +76,23 @@ def git_branch(value: Any, field: str) -> str:
     return value
 
 
+def validate_steps(steps: Any, field: str) -> None:
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 32:
+        raise ValueError(f"{field} needs 1-32 entries")
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict) or set(step) != {"ref", "action"}:
+            raise ValueError(f"{field}[{index}] needs ref and action")
+        git_branch(step["ref"], f"{field}[{index}].ref")
+        action = step["action"]
+        if not isinstance(action, str) or not BUILD_ACTION.fullmatch(action) or (index == 0) != (action == "checkout"):
+            raise ValueError(f"{field}[{index}].action is invalid")
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text())
     if not isinstance(config, dict):
         raise ValueError("campaign must be a JSON object")
-    allowed = {"id", "namespace", "source", "results_pvc", "benchmark_queue",
+    allowed = {"id", "namespace", "source", "build_repo", "builds", "results_pvc", "benchmark_queue",
                "campaign_queue", "overlays", "benchmarks", "rollout_timeout_seconds",
                "admission_timeout_seconds", "cleanup_timeout_seconds", "continue_on_failure"}
     if set(config) - allowed:
@@ -99,11 +120,29 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("overlays must contain 1-32 entries")
     if not isinstance(benchmarks, list) or not benchmarks or len(benchmarks) > 4:
         raise ValueError("benchmarks must contain 1-4 entries")
+    builds = config.get("builds")
+    if builds is not None:
+        git_repo(config.get("build_repo"), "build_repo")
+        if not isinstance(builds, list) or not 1 <= len(builds) <= 16:
+            raise ValueError("builds must contain 1-16 entries")
+        build_names = set()
+        for build in builds:
+            if not isinstance(build, dict) or set(build) != {"name", "steps"}:
+                raise ValueError("each build needs name and steps")
+            name = required_name(build["name"], "build.name")
+            if name in build_names:
+                raise ValueError(f"duplicate build: {name}")
+            build_names.add(name)
+            validate_steps(build["steps"], f"build {name}.steps")
+        if len(builds) * len(overlays) > 128:
+            raise ValueError("builds x overlays may not exceed 128 combinations")
+    elif "build_repo" in config:
+        raise ValueError("build_repo requires builds")
     seen = set()
     for overlay in overlays:
         required = {"name", "path", "model_label", "pod_selector", "expected_pods"}
-        if not isinstance(overlay, dict) or not required.issubset(overlay) or set(overlay) - required - {"build"}:
-            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods; build is optional")
+        if not isinstance(overlay, dict) or not required.issubset(overlay) or set(overlay) - required - {"build", "dimensions"}:
+            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods; build/dimensions are optional")
         name = required_name(overlay["name"], "overlay.name")
         if name in seen:
             raise ValueError(f"duplicate overlay: {name}")
@@ -115,21 +154,25 @@ def load_config(path: Path) -> dict[str, Any]:
             if not isinstance(overlay[key], str) or not overlay[key].strip() or "\n" in overlay[key]:
                 raise ValueError(f"overlay {name} requires {key}")
         bounded_int(overlay["expected_pods"], "expected_pods", 1, 1000)
+        dimensions = overlay.get("dimensions", {})
+        reserved = {"build", "overlay", "tool", "sample", "concurrency", "status", "requests_per_s",
+                    "output_tokens_per_s", "ttft_p90", "itl_p90", "artifacts", "error",
+                    "successful_requests", "error_requests", "requests_unit", "output_tokens_unit",
+                    "ttft_unit", "itl_unit", "report"}
+        if not isinstance(dimensions, dict) or len(dimensions) > 16 or any(
+            not isinstance(key, str) or not DIMENSION_NAME.fullmatch(key) or key in reserved or
+            not isinstance(value, (str, int, float, bool)) or len(str(value)) > 80
+            for key, value in dimensions.items()
+        ):
+            raise ValueError(f"overlay {name}.dimensions must map short names to scalar values")
+        if builds is not None and "build" in overlay:
+            raise ValueError("top-level builds cannot be combined with per-overlay build")
         if "build" in overlay:
             build = overlay["build"]
             if not isinstance(build, dict) or set(build) != {"repo", "steps"}:
                 raise ValueError(f"overlay {name} build needs repo and steps")
             git_repo(build["repo"], f"overlay {name} build.repo")
-            steps = build["steps"]
-            if not isinstance(steps, list) or not 1 <= len(steps) <= 32:
-                raise ValueError(f"overlay {name} build.steps needs 1-32 entries")
-            for index, step in enumerate(steps):
-                if not isinstance(step, dict) or set(step) != {"ref", "action"}:
-                    raise ValueError(f"overlay {name} build step needs ref and action")
-                git_branch(step["ref"], f"overlay {name} build.steps[{index}].ref")
-                action = step["action"]
-                if not isinstance(action, str) or not BUILD_ACTION.fullmatch(action) or (index == 0) != (action == "checkout"):
-                    raise ValueError(f"overlay {name} build.steps[{index}].action is invalid")
+            validate_steps(build["steps"], f"overlay {name} build.steps")
     tools = set()
     for bench in benchmarks:
         if not isinstance(bench, dict):
@@ -155,9 +198,15 @@ def load_config(path: Path) -> dict[str, Any]:
             bounded_int(bench["warmup_seconds"], "warmup_seconds", 0, 3600)
     if len("campaign-" + config["id"]) > 63:
         raise ValueError("campaign ID is too long for Kubernetes Job/ConfigMap names")
+    combined_names = set()
     for overlay in overlays:
-        if any(len(f"{config['id']}-{overlay['name']}-{tool}") > 120 for tool in tools):
-            raise ValueError("campaign/overlay names produce a run ID longer than 120 characters")
+        names = [f"{build['name']}-{overlay['name']}" for build in builds] if builds else [overlay["name"]]
+        for name in names:
+            if name in combined_names:
+                raise ValueError(f"build/overlay combination name collides: {name}")
+            combined_names.add(name)
+        if any(len(f"{config['id']}-{name}-{tool}") > 120 for name in names for tool in tools):
+            raise ValueError("campaign/build/overlay names produce a run ID longer than 120 characters")
     return config
 
 
@@ -263,11 +312,11 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
         raise ValueError("overlay already contains a conflicting vllm-build ConfigMap")
     script_map["metadata"]["name"] = "vllm-build"
     script_map["data"] = {"vllm-wheel-build.sh": (ROOT / "campaign" / "vllm-wheel-build.sh").read_text()}
+    ref_map = next((item for item in documents if isinstance(item, dict) and item.get("kind") == "ConfigMap" and
+                    item.get("metadata", {}).get("name") == "vllm-build-ref"), None)
+    if ref_map is None:
+        raise ValueError("vLLM build script requires a vllm-build-ref ConfigMap")
     if build:
-        ref_map = next((item for item in documents if isinstance(item, dict) and item.get("kind") == "ConfigMap" and
-                        item.get("metadata", {}).get("name") == "vllm-build-ref"), None)
-        if ref_map is None:
-            raise ValueError("build steps require a vllm-build-ref ConfigMap")
         steps = build["steps"]
         ref_map.setdefault("data", {}).update({
             "VLLM_BUILD_REF": steps[0]["ref"], "VLLM_BUILD_COMMIT": steps[0]["commit"],
@@ -295,11 +344,22 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
                 if field in container:
                     references += sum(old_key in part for part in container[field])
                     container[field] = [part.replace(old_key, "vllm-wheel-build.sh") for part in container[field]]
-            if build and any("vllm-wheel-build.sh" in part for field in ("command", "args") for part in container.get(field, [])):
+            if any("vllm-wheel-build.sh" in part for field in ("command", "args") for part in container.get(field, [])):
                 env = container.setdefault("env", [])
-                for key in ("VLLM_BUILD_REPO", "VLLM_BUILD_REFS", "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS"):
-                    env[:] = [item for item in env if item.get("name") != key]
-                    env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
+                existing = {item.get("name") for item in env}
+                for key in ("VLLM_BUILD_REF", "VLLM_BUILD_COMMIT"):
+                    if key not in existing:
+                        env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
+                if "VLLM_BUILD_BASE_IMAGE_ID" not in existing:
+                    image = container.get("image", "")
+                    image_id = image.split("@", 1)[1] if "@sha256:" in image else image
+                    env.append({"name": "VLLM_BUILD_BASE_IMAGE_ID", "value": image_id})
+                if "VLLM_BUILD_ROLE" not in existing:
+                    env.append({"name": "VLLM_BUILD_ROLE", "value": "prefill"})
+                if build:
+                    for key in ("VLLM_BUILD_REPO", "VLLM_BUILD_REFS", "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS"):
+                        env[:] = [item for item in env if item.get("name") != key]
+                        env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
     if not references:
         raise ValueError("vLLM build script is not sourced by a LeaderWorkerSet container")
     return yaml.safe_dump_all(documents, sort_keys=False)
@@ -321,11 +381,12 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
             continue
         pod = item.get("spec", {}).get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec", {})
         for container in pod.get("containers", []):
-            if any(env.get("name") == "VLLM_BUILD_ROLE" and env.get("value") == "prefill" for env in container.get("env", [])):
-                candidates.append((pod, container))
-    if len(candidates) != 1:
-        raise ValueError("vLLM build needs exactly one prefill worker container")
-    pod, serving = candidates[0]
+            if any("vllm-wheel-build.sh" in part for field in ("command", "args") for part in container.get(field, [])):
+                role = next((env.get("value") for env in container.get("env", []) if env.get("name") == "VLLM_BUILD_ROLE"), "")
+                candidates.append((role == "prefill", pod, container))
+    if not candidates:
+        raise ValueError("vLLM build needs a worker container that sources the script")
+    _, pod, serving = next((candidate for candidate in candidates if candidate[0]), candidates[0])
     mounts = [copy.deepcopy(m) for m in serving.get("volumeMounts", []) if m.get("name") in {"build-cache", "vllm-build"}]
     volumes = [copy.deepcopy(v) for v in pod.get("volumes", []) if v.get("name") in {"build-cache", "vllm-build"}]
     if {m.get("name") for m in mounts} != {"build-cache", "vllm-build"} or {v.get("name") for v in volumes} != {"build-cache", "vllm-build"}:
@@ -336,7 +397,8 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
     env = [copy.deepcopy(e) for e in serving.get("env", []) if e.get("name", "").startswith("VLLM_BUILD_")]
     if not {"VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_BASE_IMAGE_ID", "VLLM_BUILD_ROLE"}.issubset({e["name"] for e in env}):
         raise ValueError("vLLM prefill worker is missing build identity")
-    env.append({"name": "LWS_WORKER_INDEX", "value": "0"})
+    env = [item for item in env if item["name"] not in {"VLLM_BUILD_ROLE", "LWS_WORKER_INDEX"}]
+    env.extend(({"name": "VLLM_BUILD_ROLE", "value": "prefill"}, {"name": "LWS_WORKER_INDEX", "value": "0"}))
     builder = {"name": "build", "image": serving["image"], "imagePullPolicy": serving.get("imagePullPolicy", "IfNotPresent"),
                "command": ["/bin/bash", "-c"], "args": ["source /opt/build-scripts/vllm-wheel-build.sh"],
                "env": env, "resources": copy.deepcopy(serving.get("resources", {})), "volumeMounts": mounts}
@@ -353,11 +415,13 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
     # These are owned by the saved overlay manifest and deleted with it on failure.
     service_account = next((item for item in documents if item.get("kind") == "ServiceAccount" and
                             item.get("metadata", {}).get("name") == pod.get("serviceAccountName")), None)
-    for item in (script_map, ref_map, service_account):
-        if item is None:
-            continue
-        kube(config["namespace"], "create", "-f", "-", input_text=json.dumps(item))
+    created = []
     try:
+        for item in (script_map, ref_map, service_account):
+            if item is None:
+                continue
+            kube(config["namespace"], "create", "-f", "-", input_text=json.dumps(item))
+            created.append(item)
         kube(config["namespace"], "create", "-f", "-", input_text=json.dumps(job))
         waited = kube(config["namespace"], "wait", "--for=condition=complete", f"job/{name}",
                       f"--timeout={config['rollout_timeout_seconds']}s", check=False)
@@ -366,10 +430,16 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
         if waited.returncode:
             raise RuntimeError(f"vLLM prebuild failed: {waited.stderr.strip()}; see {folder / 'build.log'}")
     finally:
-        deleted = kube(config["namespace"], "delete", "job", name, "--ignore-not-found", "--wait=true",
-                       f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
-        if deleted.returncode:
-            raise CleanupError(f"prebuild Job {name} cleanup failed: {deleted.stderr.strip()}")
+        errors = []
+        for kind, resource_name in [("job", name)] + [
+            (item["kind"].lower(), item["metadata"]["name"]) for item in reversed(created)
+        ]:
+            deleted = kube(config["namespace"], "delete", kind, resource_name, "--ignore-not-found", "--wait=true",
+                           f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
+            if deleted.returncode:
+                errors.append(f"{kind}/{resource_name}: {deleted.stderr.strip()}")
+        if errors:
+            raise CleanupError("prebuild resource cleanup failed: " + "; ".join(errors))
     return ref_map["data"]["VLLM_BUILD_COMMIT"]
 
 
@@ -412,6 +482,65 @@ def wait_job(config: dict[str, Any], name: str, timeout: int) -> None:
             raise RuntimeError(f"benchmark Job {name} failed; inspect kubectl logs -n {namespace} job/{name}")
         time.sleep(10)
     raise TimeoutError(f"benchmark Job {name} exceeded admission/runtime timeout")
+
+
+def aiperf_measurements(artifact: Path, run_id: str, concurrencies: list[int]) -> list[dict[str, Any]]:
+    counts = Counter(concurrencies)
+    seen: Counter[int] = Counter()
+    expected_samples = {}
+    for concurrency in concurrencies:
+        seen[concurrency] += 1
+        sample = f"c{concurrency}" if counts[concurrency] == 1 else f"c{concurrency}-r{seen[concurrency]}"
+        expected_samples[sample] = concurrency
+    measurements = []
+    for directory in sorted(artifact.iterdir()):
+        data = AIPERF_REPORT.run_data(directory)
+        if data is None:
+            continue
+        profile, metadata = data["profile"], data["metadata"]
+        if metadata.get("run_id") != f"{run_id}-{directory.name}" or metadata.get("concurrency") != expected_samples.get(directory.name):
+            raise RuntimeError(f"AIPerf artifact {directory.name} has unexpected run identity or concurrency")
+        metrics = {}
+        for key in ("request_throughput", "output_token_throughput", "time_to_first_token", "inter_token_latency"):
+            value = profile.get(key, {})
+            if isinstance(value, dict):
+                metrics[key] = {field: value[field] for field in ("avg", "p90", "unit") if field in value}
+        measurements.append({"concurrency": metadata["concurrency"], "sample": directory.name, "metrics": metrics})
+    if {item["sample"] for item in measurements} != set(expected_samples):
+        raise RuntimeError(f"AIPerf artifacts have samples {[item['sample'] for item in measurements]}, "
+                           f"expected {list(expected_samples)}")
+    return measurements
+
+
+def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    summary = None
+    for match in re.finditer(r"(?m)^\{", log):
+        try:
+            candidate, _ = decoder.raw_decode(log[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and isinstance(candidate.get("stages"), list):
+            summary = candidate
+    if summary is None:
+        raise RuntimeError("Nyann Job completed without a machine-readable stage summary in its logs")
+    stages = summary["stages"]
+    if [stage.get("concurrency") for stage in stages] != concurrencies:
+        raise RuntimeError("Nyann stage concurrencies differ from the requested sweep")
+    measurements = []
+    for index, stage in enumerate(stages, 1):
+        successes = stage["successful_requests"]
+        errors = stage["error_requests"]
+        duration = stage["duration_seconds"]
+        if successes <= 0 or duration <= 0:
+            raise RuntimeError(f"Nyann stage {index} has no successful requests or measured duration")
+        measurements.append({"concurrency": stage["concurrency"], "sample": f"stage-{index}",
+                             "successful_requests": successes, "error_requests": errors,
+                             "metrics": {"request_throughput": {"avg": successes / duration, "unit": "req/s"},
+                                         "output_token_throughput": {"avg": stage["output_tokens_per_second"], "unit": "tokens/s"},
+                                         "time_to_first_token": {"p90": stage["ttft_ms"]["p90"], "unit": "ms"},
+                                         "inter_token_latency": {"p90": stage["itl_ms"]["p90"], "unit": "ms"}}})
+    return measurements
 
 
 def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dict[str, Any],
@@ -465,20 +594,11 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
         raise RuntimeError(f"{job_name} completed without expected artifacts: {artifact}")
     measurements = []
     if tool == "aiperf":
-        for directory in sorted(Path(artifact).iterdir()):
-            profile_path = directory / "profile_export_aiperf.json"
-            if not profile_path.is_file():
-                continue
-            profile = json.loads(profile_path.read_text())
-            metadata = json.loads((directory / "benchmark-metadata.json").read_text())
-            metrics = {}
-            for key in ("request_throughput", "output_token_throughput", "time_to_first_token", "inter_token_latency"):
-                value = profile.get(key, {})
-                if isinstance(value, dict):
-                    metrics[key] = {field: value[field] for field in ("avg", "p90", "unit") if field in value}
-            measurements.append({"concurrency": metadata["concurrency"], "sample": directory.name, "metrics": metrics})
-        if len(measurements) != len(bench["concurrencies"]):
-            raise RuntimeError(f"{job_name} completed with {len(measurements)} profiles, expected {len(bench['concurrencies'])}")
+        measurements = aiperf_measurements(Path(artifact), run_id, bench["concurrencies"])
+    else:
+        log = kube(config["namespace"], "logs", f"job/{job_name}").stdout
+        (campaign_dir / "nyann-job.log").write_text(log)
+        measurements = nyann_measurements(log, bench["concurrencies"])
     return {"tool": tool, "job": job_name, "run_id": run_id, "artifacts": artifact,
             "report": f"{artifact}/index.html" if tool == "aiperf" else None,
             "measurements": measurements, "status": "completed"}
@@ -488,33 +608,125 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
     tmp = destination / "summary.json.tmp"
     tmp.write_text(json.dumps(summary, indent=2) + "\n")
     tmp.replace(destination / "summary.json")
+    dimensions = sorted({key for record in summary["overlays"] for key in record.get("dimensions", {})})
+    fields = ["build", "overlay", *dimensions, "tool", "sample", "concurrency", "status",
+              "successful_requests", "error_requests",
+              "requests_per_s", "requests_unit", "output_tokens_per_s", "output_tokens_unit",
+              "ttft_p90", "ttft_unit", "itl_p90", "itl_unit", "report", "artifacts", "error"]
     rows = []
-    for overlay in summary["overlays"]:
-        for bench in overlay.get("benchmarks", []):
-            rows.append("<tr>" + "".join(f"<td>{html.escape(str(value or ''))}</td>" for value in (
-                overlay["name"], bench["tool"], bench["status"], bench.get("job"),
-                bench.get("artifacts"), bench.get("error"))) + "</tr>")
-        if not overlay.get("benchmarks"):
-            rows.append(f"<tr><td>{html.escape(overlay['name'])}</td><td></td><td>{html.escape(overlay['status'])}</td><td colspan=3>{html.escape(overlay.get('error', ''))}</td></tr>")
-    comparisons = []
-    for overlay in summary["overlays"]:
-        for bench in overlay.get("benchmarks", []):
-            for measurement in bench.get("measurements", []):
-                metrics = measurement["metrics"]
-                values = [overlay["name"], measurement["sample"],
-                          metrics.get("request_throughput", {}).get("avg", ""),
-                          metrics.get("output_token_throughput", {}).get("avg", ""),
-                          metrics.get("time_to_first_token", {}).get("p90", ""),
-                          metrics.get("inter_token_latency", {}).get("p90", "")]
-                comparisons.append("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in values) + "</tr>")
+    for record in summary["overlays"]:
+        for bench in record.get("benchmarks") or [{"tool": "", "status": record["status"], "error": record.get("error", "")}]:
+            for measurement in bench.get("measurements") or [{}]:
+                metrics = measurement.get("metrics", {})
+                row = {"build": record.get("build", ""), "overlay": record.get("overlay", record["name"]),
+                       "tool": bench["tool"], "sample": measurement.get("sample", ""),
+                       "concurrency": measurement.get("concurrency", ""), "status": bench["status"],
+                       "successful_requests": measurement.get("successful_requests", ""),
+                       "error_requests": measurement.get("error_requests", ""),
+                       "requests_per_s": metrics.get("request_throughput", {}).get("avg", ""),
+                       "requests_unit": metrics.get("request_throughput", {}).get("unit", ""),
+                       "output_tokens_per_s": metrics.get("output_token_throughput", {}).get("avg", ""),
+                       "output_tokens_unit": metrics.get("output_token_throughput", {}).get("unit", ""),
+                       "ttft_p90": metrics.get("time_to_first_token", {}).get("p90", ""),
+                       "ttft_unit": metrics.get("time_to_first_token", {}).get("unit", ""),
+                       "itl_p90": metrics.get("inter_token_latency", {}).get("p90", ""),
+                       "itl_unit": metrics.get("inter_token_latency", {}).get("unit", ""),
+                       "report": bench.get("report", ""),
+                       "artifacts": bench.get("artifacts", ""), "error": bench.get("error", "")}
+                row.update(record.get("dimensions", {}))
+                rows.append(row)
+    with (destination / "comparison.csv").open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    build_rows = []
+    for build in summary.get("builds", []):
+        inputs = ", ".join(f"{step['action']} {step['ref']}@{step['commit'][:12]}" for step in build.get("inputs", {}).get("steps", []))
+        build_rows.append("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in
+                        (build["name"], build["status"], inputs, build.get("error", ""))) + "</tr>")
+    header = "".join(f"<th>{html.escape(field.replace('_', ' ').title())}</th>" for field in fields)
+    def html_cell(row: dict[str, Any], field: str) -> str:
+        value = str(row.get(field, ""))
+        if field == "report" and value:
+            try:
+                relative = Path(value).relative_to("/workload")
+            except ValueError:
+                pass
+            else:
+                href = "../../" + relative.as_posix()
+                return f'<td><a href="{html.escape(href, quote=True)}">AIPerf dashboard</a></td>'
+        return f"<td>{html.escape(value)}</td>"
+
+    body = "".join("<tr>" + "".join(html_cell(row, field) for field in fields) + "</tr>" for row in rows)
     page = "<!doctype html><meta charset='utf-8'><title>Benchmark campaign</title>" + \
         "<style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #aaa;padding:.5rem;text-align:left}</style>" + \
         f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + \
-        "<table><tr><th>Overlay</th><th>Tool</th><th>Status</th><th>Job</th><th>Artifacts on PVC</th><th>Error</th></tr>" + \
-        "".join(rows) + "</table>" + \
-        "<h2>AIPerf comparison</h2><table><tr><th>Overlay</th><th>Sample</th><th>Requests/s avg</th><th>Output tokens/s avg</th><th>TTFT p90</th><th>ITL p90</th></tr>" + \
-        "".join(comparisons) + "</table>"
+        "<h2>Builds</h2><table><tr><th>Build</th><th>Status</th><th>Resolved inputs</th><th>Error</th></tr>" + \
+        "".join(build_rows) + "</table>" + \
+        "<h2>All configurations</h2><table><tr>" + header + "</tr>" + body + "</table>"
     (destination / "index.html").write_text(page)
+
+
+def render_overlay(overlay_root: Path, overlay: dict[str, Any]) -> str:
+    path = (overlay_root / overlay["path"]).resolve(strict=True)
+    if not path.is_relative_to(overlay_root) or not path.is_dir():
+        raise ValueError(f"overlay {overlay['name']} escapes overlay_root or is not a directory")
+    rendered = call(["kubectl", "kustomize", str(path)]).stdout
+    if not rendered.strip():
+        raise RuntimeError(f"overlay {overlay['name']} rendered no resources")
+    return rendered
+
+
+def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destination: Path,
+                          summary: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, str], bool, bool]:
+    """Build every variant before starting any serving overlay."""
+    base_manifests = {overlay["name"]: render_overlay(overlay_root, overlay) for overlay in config["overlays"]}
+    resolved = {}
+    failed = False
+    stopped = False
+    summary["builds"] = []
+    for variant in config["builds"]:
+        name = variant["name"]
+        record: dict[str, Any] = {"name": name, "status": "running", "prebuilds": []}
+        summary["builds"].append(record)
+        folder = destination / "builds" / name
+        folder.mkdir(parents=True)
+        write_summary(destination, summary)
+        cleanup_error = False
+        try:
+            build = resolve_build({"repo": config["build_repo"], "steps": variant["steps"]})
+            record["inputs"] = build
+            resolved[name] = build
+            for overlay in config["overlays"]:
+                overlay_folder = folder / overlay["name"]
+                overlay_folder.mkdir()
+                rendered = inject_vllm_build_script(base_manifests[overlay["name"]], build)
+                validate_manifest(rendered, config["namespace"])
+                manifest = overlay_folder / "manifest.yaml"
+                manifest.write_text(rendered)
+                existing = kube(config["namespace"], "get", "-f", str(manifest), "--ignore-not-found", "-o", "name").stdout.strip()
+                if existing:
+                    raise RuntimeError(f"prebuild would modify pre-existing resources: {existing}")
+                if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
+                    raise RuntimeError("prebuild requires an empty serving namespace")
+                commit = vllm_prebuild(rendered, config, overlay, overlay_folder)
+                if not commit:
+                    raise RuntimeError(f"overlay {overlay['name']} has no compatible vLLM build script")
+                record["prebuilds"].append({"overlay": overlay["name"], "base_commit": commit,
+                                             "log": str(overlay_folder / "build.log")})
+                write_summary(destination, summary)
+            record["status"] = "completed"
+        except Exception as exc:
+            record["status"] = "failed"
+            record["error"] = str(exc)
+            cleanup_error = isinstance(exc, CleanupError)
+            resolved.pop(name, None)
+            failed = True
+        write_summary(destination, summary)
+        if record["status"] == "failed" and (cleanup_error or not config["continue_on_failure"]):
+            stopped = True
+            break
+    return resolved, base_manifests, failed, stopped
 
 
 def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
@@ -537,24 +749,58 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
     write_summary(destination, summary)
     failed = False
     resolved_builds: dict[str, dict[str, Any]] = {}
-    for overlay in config["overlays"]:
+    matrix_builds: dict[str, dict[str, Any]] = {}
+    base_manifests: dict[str, str] = {}
+    stopped = False
+    if "builds" in config:
+        try:
+            matrix_builds, base_manifests, failed, stopped = prepare_matrix_builds(
+                config, overlay_root, destination, summary)
+        except Exception as exc:
+            summary["status"] = "failed"
+            summary["error"] = f"build preparation failed: {exc}"
+            summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+            write_summary(destination, summary)
+            shutil.rmtree(overlay_root)
+            return 1
+        build_status = {record["name"]: record for record in summary["builds"]}
+        for variant in config["builds"]:
+            name = variant["name"]
+            if name not in build_status:
+                build_status[name] = {"name": name, "status": "skipped", "error": "earlier build failed"}
+                summary["builds"].append(build_status[name])
+            if stopped or name not in matrix_builds:
+                reason = ("build preparation stopped after a failure" if stopped and name in matrix_builds
+                          else build_status[name].get("error", "build was not prepared"))
+                for overlay in config["overlays"]:
+                    summary["overlays"].append({"name": f"{name}-{overlay['name']}", "build": name,
+                                                "overlay": overlay["name"], "dimensions": overlay.get("dimensions", {}),
+                                                "status": "skipped", "error": reason, "benchmarks": []})
+        write_summary(destination, summary)
+    cases = ([(variant, overlay) for variant in config["builds"] if variant["name"] in matrix_builds
+              for overlay in config["overlays"]] if not stopped and "builds" in config else
+             [(None, overlay) for overlay in config["overlays"]] if "builds" not in config else [])
+    for variant, base_overlay in cases:
+        overlay = dict(base_overlay)
+        if variant:
+            overlay["name"] = f"{variant['name']}-{base_overlay['name']}"
         name = overlay["name"]
         print(f"Deploying overlay {name}", flush=True)
-        record: dict[str, Any] = {"name": name, "status": "running", "benchmarks": []}
+        record: dict[str, Any] = {"name": name, "status": "running", "benchmarks": [],
+                                  "overlay": base_overlay["name"], "dimensions": base_overlay.get("dimensions", {})}
+        if variant:
+            record["build"] = variant["name"]
         summary["overlays"].append(record)
         folder = destination / name
         folder.mkdir()
         manifest = folder / "manifest.yaml"
         applied = False
         try:
-            overlay_path = (overlay_root / overlay["path"]).resolve(strict=True)
-            if not overlay_path.is_relative_to(overlay_root) or not overlay_path.is_dir():
-                raise ValueError(f"overlay {name} escapes overlay_root or is not a directory")
-            rendered = call(["kubectl", "kustomize", str(overlay_path)]).stdout
-            if not rendered.strip():
-                raise RuntimeError(f"overlay {name} rendered no resources")
-            build = None
-            if "build" in overlay:
+            rendered = base_manifests[base_overlay["name"]] if variant else render_overlay(overlay_root, overlay)
+            build = matrix_builds[variant["name"]] if variant else None
+            if build:
+                record["vllm_build_inputs"] = build
+            elif "build" in overlay:
                 key = json.dumps(overlay["build"], sort_keys=True)
                 if key not in resolved_builds:
                     resolved_builds[key] = resolve_build(overlay["build"])
@@ -570,10 +816,11 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
                 raise RuntimeError(f"overlay {name} cannot start while serving Pods already exist in the namespace")
             applied = True  # prebuild or apply may partially succeed; clean up the saved manifest
-            prebuild_commit = vllm_prebuild(rendered, config, overlay, folder)
-            if prebuild_commit:
-                record["prebuild_commit"] = prebuild_commit
-                print(f"Overlay {name} build cache prepared for {prebuild_commit[:12]}", flush=True)
+            if not variant:
+                prebuild_commit = vllm_prebuild(rendered, config, overlay, folder)
+                if prebuild_commit:
+                    record["prebuild_commit"] = prebuild_commit
+                    print(f"Overlay {name} build cache prepared for {prebuild_commit[:12]}", flush=True)
             kube(config["namespace"], "apply", "-f", str(manifest))
             baseline = wait_ready(config, overlay)
             print(f"Overlay {name} ready: {len(baseline)} serving Pods", flush=True)

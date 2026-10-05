@@ -91,6 +91,111 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(len(summary["overlays"]), 2)
             self.assertTrue((root / "campaigns/test-campaign/index.html").exists())
 
+    def test_matrix_prepares_all_builds_before_deploying_every_combination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["build_repo"] = "https://github.com/example/vllm.git"
+            config["builds"] = [
+                {"name": "branch2", "steps": [{"ref": "branch0", "action": "checkout"},
+                                               {"ref": "branch1", "action": "merge"},
+                                               {"ref": "branch2", "action": "cherry-pick"}]},
+                {"name": "branch3", "steps": [{"ref": "branch0", "action": "checkout"},
+                                               {"ref": "branch1", "action": "merge"},
+                                               {"ref": "branch3", "action": "cherry-pick"}]},
+            ]
+            config["overlays"][0]["dimensions"] = {"mtp": "off", "topology": "pd"}
+            config["overlays"][1]["dimensions"] = {"mtp": "on", "topology": "aggregate"}
+            path = root / "config.json"
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+            events = []
+            manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+
+            def fake_resolve(build):
+                name = build["steps"][-1]["ref"]
+                events.append("resolve:" + name)
+                return {"repo": build["repo"], "steps": [
+                    {**step, "commit": ("b" if name == "branch2" else "c") * 40} for step in build["steps"]]}
+
+            def fake_prebuild(rendered, config, overlay, folder):
+                events.append("prebuild:" + folder.parent.name + "/" + overlay["name"])
+                (folder / "build.log").write_text("cache ready\n")
+                return "a" * 40
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "apply":
+                    events.append("deploy:" + Path(args[-1]).parent.name)
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+            def fake_submit(config, overlay, bench, folder, baseline, commit, source_commit):
+                events.append("benchmark:" + overlay["name"])
+                return {"tool": "aiperf", "status": "completed", "artifacts": "/workload/example",
+                        "measurements": [{"sample": "c1", "concurrency": 1,
+                                          "metrics": {"request_throughput": {"avg": 12}}}]}
+
+            with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
+                 patch.object(runner.shutil, "rmtree"), \
+                 patch.object(runner, "render_overlay", return_value=manifest), \
+                 patch.object(runner, "resolve_build", side_effect=fake_resolve), \
+                 patch.object(runner, "inject_vllm_build_script", side_effect=lambda rendered, build: rendered), \
+                 patch.object(runner, "vllm_prebuild", side_effect=fake_prebuild), \
+                 patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "snapshot", return_value=[]), \
+                 patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
+                 patch.object(runner, "build_commit", return_value="a" * 40), \
+                 patch.object(runner, "submit_benchmark", side_effect=fake_submit), \
+                 patch.object(runner, "wait_gone"):
+                self.assertEqual(runner.run(config, root), 0)
+            self.assertEqual(len([event for event in events if event.startswith("prebuild:")]), 4)
+            self.assertLess(max(i for i, event in enumerate(events) if event.startswith("prebuild:")),
+                            min(i for i, event in enumerate(events) if event.startswith("deploy:")))
+            summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
+            self.assertEqual([record["name"] for record in summary["overlays"]],
+                             ["branch2-baseline", "branch2-candidate", "branch3-baseline", "branch3-candidate"])
+            comparison = (root / "campaigns/test-campaign/comparison.csv").read_text()
+            self.assertIn("branch2,baseline,off,pd", comparison)
+            self.assertIn("branch3,candidate,on,aggregate", comparison)
+
+    def test_aiperf_report_matches_each_requested_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = "test-campaign-branch2-baseline-aiperf"
+            for sample, concurrency in (("c1-r1", 1), ("c4", 4), ("c1-r2", 1)):
+                folder = root / sample
+                folder.mkdir()
+                (folder / "benchmark-metadata.json").write_text(json.dumps(
+                    {"run_id": f"{run_id}-{sample}", "concurrency": concurrency}))
+                (folder / "profile_export_aiperf.json").write_text(json.dumps(
+                    {"request_throughput": {"avg": concurrency * 2, "unit": "req/s"},
+                     "time_to_first_token": {"p90": 30, "unit": "ms"}}))
+            measurements = runner.aiperf_measurements(root, run_id, [1, 4, 1])
+            self.assertEqual(len(measurements), 3)
+            self.assertEqual(sum(item["metrics"]["request_throughput"]["avg"] for item in measurements), 12)
+            runner.write_summary(root, {"id": "test", "status": "completed", "overlays": [
+                {"name": "build-baseline", "build": "build", "overlay": "baseline", "status": "completed",
+                 "benchmarks": [{"tool": "aiperf", "status": "completed", "measurements": measurements,
+                                 "report": f"/workload/aiperf-agentx/{run_id}/index.html"}]}]})
+            self.assertIn(f"../../aiperf-agentx/{run_id}/index.html", (root / "index.html").read_text())
+            with self.assertRaisesRegex(RuntimeError, "unexpected|expected"):
+                runner.aiperf_measurements(root, run_id, [1, 4, 4])
+
+    def test_nyann_stage_summary_enters_comparison_report(self):
+        stages = [{"concurrency": concurrency, "successful_requests": 10,
+                   "error_requests": 1, "duration_seconds": 5,
+                   "output_tokens_per_second": concurrency * 20,
+                   "ttft_ms": {"p90": 30}, "itl_ms": {"p90": 4}}
+                  for concurrency in (1, 4)]
+        log = "stage output\n" + json.dumps({"total_requests": 22, "stages": stages}, indent=2) + "\n"
+        measurements = runner.nyann_measurements(log, [1, 4])
+        self.assertEqual([item["metrics"]["request_throughput"]["avg"] for item in measurements], [2, 2])
+        with tempfile.TemporaryDirectory() as directory:
+            runner.write_summary(Path(directory), {"id": "example", "status": "completed", "overlays": [
+                {"name": "build-pd", "build": "build", "overlay": "pd", "status": "completed",
+                 "benchmarks": [{"tool": "nyann", "status": "completed", "measurements": measurements}]}]})
+            comparison = (Path(directory) / "comparison.csv").read_text()
+            self.assertIn("build,pd,nyann,stage-1,1,completed,10,1,2.0,req/s,20,tokens/s,30,ms,4,ms", comparison)
+
     def test_rejects_unsafe_source_and_records_checkout_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -228,7 +333,8 @@ class CampaignTests(unittest.TestCase):
             with patch.object(runner, "kube", side_effect=fake_kube):
                 commit = runner.vllm_prebuild(rendered, config, config["overlays"][0], root)
             self.assertEqual(commit, "b" * 40)
-            self.assertEqual(actions, ["create", "create", "create", "create", "wait", "logs", "delete"])
+            self.assertEqual(actions, ["create", "create", "create", "create", "wait", "logs",
+                                       "delete", "delete", "delete", "delete"])
             self.assertEqual([item["kind"] for item in created], ["ConfigMap", "ConfigMap", "ServiceAccount", "Job"])
             job_pod = created[-1]["spec"]["template"]["spec"]
             self.assertEqual(job_pod["serviceAccountName"], "kimi-k3")
