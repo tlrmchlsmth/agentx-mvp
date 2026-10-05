@@ -1,0 +1,32 @@
+{
+  "id": "example-overlay-sweep-001",
+  "namespace": "vllm",
+  "overlay_root": "/workspace/overlays",
+  "results_pvc": "kimi-k3-build-cache",
+  "benchmark_queue": "live-benchmark-client",
+  "campaign_queue": "benchmark-campaign",
+  "rollout_timeout_seconds": 3600,
+  "admission_timeout_seconds": 3600,
+  "cleanup_timeout_seconds": 600,
+  "continue_on_failure": false,
+  "overlays": [
+    {
+      "name": "baseline",
+      "path": "overlays/baseline",
+      "model_label": "kimi-k3",
+      "pod_selector": "llm-d.ai/model=kimi-k3,llm-d.ai/inference-serving=true",
+      "expected_pods": 2
+    },
+    {
+      "name": "candidate",
+      "path": "overlays/candidate",
+      "model_label": "kimi-k3",
+      "pod_selector": "llm-d.ai/model=kimi-k3,llm-d.ai/inference-serving=true",
+      "expected_pods": 2
+    }
+  ],
+  "benchmarks": [
+    {"tool": "aiperf", "concurrencies": [1, 4, 8, 16], "duration_seconds": 900},
+    {"tool": "nyann", "concurrencies": [1, 4, 8], "duration_seconds": 900, "isl": 1024, "osl": 512, "warmup_seconds": 60}
+  ]
+}

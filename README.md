@@ -8,6 +8,14 @@ The service branch exposes the same bounded benchmark tools over MCP
 The repository also ships a bounded, durable MCP benchmark service. Start
 with [the service contract and deployment guide](docs/agentx-service.md).
 
+## Overlay campaigns
+
+To compare several deployment overlays, run a single campaign that deploys each
+Kustomize overlay, waits for serving readiness, runs the same benchmark sweeps,
+saves the results, and tears it down before starting the next. See
+[overlay campaign setup](docs/campaigns.md) and
+[the campaign configuration example](examples/campaign.kimi-k3.json).
+
 ## Live llm-d sweep
 
 Use this when the question is: “how does the model deployed in this namespace

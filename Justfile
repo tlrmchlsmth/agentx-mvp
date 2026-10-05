@@ -37,6 +37,9 @@ orchestrator_image := env_var_or_default('ORCHESTRATOR_IMAGE', 'quay.io/tms/benc
 agentx_service_image := env_var_or_default('AGENTX_SERVICE_IMAGE', 'quay.io/tms/agentx-service:0.1.0')
 orchestrator_manifesto_repo := env_var_or_default('ORCHESTRATOR_MANIFESTO_REPO', 'https://github.com/tlrmchlsmth/llm-manifesto.git')
 orchestrator_manifesto_ref := env_var_or_default('ORCHESTRATOR_MANIFESTO_REF', 'main')
+campaign_overlay_repo := env_var_or_default('CAMPAIGN_OVERLAY_REPO', '')
+campaign_overlay_ref := env_var_or_default('CAMPAIGN_OVERLAY_REF', '')
+campaign_image := env_var_or_default('CAMPAIGN_IMAGE', orchestrator_image)
 orchestrator_deploy := "benchmark-orchestrator"
 orchestrator_spec_configmap := "benchmark-orchestrator-spec"
 model     := env_var_or_default('MODEL', 'deepseek-ai/DeepSeek-V4-Pro')
@@ -66,6 +69,30 @@ default:
 live-benchmark-kueue-setup namespace:
     kubectl apply -f "{{repo_root}}/kueue/live-benchmark-cluster-queue.yaml"
     kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/live-benchmark-local-queue.yaml"
+
+# Queue one overlay campaign at a time in the serving namespace. The campaign
+# queue is separate from the child benchmark queue to avoid admission deadlock.
+campaign-setup namespace:
+    kubectl apply -f "{{repo_root}}/kueue/campaign-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/campaign-local-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/campaign/rbac.yaml"
+
+campaign-validate config:
+    python3 "{{repo_root}}/campaign/run.py" validate "{{config}}"
+
+campaign-submit config:
+    python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}"
+
+campaign-build:
+    podman build --platform linux/amd64 \
+      --build-arg MANIFESTO_REPO="{{orchestrator_manifesto_repo}}" \
+      --build-arg MANIFESTO_REF="{{orchestrator_manifesto_ref}}" \
+      --build-arg CAMPAIGN_OVERLAY_REPO="{{campaign_overlay_repo}}" \
+      --build-arg CAMPAIGN_OVERLAY_REF="{{campaign_overlay_ref}}" \
+      -f Dockerfile.orchestrator -t {{campaign_image}} .
+
+campaign-push:
+    podman push {{campaign_image}}
 
 # Benchmark the currently deployed llm-d model. This is intentionally a thin
 # deployment-coupled path: it discovers the model/topology, captures the

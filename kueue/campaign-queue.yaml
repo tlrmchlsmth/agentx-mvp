@@ -1,0 +1,29 @@
+# A separate, one-slot queue serializes overlay campaigns without consuming
+# the benchmark-client quota while an orchestrator waits for child Jobs.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: benchmark-campaign
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: benchmark-campaign
+spec:
+  namespaceSelector: {}
+  preemption:
+    withinClusterQueue: Never
+    reclaimWithinCohort: Never
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "ephemeral-storage"]
+      flavors:
+        - name: benchmark-campaign
+          resources:
+            - name: cpu
+              nominalQuota: "1"
+            - name: memory
+              nominalQuota: 1Gi
+            - name: ephemeral-storage
+              nominalQuota: 1Gi
+  queueingStrategy: StrictFIFO
