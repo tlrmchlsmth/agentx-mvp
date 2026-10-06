@@ -829,7 +829,7 @@ def aiperf_measurements(artifact: Path, run_id: str, concurrencies: list[int]) -
     return measurements
 
 
-def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any]]:
+def nyann_summary(log: str) -> dict[str, Any] | None:
     decoder = json.JSONDecoder()
     summary = None
     for match in re.finditer(r"(?m)^\{", log):
@@ -839,6 +839,46 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
             continue
         if isinstance(candidate, dict) and isinstance(candidate.get("stages"), list):
             summary = candidate
+    return summary
+
+
+def nyann_source_results(campaign_dir: Path, records: list[dict[str, Any]]) -> str:
+    """Keep every stage metric and Nyann's original summaries in the portable HTML."""
+    sections = []
+    for record in records:
+        nyann_benches = [bench for bench in record.get("benchmarks", []) if bench.get("tool") == "nyann"]
+        if not nyann_benches:
+            continue
+        stage_tables = []
+        for bench in nyann_benches:
+            for measurement in bench.get("measurements", []):
+                metrics = measurement.get("metrics", {})
+                if not metrics:
+                    continue
+                title = f'c{measurement["concurrency"]} {measurement["sample"]}'
+                stage_tables.append(f'<details><summary>{html.escape(title)} — all metrics</summary>'
+                                    + AIPERF_REPORT.metrics_table(metrics) + '</details>')
+        folder = campaign_dir / record["name"]
+        source = ""
+        for path in (folder / "nyann-job.log", folder / "nyann-live.log"):
+            if not path.is_file():
+                continue
+            summary = nyann_summary(path.read_text(encoding="utf-8", errors="replace"))
+            if summary is not None:
+                source = ('<details><summary>Original Nyann JSON summary</summary>'
+                          f'<pre>{html.escape(json.dumps(summary, indent=2))}</pre></details>')
+                break
+        if stage_tables or source:
+            sections.append(f'<details><summary>{html.escape(record["name"])} — Nyann results</summary>'
+                            + "".join(stage_tables) + source + '</details>')
+    if not sections:
+        return ""
+    return ('<details class="campaign-detail"><summary>Complete Nyann source results '
+            '(all stage and sweep fields)</summary>' + "".join(sections) + '</details>')
+
+
+def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any]]:
+    summary = nyann_summary(log)
     if summary is None:
         raise RuntimeError("Nyann Job completed without a machine-readable stage summary in its logs")
     stages = summary["stages"]
@@ -860,7 +900,12 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
         duration = stage["duration_seconds"]
         if successes <= 0 or duration <= 0:
             raise RuntimeError(f"Nyann stage {index} has no successful requests or measured duration")
-        metrics = {"request_throughput": {"avg": successes / duration, "unit": "req/s"},
+        metrics = {"concurrency": {"avg": stage["concurrency"], "unit": "requests"},
+                   "stage_duration": {"avg": duration, "unit": "s"},
+                   "total_request_count": {"avg": stage.get("total_requests", successes + errors), "unit": "requests"},
+                   "successful_request_count": {"avg": successes, "unit": "requests"},
+                   "error_request_count": {"avg": errors, "unit": "requests"},
+                   "request_throughput": {"avg": successes / duration, "unit": "req/s"},
                    "output_token_throughput": {"avg": stage["output_tokens_per_second"], "unit": "tokens/s"},
                    "time_to_first_token": latency_stats(stage["ttft_ms"]),
                    "inter_token_latency": latency_stats(stage["itl_ms"]),
@@ -915,6 +960,11 @@ def nyann_live_measurements(log: str, concurrencies: list[int], duration_seconds
             "concurrency": concurrency, "sample": f"stage-{current_stage}",
             "successful_requests": successes, "error_requests": errors,
             "metrics": {
+                "concurrency": {"avg": concurrency, "unit": "requests"},
+                "stage_duration": {"avg": duration_seconds, "unit": "s"},
+                "total_request_count": {"avg": successes + errors, "unit": "requests"},
+                "successful_request_count": {"avg": successes, "unit": "requests"},
+                "error_request_count": {"avg": errors, "unit": "requests"},
                 "request_throughput": {"avg": successes / duration_seconds, "unit": "req/s"},
                 "output_token_throughput": {"avg": throughput, "unit": "tokens/s"},
                 "time_to_first_token": {**dict(zip(("avg", "p10", "p50", "p95", "p99"), ttft)), "unit": "ms"},
@@ -929,9 +979,9 @@ def nyann_live_measurements(log: str, concurrencies: list[int], duration_seconds
     return [stages[index] for index in sorted(stages)]
 
 
-def nyann_distribution(values: list[float]) -> dict[str, Any]:
+def nyann_distribution(values: list[float], unit: str = "ms") -> dict[str, Any]:
     ordered = sorted(values)
-    result = {"avg": sum(ordered) / len(ordered), "min": ordered[0], "max": ordered[-1], "unit": "ms"}
+    result = {"avg": sum(ordered) / len(ordered), "min": ordered[0], "max": ordered[-1], "unit": unit}
     for percentile in (10, 50, 90, 95, 99):
         position = (len(ordered) - 1) * percentile / 100
         lower = math.floor(position)
@@ -948,7 +998,9 @@ def enrich_nyann_request_metrics(measurements: list[dict[str, Any]], log: str,
         return
     windows = nyann_stage_windows(log, concurrencies, measurements, duration_seconds)
     samples = {item["sample"]: item for item in measurements if item["sample"] in windows}
-    values = {sample: {"count": 0, "tpot": [], "e2e": []} for sample in samples}
+    values = {sample: {"count": 0, "tpot": [], "e2e": [], "prompt_tokens": [],
+                       "output_tokens": [], "second_token": [], "conversations": Counter()}
+              for sample in samples}
     for path in request_files:
         with path.open(encoding="utf-8", errors="replace") as source:
             for line in source:
@@ -967,9 +1019,19 @@ def enrich_nyann_request_metrics(measurements: list[dict[str, Any]], log: str,
                         continue
                     bucket = values[sample]
                     bucket["count"] += 1
+                    for key in ("prompt_tokens", "output_tokens"):
+                        if isinstance(row.get(key), int) and row[key] >= 0:
+                            bucket[key].append(row[key])
+                    if isinstance(row.get("conv_id"), str):
+                        bucket["conversations"][row["conv_id"]] += 1
                     latency = row.get("latency_ms")
                     ttft = row.get("ttft_ms")
                     tokens = row.get("output_tokens")
+                    itls = row.get("itls_ms")
+                    if (isinstance(ttft, (int, float)) and math.isfinite(ttft) and
+                            isinstance(itls, list) and itls and
+                            isinstance(itls[0], (int, float)) and math.isfinite(itls[0])):
+                        bucket["second_token"].append(ttft + itls[0])
                     if isinstance(latency, (int, float)) and math.isfinite(latency) and latency >= 0:
                         bucket["e2e"].append(float(latency))
                         if (isinstance(ttft, (int, float)) and math.isfinite(ttft) and
@@ -984,6 +1046,22 @@ def enrich_nyann_request_metrics(measurements: list[dict[str, Any]], log: str,
             item["metrics"]["time_per_output_token"] = nyann_distribution(bucket["tpot"])
         if "request_latency" not in item["metrics"] and bucket["e2e"]:
             item["metrics"]["request_latency"] = nyann_distribution(bucket["e2e"])
+        if bucket["second_token"]:
+            item["metrics"]["time_to_second_token"] = nyann_distribution(bucket["second_token"])
+        for key in ("prompt_tokens", "output_tokens"):
+            if len(bucket[key]) == bucket["count"]:
+                item["metrics"][f"{key}_per_request"] = nyann_distribution(bucket[key], "tokens/request")
+                if key == "prompt_tokens":
+                    item["metrics"]["total_prompt_tokens"] = {"avg": sum(bucket[key]), "unit": "tokens"}
+                    duration = item["metrics"].get("stage_duration", {}).get("avg")
+                    if duration:
+                        item["metrics"]["input_token_throughput"] = {
+                            "avg": sum(bucket[key]) / duration, "unit": "tokens/s"}
+        conversations = bucket["conversations"]
+        if conversations:
+            item["metrics"]["conversation_count"] = {"avg": len(conversations), "unit": "conversations"}
+            item["metrics"]["turns_per_conversation"] = nyann_distribution(
+                list(conversations.values()), "turns/conversation")
 
 
 def nyann_stage_windows(log: str, concurrencies: list[int],
@@ -1390,7 +1468,8 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
     AIPERF_REPORT.write_index_from_runs(destination, runs, model_label=f"Campaign {summary['id']}",
                                         save_monitoring_overlay=False, compact_header=True,
                                         campaign=summary,
-                                        extra_html=AIPERF_REPORT.nyann_setup(campaign_config, destination))
+                                        extra_html=AIPERF_REPORT.nyann_setup(campaign_config, destination)
+                                        + nyann_source_results(destination, summary["overlays"]))
 
 
 def render_overlay(overlay_root: Path, overlay: dict[str, Any]) -> str:
@@ -2403,7 +2482,8 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         started = {(path.parent.name, path.name) for line in directories.splitlines()
                    if (path := Path(line)).parent.name in labels}
         progress = preview_progress(config, campaign_dir, summary, completed, started)
-        notice = progress + AIPERF_REPORT.nyann_setup(config, campaign_dir)
+        notice = (progress + AIPERF_REPORT.nyann_setup(config, campaign_dir)
+                  + nyann_source_results(campaign_dir, summary.get("overlays", [])))
         if missing_nyann_metrics:
             notice += ('<p class="campaign-note">' + html.escape("; ".join(missing_nyann_metrics)) + '</p>')
         if missing_monitoring:

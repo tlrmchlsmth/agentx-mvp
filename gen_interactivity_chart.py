@@ -410,6 +410,15 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
         'output_token_throughput': 'Output token throughput',
         'output_token_throughput_per_user': 'Output token throughput/user',
         'output_tokens_per_request': 'Output tokens per request',
+        'prompt_tokens_per_request': 'Prompt tokens per request',
+        'concurrency': 'Concurrency',
+        'stage_duration': 'Stage duration',
+        'total_request_count': 'Total requests',
+        'successful_request_count': 'Successful requests',
+        'error_request_count': 'Error requests',
+        'conversation_count': 'Conversations',
+        'turns_per_conversation': 'Turns per conversation',
+        'total_prompt_tokens': 'Total prompt tokens',
         'request_count': 'Request count',
         'request_latency': 'End-to-end request latency',
         'request_error_rate': 'Request error rate',
@@ -740,7 +749,6 @@ let gpuCostPerHour = 0;
 function applyNorm(val, norm, meta) {{
   if (val == null) return null;
   if (norm.startsWith('cost') && (val <= 0 || gpuCostPerHour <= 0)) return null;
-  if (val === 0) return null;
   if (norm === 'decode') return val / meta.decodeGPUs;
   if (norm === 'prefill') return val / meta.prefillGPUs;
   if (norm === 'total') return val / (meta.decodeGPUs + meta.prefillGPUs);

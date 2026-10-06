@@ -444,6 +444,8 @@ def nyann_setup(config: dict[str, Any], campaign_dir: Path | None = None) -> str
             f'<table><tbody>{rows}</tbody></table>'
             '<p>TPOT is calculated per completed request from Nyann JSONL as '
             '(end-to-end latency − TTFT) / (output tokens − 1); one-token requests are excluded.</p>'
+            '<p>Prompt-token counts use Nyann response usage. A reported zero can mean the server '
+            'did not supply prompt-token usage; check the configured ISL.</p>'
             f'<p>Configured JSON</p><pre>{exact}</pre>'
             '</details></div>')
     return "".join(sections)

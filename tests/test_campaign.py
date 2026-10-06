@@ -563,6 +563,10 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(measurements[0]["metrics"]["inter_token_latency"]["p10"], 2)
         self.assertEqual(measurements[0]["metrics"]["request_latency"]["p90"], 120)
         self.assertEqual(measurements[0]["metrics"]["output_tokens_per_request"]["avg"], 10)
+        self.assertEqual(measurements[0]["metrics"]["total_request_count"]["avg"], 11)
+        self.assertEqual(measurements[0]["metrics"]["successful_request_count"]["avg"], 10)
+        self.assertEqual(measurements[0]["metrics"]["error_request_count"]["avg"], 1)
+        self.assertEqual(measurements[0]["metrics"]["stage_duration"]["avg"], 5)
         with tempfile.TemporaryDirectory() as directory:
             runner.write_summary(Path(directory), {"id": "example", "status": "completed", "overlays": [
                 {"name": "build-pd", "build": "build", "overlay": "pd", "status": "completed",
@@ -575,9 +579,11 @@ class CampaignTests(unittest.TestCase):
             path = Path(directory) / "requests_0.jsonl"
             rows = [
                 {"status": "ok", "t0": 110, "tend": 120, "ttft_ms": 20,
-                 "latency_ms": 100, "output_tokens": 3},
+                 "latency_ms": 100, "output_tokens": 3, "prompt_tokens": 4,
+                 "conv_id": "conversation-1", "itls_ms": [30, 50]},
                 {"status": "ok", "t0": 130, "tend": 150, "ttft_ms": 40,
-                 "latency_ms": 120, "output_tokens": 5},
+                 "latency_ms": 120, "output_tokens": 5, "prompt_tokens": 6,
+                 "conv_id": "conversation-1", "itls_ms": [20, 20, 20, 20]},
                 {"status": "ok", "t0": 90, "tend": 110, "ttft_ms": 20,
                  "latency_ms": 100, "output_tokens": 3},
                 {"status": "ok", "t0": 190, "tend": 210, "ttft_ms": 20,
@@ -592,10 +598,31 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(measurement["metrics"]["time_per_output_token"]["avg"], 30)
             self.assertEqual(measurement["metrics"]["time_per_output_token"]["p90"], 38)
             self.assertEqual(measurement["metrics"]["request_latency"]["avg"], 110)
+            self.assertEqual(measurement["metrics"]["time_to_second_token"]["avg"], 55)
+            self.assertEqual(measurement["metrics"]["prompt_tokens_per_request"]["p50"], 5)
+            self.assertEqual(measurement["metrics"]["output_tokens_per_request"]["p90"], 4.8)
+            self.assertEqual(measurement["metrics"]["total_prompt_tokens"]["avg"], 10)
+            self.assertEqual(measurement["metrics"]["conversation_count"]["avg"], 1)
+            self.assertEqual(measurement["metrics"]["turns_per_conversation"]["avg"], 2)
             incomplete = {"sample": "stage-1", "concurrency": 1, "successful_requests": 3,
                           "metrics": {}}
             runner.enrich_nyann_request_metrics([incomplete], log, [1], 100, [path])
             self.assertNotIn("time_per_output_token", incomplete["metrics"])
+
+    def test_nyann_source_results_preserve_complete_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "pd"
+            folder.mkdir()
+            source = {"total_requests": 7, "conversations": 5,
+                      "turns_per_conversation": {"mean": 1.4},
+                      "timestamps": {"start_time": 123},
+                      "stages": [{"concurrency": 1, "total_requests": 7}]}
+            (folder / "nyann-job.log").write_text(json.dumps(source, indent=2))
+            page = runner.nyann_source_results(Path(directory), [
+                {"name": "pd", "benchmarks": [{"tool": "nyann"}]}])
+            self.assertIn("Complete Nyann source results", page)
+            self.assertIn('&quot;conversations&quot;: 5', page)
+            self.assertIn('&quot;start_time&quot;: 123', page)
 
     def test_nyann_tpot_is_visible_in_default_chart_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:
