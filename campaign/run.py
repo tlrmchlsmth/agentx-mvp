@@ -1049,10 +1049,6 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
         "".join(build_rows) + "</table>" + \
         "<h2>Run identity</h2><table class='campaign-identity'><tr>" + header(identity_fields) + "</tr>" + identity_body + "</table>" + \
         "<h2>All configurations</h2><div class='campaign-measurements'><table><tr>" + header(display_fields) + "</tr>" + body + "</table></div>"
-    page = "<!doctype html><html><head><meta charset='utf-8'><title>Benchmark campaign</title>" + \
-        "<style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #aaa;padding:.5rem;text-align:left}.campaign-identity td{overflow-wrap:anywhere}</style>" + \
-        "</head><body>" + fragment + "</body></html>"
-    (destination / "index.html").write_text(page)
     return fragment
 
 

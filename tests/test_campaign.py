@@ -102,7 +102,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(summary["status"], "completed")
             self.assertEqual(summary["source_commit"], "a" * 40)
             self.assertEqual(len(summary["overlays"]), 2)
-            self.assertTrue((root / "campaigns/test-campaign/index.html").exists())
+            self.assertFalse((root / "campaigns/test-campaign/index.html").exists())
 
     def test_matrix_prepares_all_builds_before_deploying_every_combination(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -276,11 +276,12 @@ class CampaignTests(unittest.TestCase):
             measurements = runner.aiperf_measurements(root, run_id, [1, 4, 1])
             self.assertEqual(len(measurements), 3)
             self.assertEqual(sum(item["metrics"]["request_throughput"]["avg"] for item in measurements), 12)
-            runner.write_summary(root, {"id": "test", "status": "completed", "overlays": [
+            fragment = runner.write_summary(root, {"id": "test", "status": "completed", "overlays": [
                 {"name": "build-baseline", "build": "build", "overlay": "baseline", "status": "completed",
                  "benchmarks": [{"tool": "aiperf", "status": "completed", "measurements": measurements,
                                  "report": f"/workload/aiperf-agentx/{run_id}/index.html"}]}]})
-            self.assertIn(f"../../aiperf-agentx/{run_id}/index.html", (root / "index.html").read_text())
+            self.assertIn(f"../../aiperf-agentx/{run_id}/index.html", fragment)
+            self.assertFalse((root / "index.html").exists())
             with self.assertRaisesRegex(RuntimeError, "unexpected|expected"):
                 runner.aiperf_measurements(root, run_id, [1, 4, 4])
 
