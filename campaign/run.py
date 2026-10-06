@@ -344,24 +344,40 @@ def build_commit(namespace: str) -> str | None:
     return commit
 
 
+def worker_pods(documents: list[Any]):
+    """Yield the Pod templates before a DisaggregatedSet creates its child LWSs."""
+    for item in documents:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "LeaderWorkerSet":
+            roles = [(item.get("metadata", {}).get("name", ""), item.get("spec", {}))]
+        elif item.get("kind") == "DisaggregatedSet":
+            roles = [(role.get("name", ""), role.get("spec", {})) for role in item.get("spec", {}).get("roles", [])
+                     if isinstance(role, dict)]
+        else:
+            continue
+        for role, spec in roles:
+            pod = spec.get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec")
+            if isinstance(pod, dict):
+                yield role, pod
+
+
 def apply_vllm_image(rendered: str, image: str) -> str:
     """Use the campaign's explicit runtime image in every vLLM worker."""
     documents = list(yaml.safe_load_all(rendered))
     workers = 0
-    for item in documents:
-        if not isinstance(item, dict) or item.get("kind") != "LeaderWorkerSet":
-            continue
-        pod = item.get("spec", {}).get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec", {})
+    for _, pod in worker_pods(documents):
         for container in pod.get("containers", []):
             if container.get("name") == "vllm":
                 container["image"] = image
                 workers += 1
     if not workers:
-        raise ValueError("overlay has no LeaderWorkerSet vllm container for vllm_image")
+        raise ValueError("overlay has no LeaderWorkerSet vllm container or DisaggregatedSet vllm container for vllm_image")
     return yaml.safe_dump_all(documents, sort_keys=False)
 
 
-def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None) -> str:
+def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None,
+                             cache_pvc: str | None = None) -> str:
     """Use the versioned campaign build recipe in both builder and serving Pods."""
     build = build or {"mode": "nightly", "steps": []}
     source_build = bool(build.get("steps"))
@@ -378,7 +394,7 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
                 candidates.append((item, key))
     if not candidates:
         if source_build or deepep_build:
-            raise ValueError("overlay build requires a compatible vLLM wheel build script")
+            return inject_generic_build(documents, build, cache_pvc)
         return rendered
     if len(candidates) != 1:
         raise ValueError("overlay contains multiple vLLM wheel build scripts")
@@ -424,10 +440,7 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
             "DEEPEP_BUILD_REF": deepep["ref"], "DEEPEP_BUILD_COMMIT": deepep["commit"],
         })
     references = 0
-    for item in documents:
-        if not isinstance(item, dict) or item.get("kind") != "LeaderWorkerSet":
-            continue
-        pod = item.get("spec", {}).get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec", {})
+    for _, pod in worker_pods(documents):
         old_volumes = set()
         for volume in pod.get("volumes", []):
             if volume.get("configMap", {}).get("name") == old_name:
@@ -464,13 +477,72 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
                     for key in ("DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT"):
                         env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
     if not references:
-        raise ValueError("vLLM build script is not sourced by a LeaderWorkerSet container")
+        raise ValueError("vLLM build script is not sourced by a serving container")
+    return yaml.safe_dump_all(documents, sort_keys=False)
+
+
+def inject_generic_build(documents: list[Any], build: dict[str, Any], cache_pvc: str | None) -> str:
+    """Add a pinned wheel build to overlays without an embedded build recipe."""
+    if not cache_pvc:
+        raise ValueError("source builds without an overlay build script need results_pvc as a shared cache")
+    if any(isinstance(item, dict) and item.get("kind") == "ConfigMap" and
+           item.get("metadata", {}).get("name") in {"vllm-build", "vllm-build-ref"} for item in documents):
+        raise ValueError("overlay has a conflicting vLLM build ConfigMap")
+    steps = build.get("steps", [])
+    deepep = build.get("deepep")
+    data = {"DEEPEP_BUILD_ENABLED": "1" if deepep else "0"}
+    if steps:
+        data.update({"VLLM_BUILD_REF": steps[0]["ref"], "VLLM_BUILD_COMMIT": steps[0]["commit"],
+                     "VLLM_BUILD_REPO": build["repo"],
+                     "VLLM_BUILD_REFS": " ".join(step["ref"] for step in steps),
+                     "VLLM_BUILD_ACTIONS": " ".join(step["action"] for step in steps),
+                     "VLLM_BUILD_SHAS": " ".join(step["commit"] for step in steps)})
+    if deepep:
+        data.update({"DEEPEP_BUILD_REPO": deepep["repo"], "DEEPEP_BUILD_REF": deepep["ref"],
+                     "DEEPEP_BUILD_COMMIT": deepep["commit"]})
+    documents.extend([
+        {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "vllm-build"}, "data": {
+            "vllm-wheel-build.sh": (ROOT / "campaign" / "vllm-source-build.sh").read_text(),
+            "deepep-wheel-build.sh": (ROOT / "campaign" / "deepep-wheel-build.sh").read_text()}},
+        {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "vllm-build-ref"}, "data": data},
+    ])
+    workers = 0
+    for role, pod in worker_pods(documents):
+        for container in pod.get("containers", []):
+            if container.get("name") != "vllm":
+                continue
+            workers += 1
+            volumes = pod.setdefault("volumes", [])
+            if any(volume.get("name") in {"vllm-build", "build-cache"} for volume in volumes):
+                raise ValueError("overlay has a conflicting vLLM build volume")
+            volumes.extend([{"name": "vllm-build", "configMap": {"name": "vllm-build"}},
+                            {"name": "build-cache", "persistentVolumeClaim": {"claimName": cache_pvc}}])
+            mounts = container.setdefault("volumeMounts", [])
+            if any(mount.get("name") in {"vllm-build", "build-cache"} or
+                   mount.get("mountPath") in {"/opt/build-scripts", "/shared/vllm-build"} for mount in mounts):
+                raise ValueError("overlay has a conflicting vLLM build mount")
+            mounts.extend([{"name": "vllm-build", "mountPath": "/opt/build-scripts", "readOnly": True},
+                           {"name": "build-cache", "mountPath": "/shared/vllm-build"}])
+            if container.get("command", [])[:2] != ["/bin/bash", "-c"] or len(container.get("args", [])) != 1:
+                raise ValueError("generic vLLM build needs a bash -c serving command")
+            container["args"][0] = "source /opt/build-scripts/vllm-wheel-build.sh\n" + container["args"][0]
+            env = container.setdefault("env", [])
+            env.extend([{"name": "VLLM_BUILD_MODE", "value": "source" if steps else "nightly"},
+                        {"name": "VLLM_BUILD_BASE_IMAGE_ID", "value": container["image"]},
+                        {"name": "VLLM_BUILD_ROLE", "value": role or "worker"},
+                        {"name": "DEEPEP_BUILD_ENABLED", "value": "1" if deepep else "0"}])
+            for key in (["VLLM_BUILD_REF", "VLLM_BUILD_COMMIT", "VLLM_BUILD_REPO", "VLLM_BUILD_REFS",
+                         "VLLM_BUILD_ACTIONS", "VLLM_BUILD_SHAS"] if steps else []) + ([
+                         "DEEPEP_BUILD_REPO", "DEEPEP_BUILD_REF", "DEEPEP_BUILD_COMMIT"] if deepep else []):
+                env.append({"name": key, "valueFrom": {"configMapKeyRef": {"name": "vllm-build-ref", "key": key}}})
+    if not workers:
+        raise ValueError("overlay has no vLLM worker for source build")
     return yaml.safe_dump_all(documents, sort_keys=False)
 
 
 def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any], folder: Path,
                   *, preview_only: bool = False) -> str | None:
-    """Build or preview the exact cache-warming Job for a serving LWS."""
+    """Build or preview the exact cache-warming Job for a serving worker."""
     documents = [item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)]
     maps = {item.get("metadata", {}).get("name"): item for item in documents if item.get("kind") == "ConfigMap"}
     script_map = maps.get("vllm-build")
@@ -478,10 +550,7 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
         return None
     ref_map = maps.get("vllm-build-ref")
     candidates = []
-    for item in documents:
-        if item.get("kind") != "LeaderWorkerSet":
-            continue
-        pod = item.get("spec", {}).get("leaderWorkerTemplate", {}).get("workerTemplate", {}).get("spec", {})
+    for _, pod in worker_pods(documents):
         for container in pod.get("containers", []):
             if any("vllm-wheel-build.sh" in part for field in ("command", "args") for part in container.get(field, [])):
                 role = next((env.get("value") for env in container.get("env", []) if env.get("name") == "VLLM_BUILD_ROLE"), "")
@@ -515,7 +584,8 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
     if not required_env.issubset({e["name"] for e in env}):
         raise ValueError("vLLM prefill worker is missing build identity")
     env = [item for item in env if item["name"] not in {"VLLM_BUILD_ROLE", "LWS_WORKER_INDEX"}]
-    env.extend(({"name": "VLLM_BUILD_ROLE", "value": "prefill"}, {"name": "LWS_WORKER_INDEX", "value": "0"}))
+    env.extend(({"name": "VLLM_BUILD_ROLE", "value": "prefill"}, {"name": "LWS_WORKER_INDEX", "value": "0"},
+                {"name": "VLLM_BUILD_PREBUILD", "value": "1"}))
     builder = {"name": "build", "image": serving["image"], "imagePullPolicy": serving.get("imagePullPolicy", "IfNotPresent"),
                "command": ["/bin/bash", "-c"], "args": ["source /opt/build-scripts/vllm-wheel-build.sh"],
                "env": env, "resources": copy.deepcopy(serving.get("resources", {})), "volumeMounts": mounts}
@@ -951,7 +1021,8 @@ def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destinatio
             for overlay in config["overlays"]:
                 overlay_folder = folder / overlay["name"]
                 overlay_folder.mkdir()
-                rendered = inject_vllm_build_script(base_manifests[overlay["name"]], build)
+                rendered = inject_vllm_build_script(base_manifests[overlay["name"]], build,
+                                                    config["results_pvc"])
                 validate_manifest(rendered, config["namespace"])
                 manifest = overlay_folder / "manifest.yaml"
                 manifest.write_text(rendered)
@@ -1102,7 +1173,7 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
                 record["vllm_build_inputs"] = build
                 rendered = render_overlay(overlay_root, overlay)
                 rendered = apply_vllm_image(rendered, config["vllm_image"])
-                rendered = inject_vllm_build_script(rendered, build)
+                rendered = inject_vllm_build_script(rendered, build, config["results_pvc"])
                 validate_manifest(rendered, config["namespace"])
                 (folder / "manifest.yaml").write_text(rendered)
                 record["manifest_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
@@ -1218,7 +1289,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
                 build = resolved_builds[key]
                 record["vllm_build_inputs"] = build
             build = build or {"mode": "nightly", "steps": []}
-            rendered = inject_vllm_build_script(rendered, build)
+            rendered = inject_vllm_build_script(rendered, build, config["results_pvc"])
             validate_manifest(rendered, config["namespace"])
             manifest.write_text(rendered)
             record["manifest_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()

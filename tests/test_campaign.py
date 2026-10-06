@@ -146,7 +146,7 @@ class CampaignTests(unittest.TestCase):
                  patch.object(runner, "render_overlay", return_value=manifest), \
                  patch.object(runner, "apply_vllm_image", side_effect=lambda rendered, image: rendered), \
                  patch.object(runner, "resolve_build", side_effect=fake_resolve), \
-                 patch.object(runner, "inject_vllm_build_script", side_effect=lambda rendered, build: rendered), \
+                 patch.object(runner, "inject_vllm_build_script", side_effect=lambda rendered, build, cache_pvc: rendered), \
                  patch.object(runner, "vllm_prebuild", side_effect=fake_prebuild), \
                  patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner, "snapshot", return_value=[]), \
@@ -655,6 +655,62 @@ class CampaignTests(unittest.TestCase):
             with patch.object(runner, "kube", side_effect=fake_kube):
                 self.assertEqual(runner.vllm_prebuild(nightly_deepep, config, config["overlays"][0], root),
                                  "nightly")
+
+    def test_disaggregatedset_image_and_generic_source_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            roles = []
+            for role in ("prefill", "decode"):
+                roles.append({"name": role, "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": {
+                    "serviceAccountName": "glm", "containers": [
+                        {"name": "vllm", "image": "old:tag", "command": ["/bin/bash", "-c"],
+                         "args": ["exec vllm serve model"], "resources": {"requests": {"nvidia.com/gpu": "8"}}},
+                        {"name": "sidecar", "image": "router:tag"}],
+                }}}}})
+            manifest = yaml.safe_dump({"apiVersion": "disaggregatedset.x-k8s.io/v1",
+                                       "kind": "DisaggregatedSet", "metadata": {"name": "glm", "namespace": "vllm"},
+                                       "spec": {"roles": roles}})
+            selected = runner.apply_vllm_image(manifest, "vllm/nightly:latest")
+            selected_docs = list(yaml.safe_load_all(selected))
+            selected_pods = list(runner.worker_pods(selected_docs))
+            self.assertEqual(len(selected_pods), 2)
+            for _, pod in selected_pods:
+                self.assertEqual(pod["containers"][0]["image"], "vllm/nightly:latest")
+                self.assertEqual(pod["containers"][1]["image"], "router:tag")
+            nightly = runner.inject_vllm_build_script(selected, {"mode": "nightly", "steps": []})
+            self.assertEqual(len(list(yaml.safe_load_all(nightly))), 1)
+
+            build = {"mode": "source", "repo": "https://github.com/vllm-project/vllm.git",
+                     "steps": [{"ref": "main", "action": "checkout", "commit": "a" * 40}]}
+            rendered = runner.inject_vllm_build_script(selected, build, "results")
+            documents = list(yaml.safe_load_all(rendered))
+            runner.validate_manifest(rendered, "vllm")
+            self.assertEqual({item["metadata"]["name"] for item in documents[1:]},
+                             {"vllm-build", "vllm-build-ref"})
+            for role, pod in runner.worker_pods(documents):
+                self.assertIn(role, {"prefill", "decode"})
+                self.assertEqual(next(volume for volume in pod["volumes"] if volume["name"] == "build-cache")
+                                 ["persistentVolumeClaim"]["claimName"], "results")
+                serving = pod["containers"][0]
+                self.assertTrue(serving["args"][0].startswith("source /opt/build-scripts/vllm-wheel-build.sh\n"))
+                self.assertEqual(serving["image"], "vllm/nightly:latest")
+            with patch.object(runner, "kube", side_effect=AssertionError("Kubernetes must not be contacted")):
+                self.assertEqual(runner.vllm_prebuild(rendered, config, config["overlays"][0], root,
+                                                       preview_only=True), "a" * 40)
+            job = yaml.safe_load((root / "prebuild-job.yaml").read_text())
+            self.assertEqual(job["spec"]["template"]["spec"]["containers"][0]["image"], "vllm/nightly:latest")
+            self.assertIn({"name": "VLLM_BUILD_PREBUILD", "value": "1"},
+                          job["spec"]["template"]["spec"]["containers"][0]["env"])
+            deepep_only = {"mode": "nightly", "steps": [],
+                           "deepep": {"repo": "https://github.com/deepseek-ai/DeepEP.git",
+                                      "ref": "main", "commit": "b" * 40}}
+            deepep_rendered = runner.inject_vllm_build_script(selected, deepep_only, "results")
+            self.assertEqual(runner.vllm_prebuild(deepep_rendered, config, config["overlays"][0], root,
+                                                   preview_only=True), "nightly")
+            self.assertEqual(next(item for item in yaml.safe_load_all(deepep_rendered)
+                                  if item["kind"] == "ConfigMap" and item["metadata"]["name"] == "vllm-build-ref")
+                             ["data"]["DEEPEP_BUILD_COMMIT"], "b" * 40)
 
     def test_live_submitters_use_campaign_source_without_build_marker(self):
         with tempfile.TemporaryDirectory() as directory:

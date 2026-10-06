@@ -16,7 +16,8 @@ must never use that queue or it could block its own children.
    to the llm-d fork and branch/tag/commit that contains the overlays. Set
    the required `vllm_image` to the exact image reference to run, such as your
    nightly tag or a digest. The campaign applies it to every `vllm` container
-   in the selected LeaderWorkerSet overlays and uses it for prebuild Jobs.
+   in the selected LeaderWorkerSet or DisaggregatedSet role templates and uses
+   it for prebuild Jobs.
    The overlays' `imagePullPolicy` still controls whether a moving tag is
    refreshed; use `Always` for a nightly tag.
    Set
@@ -35,10 +36,13 @@ must never use that queue or it could block its own children.
    topology, PD size, or other settings in the final report. Each overlay also
    needs its serving Pod selector and expected Pod count. The runner fetches
    llm-d once and resolves every requested vLLM branch once. The configured image
-   must be available to the cluster. A source build needs a compatible vLLM wheel build
-   script, a `vllm-build-ref` ConfigMap, and a LeaderWorkerSet that sources the script. The runner
-   replaces that script in the rendered manifest with
-   [`campaign/vllm-wheel-build.sh`](../campaign/vllm-wheel-build.sh) from this PR.
+   must be available to the cluster. When an overlay contains an existing
+   compatible build recipe, the runner replaces it with
+   [`campaign/vllm-wheel-build.sh`](../campaign/vllm-wheel-build.sh). For an
+   overlay without a build recipe, it injects
+   [`campaign/vllm-source-build.sh`](../campaign/vllm-source-build.sh), a
+   `vllm-build-ref` ConfigMap, and a cache volume backed by `results_pvc` into
+   each vLLM worker template.
    The prebuild Job and serving Pods therefore use the same versioned recipe.
    The runner starts the build Job before the serving deployment. The Job
    uses that worker's image, GPU resources, and shared build-cache PVC. The
@@ -105,6 +109,12 @@ wheel. The saved `serving-pods.json` records the image ID used by each deploymen
 `examples/campaign.kimi-nightly.example.json` shows a concrete Kimi aggregate
 overlay using `vllm/vllm-openai:nightly`; set its llm-d fork/ref and cluster
 PVC and queues before submitting.
+`examples/campaign.glm52-h200-kermit.json` compares nightly with pinned upstream
+vLLM `main` across two GLM 5.2 prefill/decode DisaggregatedSet overlays. Its
+nightly variant only replaces the images. The generic source script uses
+precompiled native libraries from the pinned first source commit; branch sets
+that change native C++/CUDA code need an overlay-specific full build recipe.
+DeepEP stays as shipped in the image unless `deepep` is specified explicitly.
 
 ## Test locally without a cluster
 
