@@ -775,6 +775,7 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
               "ttft_p90", "ttft_unit", "itl_p90", "itl_unit", "report", "artifacts", "error",
               "llm_d_commit", "vllm_commits", "deepep_commit", "vllm_image"]
     rows = []
+    identities = []
     for record in summary["overlays"]:
         build_inputs = record.get("vllm_build_inputs")
         steps = build_inputs.get("steps", []) if build_inputs else []
@@ -783,6 +784,11 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
             if steps else "N/A (using configured image; no source commit)" if build_inputs else
             "unknown (build not resolved)"
         )
+        identities.append({"build": record.get("build", ""), "overlay": record.get("overlay", record["name"]),
+                           "status": record["status"], "llm_d_commit": summary.get("source_commit", ""),
+                           "vllm_commits": vllm_commits,
+                           "deepep_commit": build_inputs.get("deepep", {}).get("commit", "") if build_inputs else "",
+                           "vllm_image": summary.get("vllm_image", "")})
         for bench in record.get("benchmarks") or [{"tool": "", "status": record["status"], "error": record.get("error", "")}]:
             for measurement in bench.get("measurements") or [{}]:
                 metrics = measurement.get("metrics", {})
@@ -803,7 +809,7 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
                        "artifacts": bench.get("artifacts", ""), "error": bench.get("error", ""),
                        "llm_d_commit": summary.get("source_commit", ""),
                        "vllm_commits": vllm_commits,
-                       "deepep_commit": record.get("vllm_build_inputs", {}).get("deepep", {}).get("commit", ""),
+                       "deepep_commit": identities[-1]["deepep_commit"],
                        "vllm_image": summary.get("vllm_image", "")}
                 row.update(record.get("dimensions", {}))
                 rows.append(row)
@@ -819,11 +825,22 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
             inputs += f"; DeepEP {deepep['ref']}@{deepep['commit'][:12]}"
         build_rows.append("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in
                         (build["name"], build["status"], inputs, build.get("error", ""))) + "</tr>")
+    display_fields = ["build", "overlay", *dimensions, "tool", "sample", "concurrency", "status",
+                      "successful_requests", "error_requests", "requests_per_s", "output_tokens_per_s",
+                      "ttft_p90", "itl_p90", "report", "error"]
     headings = {"llm_d_commit": "llm-d commit", "vllm_commits": "vLLM source commits",
-                "deepep_commit": "DeepEP commit", "vllm_image": "vLLM image"}
-    header = "".join(f"<th>{html.escape(headings.get(field, field.replace('_', ' ').title()))}</th>" for field in fields)
+                "deepep_commit": "DeepEP commit", "vllm_image": "vLLM image",
+                "requests_per_s": "Requests/s", "output_tokens_per_s": "Output tokens/s",
+                "ttft_p90": "TTFT p90", "itl_p90": "ITL p90"}
+    def header(names: list[str]) -> str:
+        return "".join(f"<th>{html.escape(headings.get(field, field.replace('_', ' ').title()))}</th>" for field in names)
+
     def html_cell(row: dict[str, Any], field: str) -> str:
         value = str(row.get(field, ""))
+        unit_field = {"requests_per_s": "requests_unit", "output_tokens_per_s": "output_tokens_unit",
+                      "ttft_p90": "ttft_unit", "itl_p90": "itl_unit"}.get(field)
+        if unit_field and value:
+            value += " " + str(row.get(unit_field, ""))
         if field == "report" and value:
             if embedded_reports:
                 return "<td>AIPerf charts below</td>"
@@ -836,15 +853,24 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
                 return f'<td><a href="{html.escape(href, quote=True)}">AIPerf dashboard</a></td>'
         return f"<td>{html.escape(value)}</td>"
 
-    body = "".join("<tr>" + "".join(html_cell(row, field) for field in fields) + "</tr>" for row in rows)
+    body = "".join("<tr>" + "".join(html_cell(row, field) for field in display_fields) + "</tr>" for row in rows)
+    identity_fields = ["build", "overlay", "status", "llm_d_commit", "vllm_commits", "deepep_commit", "vllm_image"]
+    identity_body = "".join("<tr>" + "".join(html_cell(row, field) for field in identity_fields) + "</tr>"
+                            for row in identities)
     mock_notice = ("<p><strong>MOCK DATA:</strong> generated locally to test report rendering; "
                    "no benchmark or Grafana query ran.</p>" if summary.get("mode") == "mock-test" else "")
-    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + mock_notice + \
+    fragment = ("<style>.campaign-identity{width:100%;table-layout:fixed;border-collapse:collapse}"
+                ".campaign-identity th,.campaign-identity td{overflow-wrap:anywhere;vertical-align:top}"
+                ".campaign-measurements{overflow-x:auto}"
+                ".campaign-identity th,.campaign-identity td,.campaign-measurements th,.campaign-measurements td"
+                "{border:1px solid #444;padding:6px;text-align:left}</style>" +
+                f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>") + mock_notice + \
         "<h2>Builds</h2><table><tr><th>Build</th><th>Status</th><th>Resolved inputs</th><th>Error</th></tr>" + \
         "".join(build_rows) + "</table>" + \
-        "<h2>All configurations</h2><table><tr>" + header + "</tr>" + body + "</table>"
+        "<h2>Run identity</h2><table class='campaign-identity'><tr>" + header(identity_fields) + "</tr>" + identity_body + "</table>" + \
+        "<h2>All configurations</h2><div class='campaign-measurements'><table><tr>" + header(display_fields) + "</tr>" + body + "</table></div>"
     page = "<!doctype html><html><head><meta charset='utf-8'><title>Benchmark campaign</title>" + \
-        "<style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #aaa;padding:.5rem;text-align:left}</style>" + \
+        "<style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #aaa;padding:.5rem;text-align:left}.campaign-identity td{overflow-wrap:anywhere}</style>" + \
         "</head><body>" + fragment + "</body></html>"
     (destination / "index.html").write_text(page)
     return fragment

@@ -192,9 +192,11 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
 - `summary.json`: resolved build inputs, every combination, benchmark status,
   artifacts, and per-concurrency AIPerf and nyann measurements.
 - `comparison.csv` and `index.html`: the final HTML is one portable report for
-  every build, overlay, and sweep. Its table includes AIPerf and nyann
-  throughput, latency, dimensions, status, the llm-d commit, and every pinned
-  vLLM build commit for that run. The chart labels identify each variant by
+  every build, overlay, and sweep. A compact run identity table has one row
+  per deployment with its llm-d commit, every pinned vLLM build commit, any
+  DeepEP commit, and the configured image. A separate measurements table shows
+  AIPerf and nyann throughput, latency, dimensions, and status. The CSV keeps
+  every metric and artifact path per sample. The chart labels identify each variant by
   its build commits; the source details below the charts retain full hashes,
   the configured image, and any DeepEP commit. Nightly runs show their image
   because they have no pinned vLLM source commit; the commits cell says this

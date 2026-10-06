@@ -210,6 +210,11 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("MOCK DATA", page)
             self.assertIn("nightly / baseline", page)
             self.assertIn("N/A (using configured image; no source commit)", page)
+            identity_table = page.split("<table class='campaign-identity'>", 1)[1].split("</table>", 1)[0]
+            self.assertEqual(identity_table.count("<tr>"), 3)  # header and one row per overlay
+            measurements_table = page.split("<div class='campaign-measurements'>", 1)[1].split("</table>", 1)[0]
+            self.assertNotIn("<th>Artifacts</th>", measurements_table)
+            self.assertNotIn("<th>vLLM source commits</th>", measurements_table)
             self.assertIn(config["vllm_image"], (output / "nightly-baseline/manifest.yaml").read_text())
             self.assertFalse((output / "nightly-baseline/prebuild-job.yaml").exists())
             with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
