@@ -155,8 +155,17 @@ class CampaignTests(unittest.TestCase):
             path.write_text(json.dumps(config))
             loaded = runner.load_config(path)
             self.assertEqual(loaded["monitoring"], config["monitoring"])
-            with self.assertRaisesRegex(ValueError, "for run-local"):
+            created = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "create":
+                    created.append(json.loads(kwargs["input_text"]))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
                 runner.submit(loaded, "runner:test", "benchmark-campaign")
+            self.assertNotIn("monitoring", json.loads(created[0]["data"]["campaign.json"]))
+            self.assertNotIn("env", created[1]["spec"]["template"]["spec"]["containers"][0])
 
     def test_rejects_namespace_escape_and_existing_resources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -450,6 +459,59 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "below /workload"):
                 runner.download_pvc_artifacts(config, "/workload/../etc", output)
 
+    def test_download_cluster_report_maps_remote_aiperf_inputs_for_existing_renderer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            output = root / "output"
+            remote_artifact = "/workload/aiperf-agentx/test-campaign-baseline-aiperf"
+            summary = {"id": config["id"], "status": "completed", "overlays": [
+                {"name": "baseline", "status": "completed", "benchmarks": [{"tool": "aiperf", "status": "completed",
+                 "artifacts": remote_artifact, "measurements": [{"sample": "c1"}]}]}]}
+            actions = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                actions.append(args[0])
+                stdout = json.dumps(summary) if args[0] == "exec" else ""
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+            def fake_tree(namespace, pod, remote, destination):
+                self.assertEqual(remote, "/workload/campaigns/test-campaign")
+                destination.mkdir(parents=True)
+                (destination / "campaign.json").write_text(json.dumps(config))
+                (destination / "summary.json").write_text(json.dumps(summary))
+
+            def fake_sample(namespace, pod, profile, destination):
+                self.assertEqual(str(profile), remote_artifact + "/c1/profile_export_aiperf.json")
+                (destination / "c1").mkdir(parents=True)
+
+            def fake_report(value, directory):
+                saved = json.loads((directory / "campaigns/test-campaign/summary.json").read_text())
+                self.assertEqual(saved["overlays"][0]["benchmarks"][0]["artifacts"],
+                                 str(output.resolve() / "aiperf-agentx/test-campaign-baseline-aiperf"))
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner.TRANSFER, "download_tree", side_effect=fake_tree), \
+                 patch.object(runner, "copy_aiperf_sample", side_effect=fake_sample), \
+                 patch.object(runner, "report_local", side_effect=fake_report), \
+                 patch.object(runner, "download_latest_local", return_value=root / "latest.html"):
+                self.assertEqual(runner.download_cluster_report(config, output), root / "latest.html")
+            self.assertEqual(actions, ["create", "wait", "exec", "delete"])
+
+    def test_download_cluster_report_waits_for_finished_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+
+            def fake_kube(namespace, *args, **kwargs):
+                stdout = '{"status":"running"}' if args[0] == "exec" else ""
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner.TRANSFER, "download_tree") as tree:
+                with self.assertRaisesRegex(RuntimeError, "still running"):
+                    runner.download_cluster_report(config, Path(directory) / "output")
+                tree.assert_not_called()
+
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -648,7 +710,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_download_latest_selects_live_partial_or_final_report(self):
         for status, expected in (("running", "refreshed preview"),
-                                 ("failed", "partial preview"),
+                                 ("failed", "final report"),
                                  ("completed", "final report")):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -1171,6 +1233,13 @@ class CampaignTests(unittest.TestCase):
             pod = job["spec"]["template"]["spec"]
             self.assertEqual(pod["serviceAccountName"], "benchmark-campaign")
             self.assertEqual(pod["volumes"][1]["persistentVolumeClaim"]["claimName"], "results")
+            self.assertEqual(pod["initContainers"][0]["name"], "unpack-source")
+            archive = base64.b64decode(created[0]["binaryData"]["source.tar.gz"])
+            import io
+            import tarfile
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
+                self.assertIn("campaign/run.py", bundle.getnames())
+                self.assertIn("live-aiperf/report.py", bundle.getnames())
 
             config["monitoring"] = {"grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
                                     "auth_secret": "llmd-grafana", "dashboard_uid": "wideep-overview"}

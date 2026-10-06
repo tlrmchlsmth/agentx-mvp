@@ -37,7 +37,7 @@ orchestrator_image := env_var_or_default('ORCHESTRATOR_IMAGE', 'quay.io/tms/benc
 agentx_service_image := env_var_or_default('AGENTX_SERVICE_IMAGE', 'quay.io/tms/agentx-service:0.1.0')
 orchestrator_manifesto_repo := env_var_or_default('ORCHESTRATOR_MANIFESTO_REPO', 'https://github.com/tlrmchlsmth/llm-manifesto.git')
 orchestrator_manifesto_ref := env_var_or_default('ORCHESTRATOR_MANIFESTO_REF', 'main')
-campaign_image := env_var_or_default('CAMPAIGN_IMAGE', 'quay.io/tms/benchmark-campaign:amd64')
+campaign_image := env_var_or_default('CAMPAIGN_IMAGE', 'quay.io/tms/benchmark-orchestrator:amd64')
 orchestrator_deploy := "benchmark-orchestrator"
 orchestrator_spec_configmap := "benchmark-orchestrator-spec"
 model     := env_var_or_default('MODEL', 'deepseek-ai/DeepSeek-V4-Pro')
@@ -97,6 +97,10 @@ campaign-stop-local config output:
 # Refresh a running campaign or copy its last report to Downloads as one HTML file.
 campaign-download-latest config output:
     python3 "{{repo_root}}/campaign/run.py" download-latest "{{config}}" --output "{{output}}"
+
+# Fetch a finished cluster campaign from the PVC and save its standalone HTML to Downloads.
+campaign-download-cluster config output:
+    python3 "{{repo_root}}/campaign/run.py" download-cluster "{{config}}" --output "{{output}}"
 
 # Download all existing artifact directories for this campaign.
 campaign-download-artifacts config output:

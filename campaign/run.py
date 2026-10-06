@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 from collections import Counter
 from contextlib import contextmanager
 import copy
@@ -22,6 +23,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import tempfile
 import urllib.error
@@ -48,6 +50,14 @@ DIMENSION_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 JOB_LINE = re.compile(r"^Job queued: ([a-z0-9-]+) ", re.MULTILINE)
 GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 BUILD_ACTION = re.compile(r"^(?:checkout|merge|cherry-pick|cherry-pick-parent1|cherry-pick-m[1-9][0-9]*)$")
+CAMPAIGN_SOURCE_FILES = (
+    "campaign/run.py", "campaign/transfer.py", "campaign/vllm-wheel-build.sh",
+    "campaign/vllm-source-build.sh", "campaign/deepep-wheel-build.sh",
+    "live-aiperf/submit.sh", "live-aiperf/report.py",
+    "live-aiperf/plotly-basic-2.35.2.min.js.gz", "live-aiperf/reset-prefix-caches.py",
+    "live-aiperf/capture-llmd-resources.sh", "live-nyann/submit.sh",
+    "export_dashboard.py", "gen_interactivity_chart.py", "overlay_dashboards.py",
+)
 
 
 class CleanupError(RuntimeError):
@@ -1821,6 +1831,59 @@ def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: P
     return output.resolve()
 
 
+def download_cluster_report(config: dict[str, Any], output: Path,
+                            destination: Path | None = None) -> Path:
+    """Fetch a finished cluster Job's report inputs and render one local HTML file."""
+    namespace = config["namespace"]
+    remote_campaign = Path("/workload/campaigns") / config["id"]
+    campaign_dir = output.resolve() / "campaigns" / config["id"]
+    pod_name = "campaign-download-" + secrets.token_hex(8)
+    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": pod_name, "namespace": namespace},
+           "spec": {"restartPolicy": "Never", "containers": [{"name": "artifacts",
+           "image": "docker.io/library/alpine:3.20", "command": ["sleep", "86400"],
+           "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                         "limits": {"cpu": "500m", "memory": "256Mi"}},
+           "volumeMounts": [{"name": "results", "mountPath": "/workload"}]}],
+           "volumes": [{"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}
+    kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
+    try:
+        kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
+        # Read the status before downloading a tree whose files may still be changing.
+        remote_summary = json.loads(kube(namespace, "exec", pod_name, "--", "cat",
+                                         str(remote_campaign / "summary.json")).stdout)
+        if remote_summary["status"] == "running":
+            raise RuntimeError(f"Campaign {config['id']} is still running; check job/campaign-{config['id']} "
+                               "and retry after it finishes")
+        TRANSFER.download_tree(namespace, pod_name, str(remote_campaign), campaign_dir)
+        summary = json.loads((campaign_dir / "summary.json").read_text())
+        if summary["status"] == "running":
+            raise RuntimeError(f"Campaign {config['id']} changed during download; retry after it finishes")
+        for record in summary.get("overlays", []):
+            for bench in record.get("benchmarks", []):
+                if bench.get("tool") != "aiperf" or not bench.get("measurements"):
+                    continue
+                remote_artifact = Path(bench["artifacts"])
+                if remote_artifact.parent != Path("/workload/aiperf-agentx") or not remote_artifact.name.startswith(config["id"] + "-"):
+                    raise RuntimeError(f"Unexpected AIPerf artifact path: {remote_artifact}")
+                local_artifact = output.resolve() / remote_artifact.relative_to("/workload")
+                for measurement in bench["measurements"]:
+                    sample = measurement["sample"]
+                    if not re.fullmatch(r"c[1-9][0-9]*(?:-r[1-9][0-9]*)?", sample):
+                        raise RuntimeError(f"Unexpected AIPerf sample: {sample}")
+                    profile = remote_artifact / sample / "profile_export_aiperf.json"
+                    copy_aiperf_sample(namespace, pod_name, profile, local_artifact)
+                bench["artifacts"] = str(local_artifact)
+                bench["report"] = str(local_artifact / "index.html")
+        write_summary(campaign_dir, summary)
+    finally:
+        deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
+                       f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
+        if deleted.returncode:
+            raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
+    report_local(config, output)
+    return download_latest_local(config, output, destination)
+
+
 def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[str, Any],
                      completed: set[tuple[str, str]], started: set[tuple[str, str]]) -> str:
     """Show every planned benchmark in the same HTML as completed results."""
@@ -2056,7 +2119,7 @@ def download_latest_local(config: dict[str, Any], output: Path, destination: Pat
         preview_local(config, output)
     preview = campaign_dir / "preview" / "index.html"
     final = campaign_dir / "index.html"
-    source = final if status == "completed" and final.is_file() else preview
+    source = final if status != "running" and final.is_file() else preview
     if not source.is_file():
         raise RuntimeError(f"No report is available for campaign {config['id']} ({status})")
     destination = (destination or Path.home() / "Downloads" / f"{config['id']}-latest.html").expanduser()
@@ -2102,10 +2165,20 @@ def report_local(config: dict[str, Any], output: Path) -> int:
     return 0
 
 
+def campaign_source_bundle() -> bytes:
+    """Bundle the checked-out campaign implementation for an in-cluster Job."""
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        for name in CAMPAIGN_SOURCE_FILES:
+            source = ROOT / name
+            if not source.is_file():
+                raise RuntimeError(f"Campaign source file is missing: {source}")
+            bundle.add(source, arcname=name)
+    return archive.getvalue()
+
+
 def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     namespace, campaign_id = config["namespace"], config["id"]
-    if "monitoring" in config and "grafana_service" in config["monitoring"]:
-        raise ValueError("monitoring.grafana_service is for run-local; use grafana_url and a namespace-local Secret for submit")
     required_name(service_account, "service_account")
     if not image or any(char.isspace() for char in image):
         raise ValueError("image must be a container image reference")
@@ -2115,8 +2188,17 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     configmap_name = f"campaign-{campaign_id}"
     if len(configmap_name) > 63:
         raise ValueError("campaign ID is too long for Kubernetes resource names")
+    bundle = campaign_source_bundle()
+    job_config = copy.deepcopy(config)
+    local_monitoring = "monitoring" in config and "grafana_service" in config["monitoring"]
+    if local_monitoring:
+        job_config.pop("monitoring")  # Backfill through the existing local exporter after download.
     configmap = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": configmap_name, "namespace": namespace},
-                 "data": {"campaign.json": json.dumps(config)}}
+                 "data": {"campaign.json": json.dumps(job_config)},
+                 "binaryData": {"source.tar.gz": base64.b64encode(bundle).decode()}}
+    configmap["metadata"]["annotations"] = {"benchmark.llm-d.ai/source-sha256": hashlib.sha256(bundle).hexdigest()}
+    if len(json.dumps(configmap).encode()) >= 900_000:
+        raise ValueError("Campaign source bundle exceeds the safe ConfigMap size")
     kube(namespace, "create", "-f", "-", input_text=json.dumps(configmap))
     job = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": configmap_name, "namespace": namespace,
            "labels": {"kueue.x-k8s.io/queue-name": config["campaign_queue"], "app.kubernetes.io/name": "benchmark-campaign"}},
@@ -2126,10 +2208,16 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
            "resources": {"requests": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "1Gi"},
                          "limits": {"cpu": "2", "memory": "2Gi", "ephemeral-storage": "4Gi"}},
            "volumeMounts": [{"name": "config", "mountPath": "/campaign", "readOnly": True},
-                            {"name": "results", "mountPath": "/workload"}]}],
+                            {"name": "results", "mountPath": "/workload"},
+                            {"name": "source", "mountPath": "/workspace/agentx-mvp"}]}],
+           "initContainers": [{"name": "unpack-source", "image": image,
+                               "command": ["sh", "-c", "tar -xzf /campaign/source.tar.gz -C /workspace/agentx-mvp"],
+                               "volumeMounts": [{"name": "config", "mountPath": "/campaign", "readOnly": True},
+                                                {"name": "source", "mountPath": "/workspace/agentx-mvp"}]}],
            "volumes": [{"name": "config", "configMap": {"name": configmap_name}},
-                       {"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}}}
-    if "monitoring" in config:
+                       {"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}},
+                       {"name": "source", "emptyDir": {}}]}}}}
+    if "monitoring" in job_config:
         secret = config["monitoring"]["auth_secret"]
         job["spec"]["template"]["spec"]["containers"][0]["env"] = [
             {"name": "CAMPAIGN_GRAFANA_USER", "valueFrom": {"secretKeyRef": {"name": secret, "key": "admin-user"}}},
@@ -2141,6 +2229,8 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
         kube(namespace, "delete", "configmap", configmap_name, "--ignore-not-found", check=False)
         raise
     print(f"Campaign queued: {namespace}/{configmap_name}")
+    if local_monitoring:
+        print("Grafana dashboards will be backfilled after downloading the PVC report")
     print(f"Status: kubectl -n {namespace} get job {configmap_name}")
     print(f"Logs: kubectl -n {namespace} logs -f job/{configmap_name}")
     print(f"Results: {config['results_pvc']}:/workload/campaigns/{campaign_id}")
@@ -2149,14 +2239,14 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "start-local", "test-local",
-                                           "preview-local", "download-latest", "download-artifacts", "stop-local", "report-local"])
+                                           "preview-local", "download-latest", "download-cluster", "download-artifacts", "stop-local", "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
     parser.add_argument("--source-dir", type=Path, help="local llm-d checkout for test-local; otherwise fetch source.repo/ref")
     parser.add_argument("--output", type=Path, help="new artifact directory for test-local")
     parser.add_argument("--watch", action="store_true", help="refresh preview-local until the campaign finishes")
-    parser.add_argument("--dest", type=Path, help="HTML destination for download-latest (default: Downloads/<campaign-id>-latest.html)")
+    parser.add_argument("--dest", type=Path, help="HTML destination for download-latest/download-cluster")
     parser.add_argument("--remote", help="PVC artifact directory below /workload for download-artifacts")
     args = parser.parse_args()
     try:
@@ -2197,6 +2287,11 @@ def main() -> int:
             if args.watch:
                 raise ValueError("--watch is only supported with preview-local")
             download_latest_local(config, args.output, args.dest)
+            return 0
+        if args.action == "download-cluster":
+            if args.output is None:
+                raise ValueError("--output is required for download-cluster")
+            download_cluster_report(config, args.output, args.dest)
             return 0
         if args.action == "download-artifacts":
             if args.output is None:

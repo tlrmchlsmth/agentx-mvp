@@ -87,7 +87,9 @@ must never use that queue or it could block its own children.
    `grafana_namespace`, `grafana_service`, `auth_secret`, and `dashboard_uid`
    instead of `grafana_url`. The runner reads the named Secret, opens a temporary
    service port-forward during export, and closes it afterward. The GLM 5.2
-   example uses this form. Apply its PodMonitor before the benchmark so
+   example uses this form. An in-cluster submission using this form records
+   benchmark results without Grafana credentials; `campaign-download-cluster`
+   backfills dashboards after reconnecting. Apply its PodMonitor before the benchmark so
    Prometheus collects both prefill and decode metrics:
 
    ```bash
@@ -96,14 +98,35 @@ must never use that queue or it could block its own children.
 
 ```bash
 export NAMESPACE=vllm
-export CAMPAIGN_IMAGE=quay.io/your-org/benchmark-orchestrator:<immutable-tag>
-just campaign-build
-just campaign-push
 just live-benchmark-kueue-setup "$NAMESPACE"
 just campaign-setup "$NAMESPACE"
 just campaign-validate examples/campaign.example.json
 just campaign-submit examples/campaign.example.json
 ```
+
+`campaign-submit` creates a Kueue-managed Job that keeps running after the
+launching laptop disconnects. It reuses the published
+`quay.io/tms/benchmark-orchestrator:amd64` runtime and mounts a compressed
+snapshot of the checked-out campaign code through a ConfigMap. No image build
+or push is needed. Set `CAMPAIGN_IMAGE` only to use another existing runtime.
+
+After submitting, the terminal can close and the laptop can sleep. Check the
+cluster Job with `kubectl -n "$NAMESPACE" get job campaign-<id>` or read its
+logs with `kubectl -n "$NAMESPACE" logs job/campaign-<id>`. Once it finishes,
+download the PVC results and rebuild the standalone HTML with:
+
+```bash
+export KUBECONFIG=~/.kube/config.kermit
+just campaign-download-cluster examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-results
+```
+
+The command prints and saves `~/Downloads/<id>-latest.html`. It downloads the
+campaign state and only the AIPerf inputs needed by the existing report
+generator, using resumable checked chunks. If the JSON uses a Grafana service
+in another namespace, it backfills its dashboards from the laptop during this
+download. The download command reports when the cluster Job is still running;
+rerun it after completion. The benchmark and overlay work continues in the
+cluster independently of the laptop.
 
 The example fork URL, branch, overlay paths, and model label are placeholders;
 edit them for the actual deployment before submitting. `campaign-validate`
