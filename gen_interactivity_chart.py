@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 GPUS_PER_NODE = 8
-STAT_KEYS = ['avg', 'min', 'p50', 'p90', 'p95', 'p99', 'max']
+STAT_KEYS = ['avg', 'min', 'p10', 'p50', 'p90', 'p95', 'p99', 'max']
 
 COLORS = [
     '#f97316', '#22d3ee', '#a78bfa', '#34d399', '#f472b6',
@@ -338,8 +338,12 @@ def highlight_yaml(text):
     return '\n'.join(out)
 
 
-def generate_html(configs, output_path, results_dir, metric_units):
-    model_label = read_model_label(results_dir)
+def generate_html(configs, output_path, results_dir, metric_units, model_label=None, chart_defaults=None):
+    model_label = model_label or read_model_label(results_dir)
+    chart_defaults = chart_defaults or {
+        'throughput': {'xMetric': 'output_token_throughput_per_user', 'yMetric': 'output_token_throughput', 'yNorm': 'decode'},
+        'latency': {'xMetric': 'inter_token_latency', 'xStat': 'p99', 'yMetric': 'output_token_throughput', 'yNorm': 'decode'},
+    }
     color_map = {}
     for i, cfg in enumerate(sorted(configs.keys())):
         color_map[cfg] = COLORS[i % len(COLORS)]
@@ -352,6 +356,7 @@ def generate_html(configs, output_path, results_dir, metric_units):
             'label': meta['label'],
             'decodeGPUs': meta['decode_gpus'],
             'prefillGPUs': meta['prefill_gpus'],
+            'totalGPUs': meta.get('total_gpus', meta['decode_gpus'] + meta['prefill_gpus']),
             'pods': meta['pods'],
         }
         data_js[cfg] = {}
@@ -365,44 +370,10 @@ def generate_html(configs, output_path, results_dir, metric_units):
     c_labels_js = {f'c{c}': c for c in sorted_conc}
 
     metrics_js = {k: {'unit': v} for k, v in sorted(metric_units.items())}
-    x_axis_metrics = [
-        'output_token_throughput_per_user',
-        'inter_token_latency',
-        'time_to_first_token',
-        'time_to_second_token',
-        'request_latency',
-        'effective_latency',
-        'credit_to_start_latency',
-        'input_sequence_length',
-        'output_sequence_length',
-        'tokens_in_flight',
-        'effective_concurrency',
-        'effective_decode_concurrency',
-        'effective_prefill_concurrency',
-        'request_throughput',
-        'theoretical_prefix_cache_hit',
-    ]
-    y_axis_metrics = [
-        'output_token_throughput',
-        'output_token_throughput_per_user',
-        'e2e_output_token_throughput',
-        'input_token_throughput',
-        'total_token_throughput',
-        'effective_decode_throughput',
-        'effective_prefill_throughput',
-        'effective_total_throughput',
-        'active_decode_throughput',
-        'active_prefill_throughput',
-        'active_total_throughput',
-        'request_throughput',
-        'request_count',
-        'total_output_tokens',
-        'total_usage_prompt_tokens',
-        'total_usage_completion_tokens',
-        'total_usage_total_tokens',
-    ]
+    axis_metrics = sorted(metric_units)
     decode_normalized_metrics = [
         'output_token_throughput',
+        'output_token_throughput_per_user',
         'e2e_output_token_throughput',
         'effective_decode_throughput',
         'active_decode_throughput',
@@ -440,11 +411,23 @@ def generate_html(configs, output_path, results_dir, metric_units):
         'output_sequence_length': 'Output sequence length',
         'output_token_throughput': 'Output token throughput',
         'output_token_throughput_per_user': 'Output token throughput/user',
+        'output_tokens_per_request': 'Output tokens per request',
+        'prompt_tokens_per_request': 'Prompt tokens per request',
+        'concurrency': 'Concurrency',
+        'stage_duration': 'Stage duration',
+        'total_request_count': 'Total requests',
+        'successful_request_count': 'Successful requests',
+        'error_request_count': 'Error requests',
+        'conversation_count': 'Conversations',
+        'turns_per_conversation': 'Turns per conversation',
+        'total_prompt_tokens': 'Total prompt tokens',
         'request_count': 'Request count',
-        'request_latency': 'Request latency',
+        'request_latency': 'End-to-end request latency',
+        'request_error_rate': 'Request error rate',
         'request_throughput': 'Request throughput',
         'theoretical_prefix_cache_hit': 'Theoretical prefix cache hit',
         'time_to_first_token': 'Time to first token',
+        'time_per_output_token': 'Time per output token (TPOT)',
         'time_to_second_token': 'Time to second token',
         'tokens_in_flight': 'Tokens in flight',
         'total_output_tokens': 'Total output tokens',
@@ -462,6 +445,10 @@ def generate_html(configs, output_path, results_dir, metric_units):
     for cfg in configs:
         for c_val in configs[cfg]['runs']:
             key = f'c{c_val}'
+            saved_dashboard = configs[cfg].get('dashboards', {}).get(key)
+            if saved_dashboard:
+                embedded_dashboards[f'{cfg}_{key}'] = saved_dashboard
+                continue
             dash_path = os.path.join(results_dir, f'results_{cfg}', f'results_{cfg}_{key}', 'dashboard.html')
             if os.path.isfile(dash_path):
                 with open(dash_path, 'rb') as df:
@@ -507,22 +494,39 @@ def generate_html(configs, output_path, results_dir, metric_units):
   .row-header:hover {{ color: #fff; }}
   .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
   .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 8px; }}
-  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 0;
-             overflow: hidden; resize: both; min-width: 400px; min-height: 300px; }}
+  .grid {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
+  .panel {{ position: relative; isolation: isolate; z-index: 0; flex: 0 0 auto; width: calc(50% - 4px); max-width: 100%;
+             min-width: min(420px, 100%); background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px;
+             padding: 0; overflow: hidden; resize: both; min-height: 300px; }}
+  .panel.wide {{ width: 100% !important; }}
+  @media (max-width: 1000px) {{ .grid .panel {{ width: 100%; }} }}
   .panel::-webkit-resizable {{ background: transparent; }}
-  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; }}
-  .panel .plot {{ width: 100%; height: calc(100% - 36px); min-height: 250px; }}
+  .panel-title {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 36px; font-size: 13px; font-weight: 500; padding: 5px 8px 5px 12px; color: #d8d9da; }}
+  .panel-actions {{ display: flex; gap: 4px; flex: 0 0 auto; }}
+  .panel-actions button,.conc-filter {{ border: 1px solid #3a3a3e; border-radius: 4px; background: #1e2127; color: #aaa; padding: 3px 8px; cursor: pointer; font-size: 11px; }}
+  .panel-actions button:hover,.conc-filter:hover {{ color: #fff; border-color: #666; }}
+  .conc-filter.active {{ color: #fff; border-color: #58a6ff; box-shadow: inset 0 0 0 1px #58a6ff; }}
+  .panel .plot {{ position: relative; z-index: 0; width: 100%; min-width: 0; height: calc(100% - 36px); min-height: 250px; }}
   .panel .plot .nsewdrag {{ cursor: pointer !important; }}
   .summary {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 16px; margin-bottom: 16px; overflow-x: auto; }}
   .summary table {{ width: 100%; border-collapse: collapse; font-size: 12px; min-width: 900px; }}
   .summary th {{ text-align: left; padding: 6px 8px; color: #8e8e8e; border-bottom: 1px solid #2a2a2e; font-weight: 500;
                  cursor: pointer; user-select: none; white-space: nowrap; }}
   .summary th:hover {{ color: #d8d9da; }}
-  .chart-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }}
-  @media (max-width: 1200px) {{ .chart-row {{ grid-template-columns: 1fr; }} }}
-  .chart-col {{ display: flex; flex-direction: column; gap: 4px; }}
-  .chart-col .panel {{ min-width: 0; }}
+  .chart-row {{ display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px;
+                overflow-x: auto; padding-bottom: 12px; margin-bottom: 8px; }}
+  .chart-col {{ position: relative; flex: 0 0 auto; display: flex; flex-direction: column;
+                gap: 4px; width: calc(50% - 6px); min-width: 360px; padding-right: 10px; }}
+  @media (max-width: 1200px) {{ .chart-col {{ width: 100%; }} }}
+  .chart-col .panel {{ width: 100%; max-width: none; min-width: 0; resize: vertical; }}
+  .chart-width-handle {{ position: absolute; top: 0; right: 0; bottom: 0; width: 10px;
+                         cursor: col-resize; border-right: 2px solid #3a3a3e; touch-action: none; }}
+  .chart-width-handle:hover,.chart-width-handle.dragging {{ border-right-color: #58a6ff; }}
+  .panel-actions input[data-action="width"] {{ width: 78px; background: #111217; color: #d8d9da;
+                                               border: 1px solid #3a3a3e; border-radius: 4px;
+                                               padding: 3px 5px; font: inherit; }}
+  .chart-move-handle {{ color: #8e8e8e; cursor: grab; font-size: 11px; padding: 3px 4px; user-select: none; }}
+  .chart-col.dragging {{ opacity: .45; }}
   .axis-controls {{ display: flex; gap: 10px; align-items: center; padding: 6px 4px; flex-wrap: wrap; }}
   .axis-controls label {{ color: #8e8e8e; font-size: 12px; display: flex; align-items: center; gap: 4px; }}
   .axis-controls select {{ background: #181b1f; color: #d8d9da; border: 1px solid #2a2a2e; border-radius: 4px;
@@ -594,18 +598,25 @@ const LAYOUT_DEFAULTS = {{
 const COLORS = {json.dumps(color_map)};
 const CONFIGS = {json.dumps(configs_js)};
 const CONCURRENCIES = {json.dumps(conc_list_js)};
+const ACTIVE_CONCURRENCIES = new Set(CONCURRENCIES);
 const C_LABELS = {json.dumps(c_labels_js)};
 const DATA = {json.dumps(data_js)};
 const DASHBOARDS = {json.dumps(embedded_dashboards)};
 const METRICS = {json.dumps(metrics_js)};
-const X_AXIS_METRICS = {json.dumps(x_axis_metrics)};
-const Y_AXIS_METRICS = {json.dumps(y_axis_metrics)};
+const AXIS_METRICS = {json.dumps(axis_metrics)};
 const DECODE_NORMALIZED_METRICS = new Set({json.dumps(decode_normalized_metrics)});
 const PREFILL_NORMALIZED_METRICS = new Set({json.dumps(prefill_normalized_metrics)});
 const TOTAL_NORMALIZED_METRICS = new Set({json.dumps(total_normalized_metrics)});
 const METRIC_LABELS = {json.dumps(metric_labels)};
 const STAT_KEYS = {json.dumps(STAT_KEYS)};
 const CONFIG_KEYS = Object.keys(CONFIGS);
+const ACTIVE_CONFIGS = new Set(CONFIG_KEYS);
+
+function refreshSummaryVisibility() {{
+  document.querySelectorAll('tr[data-cfg][data-conc]').forEach(row => {{
+    row.style.display = ACTIVE_CONFIGS.has(row.dataset.cfg) && ACTIVE_CONCURRENCIES.has(row.dataset.conc) ? '' : 'none';
+  }});
+}}
 
 const root = document.getElementById('root');
 const sidePanel = document.getElementById('sidePanel');
@@ -709,14 +720,55 @@ function makePanel(parent, title, cls) {{
   panel.style.height = '500px';
   const t = document.createElement('div');
   t.className = 'panel-title';
-  t.textContent = title;
+  t.innerHTML = `<span>${{title}}</span><span class="panel-actions"><button data-action="shorter">−</button><button data-action="taller">+</button><button data-action="wide">↔</button></span>`;
   const plot = document.createElement('div');
   plot.className = 'plot';
   panel.appendChild(t);
   panel.appendChild(plot);
   parent.appendChild(panel);
-  new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
+  makePanelResizable(panel, plot);
   return plot;
+}}
+
+function makePanelResizable(panel, plot) {{
+  const chartColumn = panel.closest('.chart-col');
+  const widthInput = panel.querySelector('[data-action="width"]');
+  if (chartColumn && widthInput) {{
+    const setWidth = value => {{
+      if (Number.isFinite(value)) chartColumn.style.width = Math.max(360, value) + 'px';
+    }};
+    widthInput.value = Math.round(chartColumn.getBoundingClientRect().width);
+    widthInput.addEventListener('change', () => setWidth(Number(widthInput.value)));
+    new ResizeObserver(() => {{
+      if (document.activeElement !== widthInput) widthInput.value = Math.round(chartColumn.getBoundingClientRect().width);
+    }}).observe(chartColumn);
+  }}
+  panel.querySelector('[data-action="shorter"]')?.addEventListener('click', () => {{ panel.style.height = Math.max(300, panel.offsetHeight - 120) + 'px'; }});
+  panel.querySelector('[data-action="taller"]')?.addEventListener('click', () => {{ panel.style.height = Math.min(1200, panel.offsetHeight + 160) + 'px'; }});
+  panel.querySelector('[data-action="wide"]')?.addEventListener('click', () => {{
+    if (!chartColumn) {{ panel.classList.toggle('wide'); return; }}
+    const previous = chartColumn.dataset.previousWidth;
+    if (previous) {{
+      chartColumn.style.width = previous;
+      delete chartColumn.dataset.previousWidth;
+    }} else {{
+      chartColumn.dataset.previousWidth = chartColumn.style.width || Math.round(chartColumn.getBoundingClientRect().width) + 'px';
+      chartColumn.style.width = Math.max(360, window.innerWidth - 32) + 'px';
+    }}
+  }});
+  new ResizeObserver(() => {{ if (plot.data) Plotly.Plots.resize(plot); }}).observe(panel);
+}}
+
+function fixedAxis(values) {{
+  const finite = values.filter(Number.isFinite);
+  if (!finite.length) return {{ tickformat: ',.2f', exponentformat: 'none', showexponent: 'none', automargin: true }};
+  const low = finite.reduce((value, item) => Math.min(value, item), Infinity);
+  const high = finite.reduce((value, item) => Math.max(value, item), -Infinity);
+  const span = high - low;
+  const magnitude = Math.max(Math.abs(low), Math.abs(high));
+  const base = magnitude >= 100 ? 0 : magnitude >= 1 ? 2 : magnitude >= .01 ? 4 : 6;
+  const ranged = span > 0 ? Math.max(0, Math.ceil(-Math.log10(span / 6)) + 1) : base;
+  return {{ tickformat: `,.${{Math.min(8, Math.max(base, ranged))}}f`, exponentformat: 'none', showexponent: 'none', separatethousands: true, automargin: true }};
 }}
 
 // ── Chart factory ──
@@ -729,13 +781,12 @@ let gpuCostPerHour = 0;
 function applyNorm(val, norm, meta) {{
   if (val == null) return null;
   if (norm.startsWith('cost') && (val <= 0 || gpuCostPerHour <= 0)) return null;
-  if (val === 0) return null;
-  if (norm === 'decode') return val / meta.decodeGPUs;
-  if (norm === 'prefill') return val / meta.prefillGPUs;
-  if (norm === 'total') return val / (meta.decodeGPUs + meta.prefillGPUs);
-  if (norm === 'cost_decode') return (meta.decodeGPUs * gpuCostPerHour * 1e6) / (val * 3600);
-  if (norm === 'cost_prefill') return (meta.prefillGPUs * gpuCostPerHour * 1e6) / (val * 3600);
-  if (norm === 'cost_total') return ((meta.decodeGPUs + meta.prefillGPUs) * gpuCostPerHour * 1e6) / (val * 3600);
+  if (norm === 'decode') return meta.decodeGPUs > 0 ? val / meta.decodeGPUs : null;
+  if (norm === 'prefill') return meta.prefillGPUs > 0 ? val / meta.prefillGPUs : null;
+  if (norm === 'total') return meta.totalGPUs > 0 ? val / meta.totalGPUs : null;
+  if (norm === 'cost_decode') return meta.decodeGPUs > 0 ? (meta.decodeGPUs * gpuCostPerHour * 1e6) / (val * 3600) : null;
+  if (norm === 'cost_prefill') return meta.prefillGPUs > 0 ? (meta.prefillGPUs * gpuCostPerHour * 1e6) / (val * 3600) : null;
+  if (norm === 'cost_total') return meta.totalGPUs > 0 ? (meta.totalGPUs * gpuCostPerHour * 1e6) / (val * 3600) : null;
   return val;
 }}
 
@@ -755,19 +806,20 @@ function metricOptions(keys) {{
   }}));
 }}
 
-function metricSample(metric) {{
+function metricStats(metric) {{
+  const available = new Set();
   for (const cfg of CONFIG_KEYS) {{
     for (const c of CONCURRENCIES) {{
       const sample = DATA[cfg]?.[c]?.[metric];
-      if (sample) return sample;
+      if (sample) Object.keys(sample).forEach(key => available.add(key));
     }}
   }}
-  return null;
+  return available;
 }}
 
 function statOptionsForMetric(metric) {{
-  const sample = metricSample(metric);
-  const keys = sample ? STAT_KEYS.filter(s => Object.prototype.hasOwnProperty.call(sample, s)) : ['avg'];
+  const available = metricStats(metric);
+  const keys = STAT_KEYS.filter(s => available.has(s));
   return (keys.length ? keys : ['avg']).map(s => ({{ value: s, text: s }}));
 }}
 
@@ -809,17 +861,67 @@ function hoverText(cfg, c, d) {{
   const itl = d.inter_token_latency;
   const otpu = d.output_token_throughput_per_user;
   const ttft = d.time_to_first_token;
-  const norm = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '?';
+  const tpot = d.time_per_output_token;
+  const e2e = d.request_latency;
+  const norm = out && meta.decodeGPUs > 0 ? (out.avg / meta.decodeGPUs).toFixed(1) : '?';
   return `<b>${{meta.label}} @ c${{C_LABELS[c]}}</b><br>` +
     `Output: ${{out?.avg?.toFixed(1) ?? '?'}} tok/s (${{norm}} tok/s/decode GPU)<br>` +
     `ITL p50: ${{itl?.p50?.toFixed(1) ?? '?'}} ms · p99: ${{itl?.p99?.toFixed(1) ?? '?'}} ms<br>` +
     `Per-user: ${{otpu?.avg?.toFixed(1) ?? '?'}} tok/s/user<br>` +
-    `TTFT p50: ${{ttft ? (ttft.p50/1000).toFixed(1) : '?'}}s · p99: ${{ttft ? (ttft.p99/1000).toFixed(1) : '?'}}s`;
+    `TTFT p50: ${{ttft ? (ttft.p50/1000).toFixed(1) : '?'}}s · p99: ${{ttft ? (ttft.p99/1000).toFixed(1) : '?'}}s<br>` +
+    `TPOT p90: ${{tpot?.p90?.toFixed(1) ?? '?'}} ms · E2E p90: ${{e2e?.p90?.toFixed(1) ?? '?'}} ms`;
 }}
 
 const allCharts = [];
 
+let draggedChartColumn = null;
+function makeChartColumnMovable(container) {{
+  const handle = document.createElement('div');
+  handle.className = 'chart-move-handle';
+  handle.textContent = 'Drag chart to rearrange';
+  handle.draggable = true;
+  handle.addEventListener('dragstart', () => {{ draggedChartColumn = container; container.classList.add('dragging'); }});
+  handle.addEventListener('dragend', () => {{ draggedChartColumn = null; container.classList.remove('dragging'); }});
+  container.addEventListener('dragover', event => {{
+    event.preventDefault();
+    if (!draggedChartColumn || draggedChartColumn === container) return;
+    container.parentElement.insertBefore(draggedChartColumn, event.clientX < container.getBoundingClientRect().left + container.offsetWidth / 2 ? container : container.nextSibling);
+  }});
+  container.appendChild(handle);
+  const widthHandle = document.createElement('div');
+  widthHandle.className = 'chart-width-handle';
+  widthHandle.title = 'Drag to resize chart width';
+  widthHandle.setAttribute('role', 'separator');
+  widthHandle.setAttribute('aria-label', 'Resize chart width');
+  widthHandle.setAttribute('aria-orientation', 'vertical');
+  widthHandle.tabIndex = 0;
+  let startX = 0;
+  let startWidth = 0;
+  widthHandle.addEventListener('pointerdown', event => {{
+    event.preventDefault();
+    startX = event.clientX;
+    startWidth = container.getBoundingClientRect().width;
+    widthHandle.setPointerCapture(event.pointerId);
+    widthHandle.classList.add('dragging');
+  }});
+  widthHandle.addEventListener('pointermove', event => {{
+    if (!widthHandle.hasPointerCapture(event.pointerId)) return;
+    container.style.width = Math.max(360, startWidth + event.clientX - startX) + 'px';
+  }});
+  for (const name of ['pointerup', 'pointercancel']) {{
+    widthHandle.addEventListener(name, () => widthHandle.classList.remove('dragging'));
+  }}
+  widthHandle.addEventListener('keydown', event => {{
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowRight' ? 100 : -100;
+    container.style.width = Math.max(360, container.getBoundingClientRect().width + delta) + 'px';
+  }});
+  container.appendChild(widthHandle);
+}}
+
 function createChart(container, defaults) {{
+  makeChartColumnMovable(container);
   const state = {{
     xMetric: defaults.xMetric || 'output_token_throughput_per_user',
     xStat: defaults.xStat || 'avg',
@@ -851,8 +953,7 @@ function createChart(container, defaults) {{
     return sel;
   }}
 
-  const xMetricOpts = metricOptions(X_AXIS_METRICS);
-  const yMetricOpts = metricOptions(Y_AXIS_METRICS);
+  const axisMetricOpts = metricOptions(AXIS_METRICS);
 
   // X row
   const xDiv = document.createElement('div');
@@ -875,7 +976,7 @@ function createChart(container, defaults) {{
     return sel;
   }}
 
-  const xMetricSel = mkSelIn(xDiv, 'X:', xMetricOpts, state.xMetric, v => {{
+  const xMetricSel = mkSelIn(xDiv, 'X:', axisMetricOpts, state.xMetric, v => {{
     state.xMetric = v;
     state.xStat = setSelectOptions(xStatSel, statOptionsForMetric(v), state.xStat);
     state.xNorm = setSelectOptions(xNormSel, normOptionsForMetric(v, 'x'), state.xNorm);
@@ -891,7 +992,7 @@ function createChart(container, defaults) {{
   // Y row
   const yDiv = document.createElement('div');
   yDiv.className = 'axis-controls';
-  const yMetricSel = mkSelIn(yDiv, 'Y:', yMetricOpts, state.yMetric, v => {{
+  const yMetricSel = mkSelIn(yDiv, 'Y:', axisMetricOpts, state.yMetric, v => {{
     state.yMetric = v;
     state.yStat = setSelectOptions(yStatSel, statOptionsForMetric(v), state.yStat);
     state.yNorm = setSelectOptions(yNormSel, normOptionsForMetric(v, 'y'), state.yNorm);
@@ -912,7 +1013,11 @@ function createChart(container, defaults) {{
   plot.className = 'plot';
   panel.appendChild(plot);
   container.appendChild(panel);
-  new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
+  const panelHeader = document.createElement('div');
+  panelHeader.className = 'panel-title';
+  panelHeader.innerHTML = '<span>Chart size</span><span class="panel-actions"><label>Width <input data-action="width" type="number" min="360" step="100" aria-label="Chart width in pixels"></label><button data-action="shorter">−</button><button data-action="taller">+</button><button data-action="wide" title="Toggle viewport width">↔</button></span>';
+  panel.insertBefore(panelHeader, plot);
+  makePanelResizable(panel, plot);
   state.el = plot;
 
   function axisTitle(metric, stat, norm) {{
@@ -927,7 +1032,7 @@ function createChart(container, defaults) {{
   function buildTraces() {{
     return CONFIG_KEYS.map(cfg => {{
       const meta = CONFIGS[cfg];
-      const validConcs = CONCURRENCIES.filter(c => DATA[cfg] && DATA[cfg][c]);
+      const validConcs = CONCURRENCIES.filter(c => ACTIVE_CONCURRENCIES.has(c) && DATA[cfg] && DATA[cfg][c]);
       return {{
         x: validConcs.map(c => {{
           const m = DATA[cfg][c][state.xMetric];
@@ -950,13 +1055,15 @@ function createChart(container, defaults) {{
     }});
   }}
 
-  function getLayout() {{
-    const yAxis = {{ ...LAYOUT_DEFAULTS.yaxis, title: {{ text: axisTitle(state.yMetric, state.yStat, state.yNorm), font: {{ size: 11 }} }} }};
+  function getLayout(traces) {{
+    const xValues = traces.flatMap(trace => trace.x).filter(value => value != null);
+    const yValues = traces.flatMap(trace => trace.y).filter(value => value != null);
+    const yAxis = {{ ...LAYOUT_DEFAULTS.yaxis, ...fixedAxis(yValues), title: {{ text: axisTitle(state.yMetric, state.yStat, state.yNorm), font: {{ size: 11 }} }} }};
     if (!state.yNorm.startsWith('cost')) yAxis.rangemode = 'tozero';
     return {{
       ...LAYOUT_DEFAULTS,
       title: {{ text: `${{metricLabel(state.yMetric)}} vs ${{metricLabel(state.xMetric)}}`, font: {{ size: 13, color: '#d8d9da' }} }},
-      xaxis: {{ ...LAYOUT_DEFAULTS.xaxis, title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 11 }} }} }},
+      xaxis: {{ ...LAYOUT_DEFAULTS.xaxis, ...fixedAxis(xValues), title: {{ text: axisTitle(state.xMetric, state.xStat, state.xNorm), font: {{ size: 11 }} }} }},
       yaxis: yAxis,
       legend: {{ ...LAYOUT_DEFAULTS.legend, x: 0.99, y: 0.99, xanchor: 'right', yanchor: 'top' }},
     }};
@@ -969,10 +1076,11 @@ function createChart(container, defaults) {{
         if (traces[i] && old.visible === 'legendonly') traces[i].visible = 'legendonly';
       }});
     }}
-    Plotly.react(state.el, traces, getLayout(), {{ responsive: true, edits: {{ legendPosition: true }} }});
+    Plotly.react(state.el, traces, getLayout(traces), {{ responsive: true, edits: {{ legendPosition: true }}, displaylogo: false }});
   }}
 
-  Plotly.newPlot(state.el, buildTraces(), getLayout(), {{ responsive: true, edits: {{ legendPosition: true }} }});
+  const initialTraces = buildTraces();
+  Plotly.newPlot(state.el, initialTraces, getLayout(initialTraces), {{ responsive: true, edits: {{ legendPosition: true }}, displaylogo: false }});
   attachClickHandler(state.el);
 
   // Legend sync → table
@@ -980,11 +1088,10 @@ function createChart(container, defaults) {{
     CONFIG_KEYS.forEach((cfg, i) => {{
       if (!state.el.data[i]) return;
       const vis = state.el.data[i].visible;
-      const show = vis !== 'legendonly' && vis !== false;
-      document.querySelectorAll(`tr[data-cfg="${{cfg}}"]`).forEach(r => {{
-        r.style.display = show ? '' : 'none';
-      }});
+      if (vis === 'legendonly' || vis === false) ACTIVE_CONFIGS.delete(cfg);
+      else ACTIVE_CONFIGS.add(cfg);
     }});
+    refreshSummaryVisibility();
   }});
 
   const chart = {{ state, update }};
@@ -999,10 +1106,29 @@ const hint = document.createElement('span');
 hint.style.cssText = 'color:#ffffff; font-size:15px;';
 hint.textContent = 'Click any data point to open its Prometheus dashboard.';
 topBar.appendChild(hint);
+const concurrencyFilters = document.createElement('div');
+concurrencyFilters.style.cssText = 'display:flex;align-items:center;gap:5px;flex-wrap:wrap;';
+const filterLabel = document.createElement('span');
+filterLabel.textContent = 'Concurrency:';
+filterLabel.style.cssText = 'color:#8e8e8e;font-size:12px;';
+concurrencyFilters.appendChild(filterLabel);
+CONCURRENCIES.forEach(concurrency => {{
+  const button = document.createElement('button');
+  button.className = 'conc-filter active';
+  button.textContent = `c${{C_LABELS[concurrency]}}`;
+  button.addEventListener('click', () => {{
+    ACTIVE_CONCURRENCIES.has(concurrency) ? ACTIVE_CONCURRENCIES.delete(concurrency) : ACTIVE_CONCURRENCIES.add(concurrency);
+    button.classList.toggle('active', ACTIVE_CONCURRENCIES.has(concurrency));
+    allCharts.forEach(chart => chart.update());
+    refreshSummaryVisibility();
+  }});
+  concurrencyFilters.appendChild(button);
+}});
+topBar.appendChild(concurrencyFilters);
 
 root.appendChild(topBar);
 
-// ── Charts: two side by side ──
+// ── Charts: independently sized columns ──
 const chartRow = document.createElement('div');
 chartRow.className = 'chart-row';
 root.appendChild(chartRow);
@@ -1014,8 +1140,8 @@ chartCol2.className = 'chart-col';
 chartRow.appendChild(chartCol1);
 chartRow.appendChild(chartCol2);
 
-createChart(chartCol1, {{ xMetric: 'output_token_throughput_per_user', yMetric: 'output_token_throughput', yNorm: 'decode' }});
-createChart(chartCol2, {{ xMetric: 'inter_token_latency', xStat: 'p99', yMetric: 'output_token_throughput', yNorm: 'decode' }});
+createChart(chartCol1, {json.dumps(chart_defaults['throughput'])});
+createChart(chartCol2, {json.dumps(chart_defaults['latency'])});
 
 // ── Cost input ──
 const costWrap = document.createElement('label');
@@ -1064,6 +1190,7 @@ root.appendChild(sec2Wrap);
     'Output tok/s/GPU', 'Input tok/s/GPU', 'Total tok/s/GPU',
     'ITL p50 (ms)', 'ITL p99 (ms)', 'Per-user tok/s',
     'TTFT p50 (s)', 'TTFT p99 (s)',
+    'TPOT p50 (ms)', 'TPOT p90 (ms)', 'E2E p90 (ms)',
     '$/M input', '$/M output',
   ];
   const headerRow = document.createElement('tr');
@@ -1081,7 +1208,7 @@ root.appendChild(sec2Wrap);
 
   for (const cfg of CONFIG_KEYS) {{
     const meta = CONFIGS[cfg];
-    const totalGPUs = meta.decodeGPUs + meta.prefillGPUs;
+    const totalGPUs = meta.totalGPUs;
     for (const c of CONCURRENCIES) {{
       if (!DATA[cfg] || !DATA[cfg][c]) continue;
       const d = DATA[cfg][c];
@@ -1091,10 +1218,12 @@ root.appendChild(sec2Wrap);
       const itl = d.inter_token_latency;
       const otpu = d.output_token_throughput_per_user;
       const ttft = d.time_to_first_token;
-      const outPerGpu = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '-';
-      const inpPerGpu = inp ? (inp.avg / meta.prefillGPUs).toFixed(1) : '-';
+      const tpot = d.time_per_output_token;
+      const e2e = d.request_latency;
+      const outPerGpu = out && meta.decodeGPUs > 0 ? (out.avg / meta.decodeGPUs).toFixed(1) : '-';
+      const inpPerGpu = inp && meta.prefillGPUs > 0 ? (inp.avg / meta.prefillGPUs).toFixed(1) : '-';
       const totalTps = total?.avg ?? ((out?.avg ?? 0) + (inp?.avg ?? 0));
-      const totalPerGpu = totalTps > 0 ? (totalTps / totalGPUs).toFixed(1) : '-';
+      const totalPerGpu = totalTps > 0 && totalGPUs > 0 ? (totalTps / totalGPUs).toFixed(1) : '-';
 
       const tr = document.createElement('tr');
       tr.dataset.cfg = cfg;
@@ -1113,6 +1242,8 @@ root.appendChild(sec2Wrap);
         otpu?.avg?.toFixed(1) ?? '-',
         ttft ? (ttft.p50/1000).toFixed(1) : '-',
         ttft ? (ttft.p99/1000).toFixed(1) : '-',
+        tpot?.p50?.toFixed(1) ?? '-', tpot?.p90?.toFixed(1) ?? '-',
+        e2e?.p90?.toFixed(1) ?? '-',
         '-', '-',
       ];
       vals.forEach((v, i) => {{

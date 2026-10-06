@@ -1,0 +1,38 @@
+{
+  "id": "kimi-k3-nightly-agg-001",
+  "namespace": "vllm",
+  "source": {
+    "repo": "https://github.com/your-org/llm-d.git",
+    "ref": "your-kimi-overlay-branch"
+  },
+  "vllm_image": "vllm/vllm-openai:nightly",
+  "builds": [
+    {"name": "nightly", "steps": []}
+  ],
+  "results_pvc": "agentx-results",
+  "benchmark_queue": "live-benchmark-client",
+  "campaign_queue": "benchmark-campaign",
+  "monitoring": {
+    "grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
+    "auth_secret": "llmd-grafana",
+    "dashboard_uid": "wideep-overview"
+  },
+  "rollout_timeout_seconds": 3600,
+  "admission_timeout_seconds": 3600,
+  "cleanup_timeout_seconds": 600,
+  "continue_on_failure": false,
+  "overlays": [
+    {
+      "name": "aggregate-tp8-ep4",
+      "path": "guides/wide-ep-lws/modelserver/gpu/vllm-kimi-k3/deployments/agg-tp8-ep4",
+      "model_label": "Kimi-K3",
+      "pod_selector": "llm-d.ai/model=Kimi-K3,llm-d.ai/inference-serving=true",
+      "expected_pods": 4,
+      "dimensions": {"topology": "aggregate"}
+    }
+  ],
+  "benchmarks": [
+    {"tool": "aiperf", "concurrencies": [1, 4, 8, 16], "duration_seconds": 900, "max_context_length": 131072},
+    {"tool": "nyann", "concurrencies": [1, 4, 8], "duration_seconds": 900, "isl": 1024, "osl": 512, "warmup_seconds": 60}
+  ]
+}

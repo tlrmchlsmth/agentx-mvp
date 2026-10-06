@@ -2,6 +2,7 @@ FROM alpine:3.20
 
 ARG MANIFESTO_REPO=https://github.com/tlrmchlsmth/llm-manifesto.git
 ARG MANIFESTO_REF=main
+ARG CAMPAIGN_ONLY=false
 
 RUN apk add --no-cache \
     bash coreutils findutils grep tar curl git \
@@ -33,9 +34,11 @@ WORKDIR /workspace
 
 COPY . /workspace/agentx-mvp
 
-RUN git clone --depth 1 "${MANIFESTO_REPO}" /workspace/llm-manifesto \
-    && git -C /workspace/llm-manifesto fetch --depth 1 origin "${MANIFESTO_REF}" \
-    && git -C /workspace/llm-manifesto checkout FETCH_HEAD \
+RUN if [ "${CAMPAIGN_ONLY}" != "true" ]; then \
+      git clone --depth 1 "${MANIFESTO_REPO}" /workspace/llm-manifesto && \
+      git -C /workspace/llm-manifesto fetch --depth 1 origin "${MANIFESTO_REF}" && \
+      git -C /workspace/llm-manifesto checkout FETCH_HEAD; \
+    fi \
     && rm -rf \
       /workspace/agentx-mvp/.git \
       /workspace/agentx-mvp/.venv \
