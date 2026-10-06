@@ -1448,6 +1448,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
         if variant:
             record["build"] = variant["name"]
         summary["overlays"].append(record)
+        write_summary(destination, summary)
         folder = destination / name
         folder.mkdir()
         manifest = folder / "manifest.yaml"
@@ -1597,6 +1598,35 @@ def run_local(config: dict[str, Any], output: Path) -> int:
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
         if deleted.returncode:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
+
+
+def start_local(config_path: Path, output: Path, campaign_id: str) -> Path:
+    """Detach local orchestration while its workloads run in Kubernetes."""
+    output = output.resolve()
+    if output.exists():
+        raise ValueError(f"Output directory already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    log_path = output.with_name(output.name + ".log")
+    command = [sys.executable, str(Path(__file__).resolve()), "run-local",
+               str(config_path.resolve()), "--output", str(output)]
+    with log_path.open("x") as log:
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+        except Exception:
+            log_path.unlink(missing_ok=True)
+            raise
+    summary_path = output / "campaigns" / campaign_id / "summary.json"
+    for _ in range(30):
+        returncode = process.poll()
+        if returncode is not None:
+            raise RuntimeError(f"Campaign runner exited ({returncode}); see {log_path}")
+        if summary_path.is_file():
+            break
+        time.sleep(0.1)
+    print(f"Campaign runner started: PID {process.pid}; log: {log_path}", flush=True)
+    print(f"Campaign status: {summary_path}", flush=True)
+    return log_path
 
 
 def campaign_run_ids(config: dict[str, Any]) -> set[str]:
@@ -2118,7 +2148,7 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local",
+    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "start-local", "test-local",
                                            "preview-local", "download-latest", "download-artifacts", "stop-local", "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
@@ -2147,6 +2177,11 @@ def main() -> int:
             if args.output is None:
                 raise ValueError("--output is required for run-local")
             return run_local(config, args.output)
+        if args.action == "start-local":
+            if args.output is None:
+                raise ValueError("--output is required for start-local")
+            start_local(args.config, args.output, config["id"])
+            return 0
         if args.action == "stop-local":
             if args.output is None:
                 raise ValueError("--output is required for stop-local")

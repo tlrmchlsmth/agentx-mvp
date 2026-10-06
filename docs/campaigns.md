@@ -176,6 +176,22 @@ export KUBECONFIG=~/.kube/config.kermit
 just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
 ```
 
+`campaign-run-local` keeps the orchestration process in the foreground while
+serving Pods and benchmark Jobs run on the cluster. To return to your shell
+immediately without publishing a runner image, use `campaign-start-local` with
+a fresh campaign ID and output directory:
+
+```bash
+jq '.id = "glm52-h200-pd-nightly-012"' \
+  examples/campaign.glm52-h200-kermit.json > /tmp/campaign.glm52-h200-kermit-012.json
+just campaign-start-local /tmp/campaign.glm52-h200-kermit-012.json \
+  /tmp/agentx-glm52-nightly-live-20261006-012
+```
+
+The detached runner inherits `KUBECONFIG`, writes progress to
+`<output-directory>.log`, and writes campaign state under the output directory.
+Use `campaign-stop-local` with the same config and output path to stop it.
+
 To terminate that run from another terminal, pass the same configuration and
 output directory to `campaign-stop-local`:
 

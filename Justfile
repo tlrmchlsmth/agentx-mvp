@@ -86,6 +86,10 @@ campaign-test-local config source_dir output:
 campaign-run-local config output:
     python3 "{{repo_root}}/campaign/run.py" run-local "{{config}}" --output "{{output}}"
 
+# Start the same local orchestrator in the background and return immediately.
+campaign-start-local config output:
+    python3 "{{repo_root}}/campaign/run.py" start-local "{{config}}" --output "{{output}}"
+
 # Stop one running local campaign and retain its completed artifacts.
 campaign-stop-local config output:
     python3 "{{repo_root}}/campaign/run.py" stop-local "{{config}}" --output "{{output}}"

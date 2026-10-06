@@ -22,6 +22,24 @@ spec.loader.exec_module(runner)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_start_local_detaches_runner_and_keeps_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text("{}")
+            output = root / "results"
+            process = SimpleNamespace(pid=321, poll=lambda: None)
+            with patch.object(runner.subprocess, "Popen", return_value=process) as spawn, \
+                 patch.object(runner.time, "sleep"):
+                log = runner.start_local(config_path, output, "test-campaign")
+            self.assertEqual(log, root.resolve() / "results.log")
+            self.assertTrue(log.is_file())
+            self.assertFalse(output.exists())  # The mocked child has not started yet.
+            args = spawn.call_args.args[0]
+            self.assertEqual(args[2:4], ["run-local", str(config_path.resolve())])
+            self.assertEqual(args[-2:], ["--output", str(output.resolve())])
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+
     def test_stop_local_targets_exact_runner_and_marks_cancelled(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
