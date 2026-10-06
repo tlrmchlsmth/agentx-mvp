@@ -176,6 +176,21 @@ export KUBECONFIG=~/.kube/config.kermit
 just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
 ```
 
+To terminate that run from another terminal, pass the same configuration and
+output directory to `campaign-stop-local`:
+
+```bash
+just campaign-stop-local /tmp/campaign.glm52-h200-kermit-010.json \
+  /tmp/agentx-glm52-nightly-live-20261006-010
+```
+
+This signals only the matching local runner, removes benchmark Jobs whose
+annotated run IDs belong to the campaign, waits for the runner's overlay
+cleanup, and records `cancelled` in `summary.json`. It keeps downloaded
+artifacts and reports. If the runner already exited but left `running` in the
+summary, the same command reconciles that stale status. If serving Pods remain,
+it reports a cleanup error without deleting resources from another run.
+
 While the sweep runs, use the single preview HTML to see planned, running,
 and completed samples. The final `index.html` is generated when the run finishes.
 

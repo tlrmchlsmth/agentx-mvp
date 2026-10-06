@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 import tempfile
@@ -21,6 +22,86 @@ spec.loader.exec_module(runner)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_stop_local_targets_exact_runner_and_marks_cancelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config))
+            output = root / "output"
+            campaign = output / "campaigns" / config["id"]
+            campaign.mkdir(parents=True)
+            (campaign / "campaign.json").write_text(json.dumps(config))
+            runner.write_summary(campaign, {"id": config["id"], "status": "running",
+                                            "overlays": [{"name": "baseline", "status": "running",
+                                                          "benchmarks": []}]})
+            process = (f"1234 python3 {MODULE_PATH} run-local {config_path} --output {output}\n"
+                       f"5678 python3 {MODULE_PATH} run-local {config_path} --output /tmp/other\n")
+            with patch.object(runner, "call", return_value=SimpleNamespace(stdout=process)):
+                self.assertEqual(runner.local_runner_pids(output, config_path), [1234])
+            actions = []
+            with patch.object(runner, "local_runner_pids", side_effect=[[1234], [], []]), \
+                 patch.object(runner.os, "kill", side_effect=lambda pid, sig: actions.append((pid, sig))), \
+                 patch.object(runner, "delete_campaign_benchmark_jobs", side_effect=lambda value: actions.append("jobs")), \
+                 patch.object(runner, "kube", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(runner, "snapshot", return_value=[]):
+                runner.stop_local(config, output, config_path)
+            self.assertEqual(actions, [(1234, signal.SIGINT), "jobs"])
+            self.assertEqual(json.loads((campaign / "summary.json").read_text())["status"], "cancelled")
+
+    def test_stop_local_reconciles_orphaned_running_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config))
+            campaign = root / "output/campaigns" / config["id"]
+            campaign.mkdir(parents=True)
+            (campaign / "campaign.json").write_text(json.dumps(config))
+            runner.write_summary(campaign, {"id": config["id"], "status": "running", "overlays": []})
+            actions = []
+            with patch.object(runner, "local_runner_pids", return_value=[]), \
+                 patch.object(runner.os, "kill", side_effect=AssertionError("must not signal another process")), \
+                 patch.object(runner, "delete_campaign_benchmark_jobs", side_effect=lambda value: actions.append("jobs")), \
+                 patch.object(runner, "kube", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(runner, "snapshot", return_value=[]):
+                runner.stop_local(config, root / "output", config_path)
+            self.assertEqual(actions, ["jobs"])
+            self.assertEqual(json.loads((campaign / "summary.json").read_text())["status"], "cancelled")
+
+    def test_stop_deletes_only_jobs_with_exact_campaign_run_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            wanted = f"{config['id']}-baseline-aiperf"
+            jobs = {"items": [
+                {"metadata": {"name": "campaign-job", "annotations": {"benchmark.llm-d.ai/run-id": wanted}}},
+                {"metadata": {"name": "completed-campaign-job", "annotations": {"benchmark.llm-d.ai/run-id": wanted}},
+                 "status": {"conditions": [{"type": "Complete", "status": "True"}]}},
+                {"metadata": {"name": "other-job", "annotations": {"benchmark.llm-d.ai/run-id": wanted + "-other"}}},
+                {"metadata": {"name": "unannotated-job"}},
+            ]}
+            deletions = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "get":
+                    return SimpleNamespace(stdout=json.dumps(jobs))
+                deletions.append(args)
+                return SimpleNamespace(returncode=0)
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                runner.delete_campaign_benchmark_jobs(config)
+            self.assertEqual(len(deletions), 1)
+            self.assertEqual(deletions[0][:3], ("delete", "job", "campaign-job"))
+
+    def test_preview_watch_exits_when_campaign_is_cancelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            campaign = root / "campaigns" / config["id"]
+            campaign.mkdir(parents=True)
+            (campaign / "summary.json").write_text(json.dumps({"status": "cancelled"}))
+            self.assertEqual(runner.watch_preview_local(config, root), 1)
+
     def test_kubectl_logs_replace_invalid_utf8(self):
         with patch.object(runner, "call", return_value=SimpleNamespace(stdout="")) as command:
             runner.kube("vllm", "logs", "job/example")
@@ -290,6 +371,32 @@ class CampaignTests(unittest.TestCase):
                  patch.object(runner, "run", side_effect=fake_run):
                 self.assertEqual(runner.run_local(config, output), 0)
             self.assertEqual(actions, ["get", "get", "create", "wait", "exec", *(["download"] * 6), "delete"])
+
+    def test_local_interrupt_marks_campaign_cancelled_and_removes_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            output = root / "output"
+            actions = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                actions.append(args[0])
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            def fake_run(value, results_root, artifact_fetcher=None):
+                campaign = results_root / "campaigns" / config["id"]
+                campaign.mkdir(parents=True)
+                runner.write_summary(campaign, {"id": config["id"], "status": "running",
+                                                "overlays": []})
+                raise KeyboardInterrupt
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "run", side_effect=fake_run), \
+                 patch.object(runner, "delete_campaign_benchmark_jobs", side_effect=lambda value: actions.append("jobs")):
+                self.assertEqual(runner.run_local(config, output), 130)
+            self.assertEqual(actions, ["get", "get", "create", "wait", "jobs", "delete"])
+            summary = json.loads((output / "campaigns" / config["id"] / "summary.json").read_text())
+            self.assertEqual(summary["status"], "cancelled")
 
     def test_download_artifacts_uses_temporary_pvc_pod_and_existing_output(self):
         with tempfile.TemporaryDirectory() as directory:

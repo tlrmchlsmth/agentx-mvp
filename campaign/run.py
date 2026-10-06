@@ -16,7 +16,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1580,11 +1582,146 @@ def run_local(config: dict[str, Any], output: Path) -> int:
             return destination
 
         return run(config, output, artifact_fetcher=fetch)
+    except KeyboardInterrupt:
+        campaign_dir = output / "campaigns" / config["id"]
+        cleanup_error = None
+        try:
+            delete_campaign_benchmark_jobs(config)
+        except Exception as exc:
+            cleanup_error = str(exc)
+        mark_campaign_cancelled(campaign_dir, cleanup_error)
+        print(f"Campaign {config['id']} cancelled", flush=True)
+        return 130
     finally:
         deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
         if deleted.returncode:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
+
+
+def campaign_run_ids(config: dict[str, Any]) -> set[str]:
+    ids = set()
+    for variant in config.get("builds", [None]):
+        for overlay in config["overlays"]:
+            name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
+            ids.update(f"{config['id']}-{name}-{bench['tool']}" for bench in config["benchmarks"])
+    return ids
+
+
+def delete_campaign_benchmark_jobs(config: dict[str, Any]) -> None:
+    """Delete only benchmark Jobs carrying an exact run ID in this campaign."""
+    namespace = config["namespace"]
+    jobs = json.loads(kube(namespace, "get", "jobs", "-o", "json").stdout)["items"]
+    run_ids = campaign_run_ids(config)
+    for job in jobs:
+        if job["metadata"].get("annotations", {}).get("benchmark.llm-d.ai/run-id") in run_ids:
+            conditions = {item.get("type"): item.get("status") for item in job.get("status", {}).get("conditions", [])}
+            if conditions.get("Complete") == "True" or conditions.get("Failed") == "True":
+                continue
+            name = job["metadata"]["name"]
+            kube(namespace, "delete", "job", name, "--ignore-not-found", "--cascade=foreground",
+                 "--wait=true", f"--timeout={config['cleanup_timeout_seconds']}s")
+
+
+def mark_campaign_cancelled(campaign_dir: Path, cleanup_error: str | None = None) -> None:
+    summary_path = campaign_dir / "summary.json"
+    if not summary_path.is_file():
+        return
+    summary = json.loads(summary_path.read_text())
+    if summary.get("status") != "running":
+        return
+    for record in summary.get("overlays", []):
+        if record.get("status") == "running":
+            record["status"] = "cancelled"
+        for bench in record.get("benchmarks", []):
+            if bench.get("status") == "running":
+                bench["status"] = "cancelled"
+    summary["status"] = "cancelled"
+    summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+    if cleanup_error:
+        summary["cleanup_error"] = cleanup_error
+    write_summary(campaign_dir, summary)
+
+
+def local_runner_pids(output: Path, config_path: Path | None = None) -> list[int]:
+    """Find run-local Python processes for this exact absolute output path."""
+    result = call(["ps", "-axo", "pid=,command="])
+    pids = []
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        try:
+            args = shlex.split(fields[1])
+        except ValueError:
+            continue
+        if len(args) < 5 or "run-local" not in args or "--output" not in args:
+            continue
+        action = args.index("run-local")
+        if action == 0 or Path(args[action - 1]).resolve() != Path(__file__).resolve():
+            continue
+        if config_path is not None and (action + 1 >= len(args) or
+                Path(args[action + 1]).resolve() != config_path.resolve()):
+            continue
+        index = args.index("--output")
+        if index + 1 < len(args) and Path(args[index + 1]).is_absolute() and \
+                Path(args[index + 1]).resolve() == output.resolve():
+            pids.append(int(fields[0]))
+    return pids
+
+
+def stop_local(config: dict[str, Any], output: Path, config_path: Path) -> None:
+    """Interrupt one local campaign, then verify and finish its cleanup."""
+    output = output.resolve()
+    campaign_dir = output / "campaigns" / config["id"]
+    saved_config = campaign_dir / "campaign.json"
+    if saved_config.is_file():
+        saved = json.loads(saved_config.read_text())
+        if {key: value for key, value in saved.items() if key != "monitoring"} != \
+                {key: value for key, value in config.items() if key != "monitoring"}:
+            raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+        status = json.loads((campaign_dir / "summary.json").read_text())["status"]
+        if status != "running":
+            print(f"Campaign {config['id']} is already {status}")
+            return
+    elif not output.is_dir():
+        raise ValueError(f"No local campaign output at {output}")
+    pids = local_runner_pids(output, config_path)
+    if len(pids) > 1:
+        raise RuntimeError(f"Found {len(pids)} matching run-local processes for {output}; "
+                           "no signal was sent and no cluster resources were deleted")
+    pid = pids[0] if pids else None
+    if pid is not None:
+        os.kill(pid, signal.SIGINT)
+    else:
+        print(f"No live runner for {config['id']}; reconciling saved campaign state", flush=True)
+    job_error = None
+    try:
+        delete_campaign_benchmark_jobs(config)
+    except Exception as exc:
+        job_error = str(exc)
+    if pid is not None:
+        deadline = time.monotonic() + config["cleanup_timeout_seconds"] + 30
+        while pid in local_runner_pids(output, config_path) and time.monotonic() < deadline:
+            time.sleep(1)
+        if pid in local_runner_pids(output, config_path):
+            raise RuntimeError(f"Runner process {pid} is still active; cleanup is not complete")
+    pod_name = "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
+    kube(config["namespace"], "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
+         f"--timeout={config['cleanup_timeout_seconds']}s")
+    if not saved_config.is_file():
+        campaign_dir.mkdir(parents=True, exist_ok=True)
+        saved_config.write_text(json.dumps(config, indent=2) + "\n")
+        write_summary(campaign_dir, {"id": config["id"], "status": "running", "overlays": [],
+                                     "vllm_image": config["vllm_image"]})
+    leftovers = []
+    for overlay in config["overlays"]:
+        leftovers.extend(snapshot(config["namespace"], overlay["pod_selector"]))
+    cleanup_error = job_error or (f"Serving Pods remain: {', '.join(sorted(set(leftovers)))}" if leftovers else None)
+    mark_campaign_cancelled(campaign_dir, cleanup_error)
+    if cleanup_error:
+        raise CleanupError(f"Campaign {config['id']} was interrupted but cleanup needs attention: {cleanup_error}")
+    print(f"Campaign {config['id']} cancelled; artifacts retained at {output}", flush=True)
 
 
 def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination: Path) -> Path:
@@ -1628,11 +1765,7 @@ def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: P
         listing = kube(namespace, "exec", pod_name, "--", "sh", "-c",
                        'for root in /workload/aiperf-agentx /workload/nyann-agentx; do '
                        'if test -d "$root"; then find "$root" -mindepth 1 -maxdepth 1 -type d; fi; done').stdout
-        expected = set()
-        for variant in config.get("builds", [None]):
-            for overlay in config["overlays"]:
-                name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
-                expected.update(f"{config['id']}-{name}-{bench['tool']}" for bench in config["benchmarks"])
+        expected = campaign_run_ids(config)
         available = sorted(Path(line) for line in listing.splitlines()
                            if Path(line).name in expected and Path(line).parent.name in
                            {"aiperf-agentx", "nyann-agentx"})
@@ -1856,8 +1989,9 @@ def watch_preview_local(config: dict[str, Any], output: Path) -> int:
     while True:
         summary = json.loads((campaign_dir / "summary.json").read_text())
         if summary["status"] != "running":
-            if summary["status"] == "failed":
-                print(f"Campaign failed; retained the last partial preview in {campaign_dir / 'preview/index.html'}",
+            if summary["status"] in {"failed", "cancelled"}:
+                print(f"Campaign {summary['status']}; retained the last partial preview in "
+                      f"{campaign_dir / 'preview/index.html'}",
                       file=sys.stderr)
                 return 1
             final = campaign_dir / "index.html"
@@ -1985,7 +2119,7 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local",
-                                           "preview-local", "download-latest", "download-artifacts", "report-local"])
+                                           "preview-local", "download-latest", "download-artifacts", "stop-local", "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
@@ -2013,6 +2147,11 @@ def main() -> int:
             if args.output is None:
                 raise ValueError("--output is required for run-local")
             return run_local(config, args.output)
+        if args.action == "stop-local":
+            if args.output is None:
+                raise ValueError("--output is required for stop-local")
+            stop_local(config, args.output, args.config)
+            return 0
         if args.action == "preview-local":
             if args.output is None:
                 raise ValueError("--output is required for preview-local")

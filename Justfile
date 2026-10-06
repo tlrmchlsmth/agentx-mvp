@@ -86,6 +86,10 @@ campaign-test-local config source_dir output:
 campaign-run-local config output:
     python3 "{{repo_root}}/campaign/run.py" run-local "{{config}}" --output "{{output}}"
 
+# Stop one running local campaign and retain its completed artifacts.
+campaign-stop-local config output:
+    python3 "{{repo_root}}/campaign/run.py" stop-local "{{config}}" --output "{{output}}"
+
 # Refresh a running campaign or copy its last report to Downloads as one HTML file.
 campaign-download-latest config output:
     python3 "{{repo_root}}/campaign/run.py" download-latest "{{config}}" --output "{{output}}"
