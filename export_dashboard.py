@@ -737,7 +737,8 @@ def main():
     parser.add_argument("--pod-regex", default="", help="Pod regex used to scope dashboard metrics")
     parser.add_argument("--step", type=int, help="Query step in seconds (auto if omitted)")
     parser.add_argument("--grafana-url", default="http://localhost:3001")
-    parser.add_argument("--auth", default="admin:admin", help="user:password")
+    parser.add_argument("--auth", help="user:password")
+    parser.add_argument("--auth-env", help="environment variable containing user:password")
     parser.add_argument("--dashboard", default="wideep-overview", help="Dashboard UID")
     parser.add_argument("--plotly-bundle", help="gzip-compressed Plotly JS to embed for offline output")
     parser.add_argument("--aiperf-log", help="Timestamped AIPerf Job log used for profiling-phase boundaries")
@@ -754,6 +755,14 @@ def main():
     results.add_argument("--pad", type=int, default=60, help="Seconds of padding before/after run (default: 60)")
 
     args = parser.parse_args()
+    if args.auth_env:
+        if args.auth:
+            parser.error("use --auth or --auth-env, not both")
+        args.auth = os.environ.get(args.auth_env)
+        if not args.auth:
+            parser.error(f"{args.auth_env} is empty or unset")
+    elif args.auth is None:
+        args.auth = "admin:admin"
 
     if args.command == "results":
         export_results(args)

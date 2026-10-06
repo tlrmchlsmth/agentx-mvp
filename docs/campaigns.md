@@ -58,6 +58,24 @@ must never use that queue or it could block its own children.
    `campaign-setup` installs a namespace Role that can apply the resource kinds
    used by the overlays and submit benchmark Jobs; extend it only if your
    overlays contain additional kinds.
+4. To include Grafana dashboards in the final HTML, set `monitoring` explicitly:
+
+   ```json
+   "monitoring": {
+     "grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
+     "auth_secret": "llmd-grafana",
+     "dashboard_uid": "wideep-overview"
+   }
+   ```
+
+   The URL must be reachable from the campaign Job. The named Secret must be
+   in the campaign namespace with `admin-user` and `admin-password` keys;
+   credentials stay out of the JSON. After each AIPerf sweep, the runner uses
+   the existing dashboard exporter with the timestamped Job log and saved
+   serving Pod names, then the existing AIPerf renderer embeds those dashboards
+   into the final report. A Grafana export failure marks that sweep failed
+   while preserving its AIPerf measurements. Omit `monitoring` when no Grafana
+   export is wanted.
 
 ```bash
 export NAMESPACE=vllm
@@ -95,14 +113,14 @@ Use a local llm-d checkout and an output directory that does not yet exist:
 ```bash
 just campaign-test-local examples/campaign.kimi-nightly.example.json \
   ../llm-d /tmp/kimi-nightly-local-test
-open /tmp/kimi-nightly-local-test/index.html
+cat /tmp/kimi-nightly-local-test/summary.json
 ```
 
 This renders every build and overlay combination with `kubectl kustomize`,
 applies `vllm_image` and the build script, validates the manifests, and saves
-their YAML plus any planned `prebuild-job.yaml`. The HTML and CSV list each
-requested benchmark concurrency as **planned**. No serving Pod or benchmark
-runs locally, so throughput and latency fields remain empty. The command uses
+their YAML plus any planned `prebuild-job.yaml`. `summary.json` lists the
+cases and requested benchmark concurrencies. No serving Pod or benchmark
+runs locally, so this command does not generate an HTML performance report. The command uses
 the local checkout instead of fetching `source.repo/ref`; source build branches
 and optional DeepEP branches are still resolved from their Git remotes. The
 local test needs Python dependencies, `git`, and `kubectl` for its offline

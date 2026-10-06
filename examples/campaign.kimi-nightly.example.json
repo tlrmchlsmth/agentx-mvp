@@ -12,6 +12,11 @@
   "results_pvc": "agentx-results",
   "benchmark_queue": "live-benchmark-client",
   "campaign_queue": "benchmark-campaign",
+  "monitoring": {
+    "grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
+    "auth_secret": "llmd-grafana",
+    "dashboard_uid": "wideep-overview"
+  },
   "rollout_timeout_seconds": 3600,
   "admission_timeout_seconds": 3600,
   "cleanup_timeout_seconds": 600,

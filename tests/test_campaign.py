@@ -205,7 +205,8 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(summary["status"], "validated")
             self.assertEqual(len(summary["overlays"]), 2)
             self.assertEqual(summary["overlays"][0]["benchmarks"][0]["status"], "planned")
-            self.assertIn("Local validation only", (output / "index.html").read_text())
+            self.assertEqual(summary["overlays"][0]["benchmarks"][0]["concurrencies"], [1, 4])
+            self.assertFalse((output / "index.html").exists())
             self.assertIn(config["vllm_image"], (output / "nightly-baseline/manifest.yaml").read_text())
             self.assertFalse((output / "nightly-baseline/prebuild-job.yaml").exists())
             with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
@@ -410,6 +411,55 @@ class CampaignTests(unittest.TestCase):
                 "repo": "https://github.com/example/DeepEP.git", "ref": "feature"}}]
             path.write_text(json.dumps(config))
             runner.load_config(path)
+
+    def test_monitoring_requires_explicit_endpoint_secret_and_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["monitoring"] = {"grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
+                                    "auth_secret": "llmd-grafana", "dashboard_uid": "wideep-overview"}
+            path = root / "config.json"
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+            del config["monitoring"]["auth_secret"]
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "auth_secret"):
+                runner.load_config(path)
+            config["monitoring"]["auth_secret"] = "llmd-grafana"
+            config["monitoring"]["grafana_url"] = "https://user:password@example.com"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "without credentials"):
+                runner.load_config(path)
+
+    def test_campaign_monitoring_uses_existing_exporter_and_secret_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["monitoring"] = {"grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
+                                    "auth_secret": "llmd-grafana", "dashboard_uid": "wideep-overview"}
+            artifact = root / "aiperf"
+            for sample in ("c1", "c4"):
+                (artifact / sample).mkdir(parents=True)
+            commands = []
+
+            def fake_call(args, **kwargs):
+                commands.append((args, kwargs))
+                for sample in ("c1", "c4"):
+                    (artifact / sample / "dashboard.html").write_text("dashboard")
+                return SimpleNamespace(stdout="exported\n")
+
+            with patch.dict(os.environ, {"CAMPAIGN_GRAFANA_USER": "admin",
+                                      "CAMPAIGN_GRAFANA_PASSWORD": "private-password"}), \
+                 patch.object(runner, "kube", return_value=SimpleNamespace(stdout="2026-10-06T00:00:00Z benchmark\n")), \
+                 patch.object(runner, "call", side_effect=fake_call):
+                runner.export_campaign_monitoring(config, artifact, "aiperf-job", ["pod-one:uid", "pod-two:uid"],
+                                                  [{"sample": "c1"}, {"sample": "c4"}])
+            command, kwargs = commands[0]
+            self.assertIn("--auth-env", command)
+            self.assertNotIn("private-password", " ".join(command))
+            self.assertEqual(kwargs["env"]["CAMPAIGN_GRAFANA_AUTH"], "admin:private-password")
+            self.assertIn("pod\\-one|pod\\-two", command)
+            self.assertEqual((artifact / "grafana-export.log").read_text(), "exported\n")
 
     def test_nightly_script_uses_image_without_build_inputs(self):
         script = MODULE_PATH.parents[1] / "campaign/vllm-wheel-build.sh"
@@ -633,6 +683,15 @@ class CampaignTests(unittest.TestCase):
             pod = job["spec"]["template"]["spec"]
             self.assertEqual(pod["serviceAccountName"], "benchmark-campaign")
             self.assertEqual(pod["volumes"][1]["persistentVolumeClaim"]["claimName"], "results")
+
+            config["monitoring"] = {"grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
+                                    "auth_secret": "llmd-grafana", "dashboard_uid": "wideep-overview"}
+            created.clear()
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                runner.submit(config, "registry.example/campaign:sha", "benchmark-campaign")
+            environment = created[1]["spec"]["template"]["spec"]["containers"][0]["env"]
+            self.assertEqual(environment[0]["valueFrom"]["secretKeyRef"],
+                             {"name": "llmd-grafana", "key": "admin-user"})
 
     def test_cleanup_failure_stops_before_next_overlay(self):
         with tempfile.TemporaryDirectory() as directory:

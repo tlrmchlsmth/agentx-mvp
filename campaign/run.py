@@ -99,7 +99,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text())
     if not isinstance(config, dict):
         raise ValueError("campaign must be a JSON object")
-    allowed = {"id", "namespace", "source", "vllm_image", "build_repo", "builds", "results_pvc", "benchmark_queue",
+    allowed = {"id", "namespace", "source", "vllm_image", "build_repo", "builds", "monitoring", "results_pvc", "benchmark_queue",
                "campaign_queue", "overlays", "benchmarks", "rollout_timeout_seconds",
                "admission_timeout_seconds", "cleanup_timeout_seconds", "continue_on_failure"}
     if set(config) - allowed:
@@ -111,6 +111,20 @@ def load_config(path: Path) -> dict[str, Any]:
     image = config.get("vllm_image")
     if not isinstance(image, str) or not image or len(image) > 512 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*", image):
         raise ValueError("vllm_image must be an explicit container image reference")
+    if "monitoring" in config:
+        monitoring = config["monitoring"]
+        if not isinstance(monitoring, dict) or set(monitoring) != {"grafana_url", "auth_secret", "dashboard_uid"}:
+            raise ValueError("monitoring needs grafana_url, auth_secret, and dashboard_uid")
+        url = monitoring["grafana_url"]
+        if not isinstance(url, str) or len(url) > 512:
+            raise ValueError("monitoring.grafana_url must be an HTTP(S) URL")
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("monitoring.grafana_url must be an HTTP(S) URL without credentials")
+        required_name(monitoring["auth_secret"], "monitoring.auth_secret")
+        uid = monitoring["dashboard_uid"]
+        if not isinstance(uid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", uid):
+            raise ValueError("monitoring.dashboard_uid must be a Grafana dashboard UID")
     source = config.get("source")
     if not isinstance(source, dict) or set(source) != {"repo", "ref"}:
         raise ValueError("source needs repo and ref")
@@ -216,6 +230,8 @@ def load_config(path: Path) -> dict[str, Any]:
             for key in ("isl", "osl"):
                 bounded_int(bench[key], key, 1, 1000000)
             bounded_int(bench["warmup_seconds"], "warmup_seconds", 0, 3600)
+    if "monitoring" in config and "aiperf" not in tools:
+        raise ValueError("monitoring requires an aiperf benchmark")
     if len("campaign-" + config["id"]) > 63:
         raise ValueError("campaign ID is too long for Kubernetes Job/ConfigMap names")
     combined_names = set()
@@ -646,6 +662,38 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
     return measurements
 
 
+def export_campaign_monitoring(config: dict[str, Any], artifact: Path, job_name: str,
+                               baseline: list[str], measurements: list[dict[str, Any]]) -> None:
+    """Use the existing Grafana exporter on the completed AIPerf sweep."""
+    monitoring = config.get("monitoring")
+    if not monitoring:
+        return
+    user = os.environ.get("CAMPAIGN_GRAFANA_USER")
+    password = os.environ.get("CAMPAIGN_GRAFANA_PASSWORD")
+    if not user or not password:
+        raise RuntimeError("Grafana credentials from monitoring.auth_secret are unavailable")
+    log = kube(config["namespace"], "logs", f"job/{job_name}", "--timestamps=true").stdout
+    log_path = artifact / "aiperf-job.log"
+    log_path.write_text(log)
+    names = [entry.split(":", 1)[0] for entry in baseline]
+    if not names:
+        raise RuntimeError("Grafana export needs the saved serving Pod names")
+    env = os.environ.copy()
+    env["CAMPAIGN_GRAFANA_AUTH"] = f"{user}:{password}"
+    directories = [artifact / measurement["sample"] for measurement in measurements]
+    command = [sys.executable, str(ROOT / "export_dashboard.py"),
+               "--grafana-url", monitoring["grafana_url"], "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
+               "--dashboard", monitoring["dashboard_uid"],
+               "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
+               "--aiperf-log", str(log_path), "--pod-regex", "|".join(re.escape(name) for name in names),
+               "results", *(str(directory) for directory in directories), "--pad", "0"]
+    output = call(command, env=env).stdout
+    (artifact / "grafana-export.log").write_text(output)
+    if any(not (directory / "dashboard.html").is_file() or not (directory / "dashboard.html").stat().st_size
+           for directory in directories):
+        raise RuntimeError("Grafana exporter did not produce every AIPerf dashboard")
+
+
 def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dict[str, Any],
                      campaign_dir: Path, baseline: list[str], commit: str | None, source_commit: str) -> dict[str, Any]:
     tool = bench["tool"]
@@ -696,15 +744,23 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
     if not Path(artifact).exists():
         raise RuntimeError(f"{job_name} completed without expected artifacts: {artifact}")
     measurements = []
+    monitoring_error = None
     if tool == "aiperf":
         measurements = aiperf_measurements(Path(artifact), run_id, bench["concurrencies"])
+        try:
+            export_campaign_monitoring(config, Path(artifact), job_name, baseline, measurements)
+        except Exception as exc:
+            monitoring_error = f"Grafana export failed: {exc}"
     else:
         log = kube(config["namespace"], "logs", f"job/{job_name}").stdout
         (campaign_dir / "nyann-job.log").write_text(log)
         measurements = nyann_measurements(log, bench["concurrencies"])
-    return {"tool": tool, "job": job_name, "run_id": run_id, "artifacts": artifact,
+    result = {"tool": tool, "job": job_name, "run_id": run_id, "artifacts": artifact,
             "report": f"{artifact}/index.html" if tool == "aiperf" else None,
-            "measurements": measurements, "status": "completed"}
+            "measurements": measurements, "status": "failed" if monitoring_error else "completed"}
+    if monitoring_error:
+        result["error"] = monitoring_error
+    return result
 
 
 def write_summary(destination: Path, summary: dict[str, Any], *, embedded_reports: bool = False) -> str:
@@ -766,8 +822,7 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
         return f"<td>{html.escape(value)}</td>"
 
     body = "".join("<tr>" + "".join(html_cell(row, field) for field in fields) + "</tr>" for row in rows)
-    local_note = "<p>Local validation only: no deployment or benchmark was run.</p>" if summary.get("mode") == "local-test" else ""
-    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + local_note + \
+    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + \
         "<h2>Builds</h2><table><tr><th>Build</th><th>Status</th><th>Resolved inputs</th><th>Error</th></tr>" + \
         "".join(build_rows) + "</table>" + \
         "<h2>All configurations</h2><table><tr>" + header + "</tr>" + body + "</table>"
@@ -783,7 +838,7 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
     runs = []
     for record in summary["overlays"]:
         for bench in record.get("benchmarks", []):
-            if bench.get("tool") != "aiperf" or bench.get("status") != "completed":
+            if bench.get("tool") != "aiperf" or (bench.get("status") != "completed" and not bench.get("measurements")):
                 continue
             artifact = Path(bench["artifacts"])
             for directory in sorted(artifact.iterdir()):
@@ -874,6 +929,9 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
     """Render and validate every campaign case without contacting Kubernetes."""
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "campaign.json").write_text(json.dumps(config, indent=2) + "\n")
+    def save_plan() -> None:
+        (destination / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
     summary: dict[str, Any] = {
         "id": config["id"], "mode": "local-test", "status": "validating",
         "started_at": datetime.now(timezone.utc).isoformat(), "overlays": [], "builds": [],
@@ -943,23 +1001,22 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
                         raise ValueError("overlay has no compatible vLLM prebuild script")
                     record["prebuild_job"] = str(folder / "prebuild-job.yaml")
                 for bench in config["benchmarks"]:
-                    record["benchmarks"].append({"tool": bench["tool"], "status": "planned", "measurements": [
-                        {"sample": f"c{concurrency}", "concurrency": concurrency}
-                        for concurrency in bench["concurrencies"]]})
+                    record["benchmarks"].append({"tool": bench["tool"], "status": "planned",
+                                                 "concurrencies": bench["concurrencies"]})
             except Exception as exc:
                 record["status"] = "failed"
                 record["error"] = str(exc)
         summary["status"] = "failed" if any(item["status"] == "failed" for item in
                                              [*summary["builds"], *summary["overlays"]]) else "validated"
         summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-        write_summary(destination, summary)
+        save_plan()
         print(f"Local campaign test {summary['status']}; artifacts: {destination}", flush=True)
         return 0 if summary["status"] == "validated" else 1
     except Exception as exc:
         summary["status"] = "failed"
         summary["error"] = str(exc)
         summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-        write_summary(destination, summary)
+        save_plan()
         print(f"Local campaign test failed: {exc}; artifacts: {destination}", file=sys.stderr)
         return 1
     finally:
@@ -1083,6 +1140,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
                 record["benchmarks"].append(result)
                 write_summary(destination, summary)
                 if result["status"] != "completed":
+                    failed = True
                     break
             record["status"] = "completed" if all(item["status"] == "completed" for item in record["benchmarks"]) else "failed"
         except Exception as exc:
@@ -1147,6 +1205,12 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
                             {"name": "results", "mountPath": "/workload"}]}],
            "volumes": [{"name": "config", "configMap": {"name": configmap_name}},
                        {"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}}}
+    if "monitoring" in config:
+        secret = config["monitoring"]["auth_secret"]
+        job["spec"]["template"]["spec"]["containers"][0]["env"] = [
+            {"name": "CAMPAIGN_GRAFANA_USER", "valueFrom": {"secretKeyRef": {"name": secret, "key": "admin-user"}}},
+            {"name": "CAMPAIGN_GRAFANA_PASSWORD", "valueFrom": {"secretKeyRef": {"name": secret, "key": "admin-password"}}},
+        ]
     try:
         kube(namespace, "create", "-f", "-", input_text=json.dumps(job))
     except Exception:
