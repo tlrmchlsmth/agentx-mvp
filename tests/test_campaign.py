@@ -363,6 +363,41 @@ class CampaignTests(unittest.TestCase):
                 self.assertIn(commit, (root / "aiperf-agentx" / f"campaign-{build}-pd-aiperf" /
                                        "index.html").read_text())
 
+    def test_preview_local_renders_only_completed_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            campaign = root / "campaigns" / config["id"]
+            campaign.mkdir(parents=True)
+            (campaign / "campaign.json").write_text(json.dumps(config))
+            (campaign / "summary.json").write_text(json.dumps({"status": "running"}))
+            run_id = f"{config['id']}-baseline-aiperf"
+            remote = Path(f"/workload/aiperf-agentx/{run_id}/c1")
+            source = root / "completed-sample"
+            source.mkdir()
+            (source / "profile_export_aiperf.json").write_text(json.dumps({
+                "request_throughput": {"avg": 2, "unit": "req/s"},
+                "output_token_throughput": {"avg": 200, "unit": "tokens/s"}}))
+            (source / "benchmark-metadata.json").write_text(json.dumps({
+                "run_id": f"{run_id}-c1", "concurrency": 1,
+                "source_kind": "llm-d", "source_ref": "main", "source_commit": "a" * 40}))
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "exec":
+                    return SimpleNamespace(stdout=str(remote / "profile_export_aiperf.json") + "\n")
+                if args[0] == "cp":
+                    runner.shutil.copytree(source, Path(args[2]))
+                    return SimpleNamespace(stdout="")
+                raise AssertionError(args)
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                self.assertEqual(runner.preview_local(config, root), 0)
+            page = (campaign / "preview/index.html").read_text()
+            self.assertIn("In-progress preview: 1 completed AIPerf samples", page)
+            self.assertIn("baseline", page)
+            self.assertIn(config["vllm_image"], page)
+            self.assertIn('id="root"', page)
+
     def test_rejects_unsafe_source_and_records_checkout_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1511,6 +1511,62 @@ def run_local(config: dict[str, Any], output: Path) -> int:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
 
 
+def preview_local(config: dict[str, Any], output: Path) -> int:
+    """Render completed AIPerf samples from an active run-local campaign."""
+    campaign_dir = output.resolve() / "campaigns" / config["id"]
+    saved_config = campaign_dir / "campaign.json"
+    if not saved_config.is_file() or json.loads(saved_config.read_text()) != config:
+        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    summary = json.loads((campaign_dir / "summary.json").read_text())
+    if summary["status"] != "running":
+        print(f"Campaign is {summary['status']}; use its final report if available")
+        return 0
+    pod_name = "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
+    namespace = config["namespace"]
+    remote_root = "/workload/aiperf-agentx"
+    listing = kube(namespace, "exec", pod_name, "--", "find", remote_root,
+                   "-mindepth", "3", "-maxdepth", "3", "-type", "f",
+                   "-name", "profile_export_aiperf.json").stdout
+    labels = {}
+    for variant in config.get("builds", [None]):
+        for overlay in config["overlays"]:
+            name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
+            run_id = f"{config['id']}-{name}-aiperf"
+            labels[run_id] = name
+    paths = []
+    for line in listing.splitlines():
+        path = Path(line)
+        if path.parent.parent.name in labels and path.name == "profile_export_aiperf.json":
+            paths.append(path)
+    if not paths:
+        print("No completed AIPerf samples yet; preview HTML was not created")
+        return 0
+    preview = campaign_dir / "preview"
+    preview.mkdir(exist_ok=True)
+    runs = []
+    with tempfile.TemporaryDirectory(prefix="campaign-preview-") as temporary:
+        for path in sorted(paths):
+            sample = Path(temporary) / path.parent.parent.name / path.parent.name
+            sample.parent.mkdir(parents=True, exist_ok=True)
+            kube(namespace, "cp", f"{pod_name}:{path.parent}", str(sample))
+            data = AIPERF_REPORT.run_data(sample)
+            if data is None or not data["profile"]:
+                continue  # The writer may still be finishing this sample.
+            data["metadata"].update({"campaign_label": labels[path.parent.parent.name],
+                                     "vllm_image": config["vllm_image"]})
+            runs.append(data)
+        if not runs:
+            print("No complete AIPerf profiles yet; preview HTML was not created")
+            return 0
+        notice = (f"<p>In-progress preview: {len(runs)} completed AIPerf samples. "
+                  "Unfinished samples and nyann results are not included.</p>")
+        AIPERF_REPORT.write_index_from_runs(preview, runs, extra_html=notice,
+                                            model_label=f"Campaign {config['id']} preview",
+                                            save_monitoring_overlay=False)
+    print(f"Preview: {preview / 'index.html'} ({len(runs)} completed AIPerf samples)")
+    return 0
+
+
 def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     namespace, campaign_id = config["namespace"], config["id"]
     required_name(service_account, "service_account")
@@ -1555,7 +1611,7 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local"])
+    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local", "preview-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
@@ -1580,6 +1636,10 @@ def main() -> int:
             if args.output is None:
                 raise ValueError("--output is required for run-local")
             return run_local(config, args.output)
+        if args.action == "preview-local":
+            if args.output is None:
+                raise ValueError("--output is required for preview-local")
+            return preview_local(config, args.output)
         return run(config)
     except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         print(f"campaign: {exc}", file=sys.stderr)
