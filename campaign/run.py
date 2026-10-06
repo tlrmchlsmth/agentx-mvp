@@ -1823,6 +1823,42 @@ def watch_preview_local(config: dict[str, Any], output: Path) -> int:
         time.sleep(60)
 
 
+def download_latest_local(config: dict[str, Any], output: Path, destination: Path | None = None) -> Path:
+    """Refresh and save the latest self-contained campaign HTML in one command."""
+    campaign_dir = output.resolve() / "campaigns" / config["id"]
+    saved_config = campaign_dir / "campaign.json"
+    if not saved_config.is_file():
+        raise ValueError(f"No campaign at {campaign_dir}")
+    saved = json.loads(saved_config.read_text())
+    if {key: value for key, value in saved.items() if key != "monitoring"} != \
+            {key: value for key, value in config.items() if key != "monitoring"}:
+        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    status = json.loads((campaign_dir / "summary.json").read_text())["status"]
+    if status == "running":
+        preview_local(config, output)
+    preview = campaign_dir / "preview" / "index.html"
+    final = campaign_dir / "index.html"
+    source = final if status == "completed" and final.is_file() else preview
+    if not source.is_file():
+        raise RuntimeError(f"No report is available for campaign {config['id']} ({status})")
+    destination = (destination or Path.home() / "Downloads" / f"{config['id']}-latest.html").expanduser()
+    if destination.is_dir():
+        destination /= f"{config['id']}-latest.html"
+    destination = destination.resolve()
+    if destination != source.resolve():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=f".{destination.name}.", dir=destination.parent,
+                                         delete=False) as temporary:
+            staged = Path(temporary.name)
+        try:
+            shutil.copyfile(source, staged)
+            staged.replace(destination)
+        finally:
+            staged.unlink(missing_ok=True)
+    print(f"Downloaded latest report: {destination} (campaign {status})")
+    return destination
+
+
 def report_local(config: dict[str, Any], output: Path) -> int:
     """Backfill Grafana dashboards and regenerate a finished local campaign report."""
     campaign_dir = output.resolve() / "campaigns" / config["id"]
@@ -1894,13 +1930,15 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local", "preview-local", "report-local"])
+    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local",
+                                           "preview-local", "download-latest", "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
     parser.add_argument("--source-dir", type=Path, help="local llm-d checkout for test-local; otherwise fetch source.repo/ref")
     parser.add_argument("--output", type=Path, help="new artifact directory for test-local")
     parser.add_argument("--watch", action="store_true", help="refresh preview-local until the campaign finishes")
+    parser.add_argument("--dest", type=Path, help="HTML destination for download-latest (default: Downloads/<campaign-id>-latest.html)")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
@@ -1924,8 +1962,17 @@ def main() -> int:
             if args.output is None:
                 raise ValueError("--output is required for preview-local")
             return watch_preview_local(config, args.output) if args.watch else preview_local(config, args.output)
+        if args.action == "download-latest":
+            if args.output is None:
+                raise ValueError("--output is required for download-latest")
+            if args.watch:
+                raise ValueError("--watch is only supported with preview-local")
+            download_latest_local(config, args.output, args.dest)
+            return 0
         if args.watch:
             raise ValueError("--watch is only supported with preview-local")
+        if args.dest is not None:
+            raise ValueError("--dest is only supported with download-latest")
         if args.action == "report-local":
             if args.output is None:
                 raise ValueError("--output is required for report-local")

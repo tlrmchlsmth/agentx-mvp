@@ -199,6 +199,17 @@ notice instead of an empty per-run Grafana dashboard. The monitoring overlay
 still includes any available GPU or other time series for that sample and
 labels its missing vLLM coverage.
 
+For a one-shot download of the latest state, run:
+
+```bash
+export KUBECONFIG=~/.kube/config.kermit
+just campaign-download-latest examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
+```
+
+This refreshes a running campaign before saving `~/Downloads/<campaign-id>-latest.html`.
+For a completed campaign it copies the final report; for a failed campaign it
+copies the last partial preview. The Python command also accepts `--dest PATH`.
+
 If monitoring was added to the JSON after a `run-local` campaign started,
 regenerate its final HTML after the campaign finishes:
 

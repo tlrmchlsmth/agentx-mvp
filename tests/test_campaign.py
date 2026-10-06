@@ -483,6 +483,30 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(runner.watch_preview_local(config, root), 1)
             self.assertEqual((preview / "index.html").read_text(), "completed sample charts")
 
+    def test_download_latest_selects_live_partial_or_final_report(self):
+        for status, expected in (("running", "refreshed preview"),
+                                 ("failed", "partial preview"),
+                                 ("completed", "final report")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = self.config(root)
+                campaign = root / "campaigns" / config["id"]
+                preview = campaign / "preview"
+                preview.mkdir(parents=True)
+                (campaign / "campaign.json").write_text(json.dumps(config))
+                (campaign / "summary.json").write_text(json.dumps({"status": status}))
+                (preview / "index.html").write_text("partial preview")
+                (campaign / "index.html").write_text("final report")
+
+                def refresh(*args):
+                    (preview / "index.html").write_text("refreshed preview")
+
+                destination = root / "Downloads" / "latest.html"
+                with patch.object(runner, "preview_local", side_effect=refresh) as refresh_call:
+                    self.assertEqual(runner.download_latest_local(config, root, destination), destination.resolve())
+                self.assertEqual(refresh_call.call_count, 1 if status == "running" else 0)
+                self.assertEqual(destination.read_text(), expected)
+
     def test_monitoring_overlay_includes_partial_gpu_data_and_excludes_empty_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
