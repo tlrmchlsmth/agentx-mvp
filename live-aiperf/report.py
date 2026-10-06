@@ -441,7 +441,10 @@ def nyann_setup(config: dict[str, Any], campaign_dir: Path | None = None) -> str
             '<div class="campaign-benchmark">'
             f'<p class="campaign-benchmark-summary">{html.escape(headline)}</p>'
             '<details class="campaign-detail"><summary>Full Nyann benchmark configuration</summary>'
-            f'<table><tbody>{rows}</tbody></table><p>Configured JSON</p><pre>{exact}</pre>'
+            f'<table><tbody>{rows}</tbody></table>'
+            '<p>TPOT is calculated per completed request from Nyann JSONL as '
+            '(end-to-end latency − TTFT) / (output tokens − 1); one-token requests are excluded.</p>'
+            f'<p>Configured JSON</p><pre>{exact}</pre>'
             '</details></div>')
     return "".join(sections)
 
@@ -512,11 +515,14 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
     first_metadata = runs[0]["metadata"]
     output = root / "index.html"
     nyann_runs = [data for data in runs if data["metadata"].get("benchmark_tool") == "nyann"]
+    has_tpot = nyann_runs and all("p90" in data["profile"].get("time_per_output_token", {})
+                                   for data in runs)
     nyann_latency_stat = ("p90" if all("p90" in data["profile"].get("time_to_first_token", {})
                                       for data in nyann_runs) else "p95")
     chart_defaults = ({
         "throughput": {"xMetric": "request_throughput", "yMetric": "output_token_throughput", "yNorm": "none"},
-        "latency": {"xMetric": "time_to_first_token", "xStat": nyann_latency_stat,
+        "latency": {"xMetric": "time_per_output_token" if has_tpot else "time_to_first_token",
+                    "xStat": "p90" if has_tpot else nyann_latency_stat,
                     "yMetric": "output_token_throughput", "yNorm": "none"},
     } if nyann_runs else {
         "throughput": {"xMetric": "e2e_output_token_throughput", "yMetric": "output_token_throughput", "yNorm": "decode"},

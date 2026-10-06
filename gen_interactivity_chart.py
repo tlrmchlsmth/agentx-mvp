@@ -409,11 +409,14 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
         'output_sequence_length': 'Output sequence length',
         'output_token_throughput': 'Output token throughput',
         'output_token_throughput_per_user': 'Output token throughput/user',
+        'output_tokens_per_request': 'Output tokens per request',
         'request_count': 'Request count',
-        'request_latency': 'Request latency',
+        'request_latency': 'End-to-end request latency',
+        'request_error_rate': 'Request error rate',
         'request_throughput': 'Request throughput',
         'theoretical_prefix_cache_hit': 'Theoretical prefix cache hit',
         'time_to_first_token': 'Time to first token',
+        'time_per_output_token': 'Time per output token (TPOT)',
         'time_to_second_token': 'Time to second token',
         'tokens_in_flight': 'Tokens in flight',
         'total_output_tokens': 'Total output tokens',
@@ -818,12 +821,15 @@ function hoverText(cfg, c, d) {{
   const itl = d.inter_token_latency;
   const otpu = d.output_token_throughput_per_user;
   const ttft = d.time_to_first_token;
+  const tpot = d.time_per_output_token;
+  const e2e = d.request_latency;
   const norm = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '?';
   return `<b>${{meta.label}} @ c${{C_LABELS[c]}}</b><br>` +
     `Output: ${{out?.avg?.toFixed(1) ?? '?'}} tok/s (${{norm}} tok/s/decode GPU)<br>` +
     `ITL p50: ${{itl?.p50?.toFixed(1) ?? '?'}} ms · p99: ${{itl?.p99?.toFixed(1) ?? '?'}} ms<br>` +
     `Per-user: ${{otpu?.avg?.toFixed(1) ?? '?'}} tok/s/user<br>` +
-    `TTFT p50: ${{ttft ? (ttft.p50/1000).toFixed(1) : '?'}}s · p99: ${{ttft ? (ttft.p99/1000).toFixed(1) : '?'}}s`;
+    `TTFT p50: ${{ttft ? (ttft.p50/1000).toFixed(1) : '?'}}s · p99: ${{ttft ? (ttft.p99/1000).toFixed(1) : '?'}}s<br>` +
+    `TPOT p90: ${{tpot?.p90?.toFixed(1) ?? '?'}} ms · E2E p90: ${{e2e?.p90?.toFixed(1) ?? '?'}} ms`;
 }}
 
 const allCharts = [];
@@ -1114,6 +1120,7 @@ root.appendChild(sec2Wrap);
     'Output tok/s/GPU', 'Input tok/s/GPU', 'Total tok/s/GPU',
     'ITL p50 (ms)', 'ITL p99 (ms)', 'Per-user tok/s',
     'TTFT p50 (s)', 'TTFT p99 (s)',
+    'TPOT p50 (ms)', 'TPOT p90 (ms)', 'E2E p90 (ms)',
     '$/M input', '$/M output',
   ];
   const headerRow = document.createElement('tr');
@@ -1141,6 +1148,8 @@ root.appendChild(sec2Wrap);
       const itl = d.inter_token_latency;
       const otpu = d.output_token_throughput_per_user;
       const ttft = d.time_to_first_token;
+      const tpot = d.time_per_output_token;
+      const e2e = d.request_latency;
       const outPerGpu = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '-';
       const inpPerGpu = inp ? (inp.avg / meta.prefillGPUs).toFixed(1) : '-';
       const totalTps = total?.avg ?? ((out?.avg ?? 0) + (inp?.avg ?? 0));
@@ -1163,6 +1172,8 @@ root.appendChild(sec2Wrap);
         otpu?.avg?.toFixed(1) ?? '-',
         ttft ? (ttft.p50/1000).toFixed(1) : '-',
         ttft ? (ttft.p99/1000).toFixed(1) : '-',
+        tpot?.p50?.toFixed(1) ?? '-', tpot?.p90?.toFixed(1) ?? '-',
+        e2e?.p90?.toFixed(1) ?? '-',
         '-', '-',
       ];
       vals.forEach((v, i) => {{

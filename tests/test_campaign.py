@@ -551,21 +551,74 @@ class CampaignTests(unittest.TestCase):
     def test_nyann_stage_summary_enters_comparison_report(self):
         stages = [{"concurrency": concurrency, "successful_requests": 10,
                    "error_requests": 1, "duration_seconds": 5,
-                   "output_tokens_per_second": concurrency * 20,
+                   "output_tokens_per_second": concurrency * 20, "total_output_tokens": 100,
                    "ttft_ms": {"mean": 20, "p10": 10, "p90": 30},
-                   "itl_ms": {"mean": 3, "p10": 2, "p90": 4}}
+                   "itl_ms": {"mean": 3, "p10": 2, "p90": 4},
+                   "e2e_latency_ms": {"mean": 100, "p90": 120}}
                   for concurrency in (1, 4)]
         log = "stage output\n" + json.dumps({"total_requests": 22, "stages": stages}, indent=2) + "\n"
         measurements = runner.nyann_measurements(log, [1, 4])
         self.assertEqual([item["metrics"]["request_throughput"]["avg"] for item in measurements], [2, 2])
         self.assertEqual(measurements[0]["metrics"]["time_to_first_token"]["avg"], 20)
         self.assertEqual(measurements[0]["metrics"]["inter_token_latency"]["p10"], 2)
+        self.assertEqual(measurements[0]["metrics"]["request_latency"]["p90"], 120)
+        self.assertEqual(measurements[0]["metrics"]["output_tokens_per_request"]["avg"], 10)
         with tempfile.TemporaryDirectory() as directory:
             runner.write_summary(Path(directory), {"id": "example", "status": "completed", "overlays": [
                 {"name": "build-pd", "build": "build", "overlay": "pd", "status": "completed",
                  "benchmarks": [{"tool": "nyann", "status": "completed", "measurements": measurements}]}]})
             comparison = (Path(directory) / "comparison.csv").read_text()
             self.assertIn("build,pd,nyann,stage-1,1,completed,10,1,2.0,req/s,20,tokens/s,30,ms,4,ms", comparison)
+
+    def test_nyann_tpot_uses_only_complete_requests_within_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests_0.jsonl"
+            rows = [
+                {"status": "ok", "t0": 110, "tend": 120, "ttft_ms": 20,
+                 "latency_ms": 100, "output_tokens": 3},
+                {"status": "ok", "t0": 130, "tend": 150, "ttft_ms": 40,
+                 "latency_ms": 120, "output_tokens": 5},
+                {"status": "ok", "t0": 90, "tend": 110, "ttft_ms": 20,
+                 "latency_ms": 100, "output_tokens": 3},
+                {"status": "ok", "t0": 190, "tend": 210, "ttft_ms": 20,
+                 "latency_ms": 100, "output_tokens": 3},
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            log = json.dumps({"stages": [{"concurrency": 1}], "timestamps": {"stages": [
+                {"concurrency": 1, "start_time": 100, "end_time": 200}]}})
+            measurement = {"sample": "stage-1", "concurrency": 1, "successful_requests": 2,
+                           "metrics": {}}
+            runner.enrich_nyann_request_metrics([measurement], log, [1], 100, [path])
+            self.assertEqual(measurement["metrics"]["time_per_output_token"]["avg"], 30)
+            self.assertEqual(measurement["metrics"]["time_per_output_token"]["p90"], 38)
+            self.assertEqual(measurement["metrics"]["request_latency"]["avg"], 110)
+            incomplete = {"sample": "stage-1", "concurrency": 1, "successful_requests": 3,
+                          "metrics": {}}
+            runner.enrich_nyann_request_metrics([incomplete], log, [1], 100, [path])
+            self.assertNotIn("time_per_output_token", incomplete["metrics"])
+
+    def test_nyann_tpot_is_visible_in_default_chart_and_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = {"id": "nyann-chart", "status": "completed", "overlays": [{
+                "name": "pd", "status": "completed", "benchmarks": [{
+                    "tool": "nyann", "status": "completed", "measurements": [{
+                        "sample": "stage-1", "concurrency": 1, "successful_requests": 10,
+                        "metrics": {
+                            "request_throughput": {"avg": 1, "unit": "req/s"},
+                            "output_token_throughput": {"avg": 100, "unit": "tokens/s"},
+                            "time_per_output_token": {"avg": 20, "p50": 18, "p90": 30, "unit": "ms"},
+                            "request_latency": {"avg": 1000, "p90": 1200, "unit": "ms"},
+                        },
+                    }],
+                }],
+            }]}
+            runner.write_final_report(root, summary)
+            page = (root / "index.html").read_text()
+            self.assertIn('"xMetric": "time_per_output_token"', page)
+            self.assertIn("TPOT p50 (ms)", page)
+            self.assertIn("E2E p90 (ms)", page)
+            self.assertIn("Time per output token (TPOT)", page)
 
     def test_nyann_monitoring_uses_stage_windows_and_cached_exporter(self):
         with tempfile.TemporaryDirectory() as directory:

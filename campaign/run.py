@@ -13,6 +13,7 @@ import hashlib
 import html
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -859,12 +860,20 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
         duration = stage["duration_seconds"]
         if successes <= 0 or duration <= 0:
             raise RuntimeError(f"Nyann stage {index} has no successful requests or measured duration")
+        metrics = {"request_throughput": {"avg": successes / duration, "unit": "req/s"},
+                   "output_token_throughput": {"avg": stage["output_tokens_per_second"], "unit": "tokens/s"},
+                   "time_to_first_token": latency_stats(stage["ttft_ms"]),
+                   "inter_token_latency": latency_stats(stage["itl_ms"]),
+                   "request_count": {"avg": successes, "unit": "requests"},
+                   "request_error_rate": {"avg": 100 * errors / (successes + errors), "unit": "%"}}
+        if isinstance(stage.get("e2e_latency_ms"), dict):
+            metrics["request_latency"] = latency_stats(stage["e2e_latency_ms"])
+        if "total_output_tokens" in stage:
+            metrics["total_output_tokens"] = {"avg": stage["total_output_tokens"], "unit": "tokens"}
+            metrics["output_tokens_per_request"] = {"avg": stage["total_output_tokens"] / successes,
+                                                     "unit": "tokens/request"}
         measurements.append({"concurrency": stage["concurrency"], "sample": f"stage-{index}",
-                             "successful_requests": successes, "error_requests": errors,
-                             "metrics": {"request_throughput": {"avg": successes / duration, "unit": "req/s"},
-                                         "output_token_throughput": {"avg": stage["output_tokens_per_second"], "unit": "tokens/s"},
-                                         "time_to_first_token": latency_stats(stage["ttft_ms"]),
-                                         "inter_token_latency": latency_stats(stage["itl_ms"])}})
+                             "successful_requests": successes, "error_requests": errors, "metrics": metrics})
     return measurements
 
 
@@ -910,10 +919,71 @@ def nyann_live_measurements(log: str, concurrencies: list[int], duration_seconds
                 "output_token_throughput": {"avg": throughput, "unit": "tokens/s"},
                 "time_to_first_token": {**dict(zip(("avg", "p10", "p50", "p95", "p99"), ttft)), "unit": "ms"},
                 "inter_token_latency": {**dict(zip(("p10", "p50", "p95", "p99"), itl)), "unit": "ms"},
+                "request_count": {"avg": successes, "unit": "requests"},
+                "request_error_rate": {"avg": 100 * errors / (successes + errors), "unit": "%"},
+                "total_output_tokens": {"avg": int(columns[3]), "unit": "tokens"},
+                "output_tokens_per_request": {"avg": int(columns[3]) / successes, "unit": "tokens/request"},
             },
         }
         current_stage = None
     return [stages[index] for index in sorted(stages)]
+
+
+def nyann_distribution(values: list[float]) -> dict[str, Any]:
+    ordered = sorted(values)
+    result = {"avg": sum(ordered) / len(ordered), "min": ordered[0], "max": ordered[-1], "unit": "ms"}
+    for percentile in (10, 50, 90, 95, 99):
+        position = (len(ordered) - 1) * percentile / 100
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        result[f"p{percentile}"] = ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+    return result
+
+
+def enrich_nyann_request_metrics(measurements: list[dict[str, Any]], log: str,
+                                 concurrencies: list[int], duration_seconds: int,
+                                 request_files: list[Path]) -> None:
+    """Calculate request-level TPOT from Nyann JSONL, excluding warmup and stage crossings."""
+    if not request_files or not measurements:
+        return
+    windows = nyann_stage_windows(log, concurrencies, measurements, duration_seconds)
+    samples = {item["sample"]: item for item in measurements if item["sample"] in windows}
+    values = {sample: {"count": 0, "tpot": [], "e2e": []} for sample in samples}
+    for path in request_files:
+        with path.open(encoding="utf-8", errors="replace") as source:
+            for line in source:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # A live snapshot can end in a partial JSONL line.
+                if row.get("status") != "ok":
+                    continue
+                start, end = row.get("t0"), row.get("tend")
+                if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+                    continue
+                for sample in samples:
+                    window_start, window_end = windows[sample]
+                    if not window_start <= start < window_end or not window_start <= end < window_end:
+                        continue
+                    bucket = values[sample]
+                    bucket["count"] += 1
+                    latency = row.get("latency_ms")
+                    ttft = row.get("ttft_ms")
+                    tokens = row.get("output_tokens")
+                    if isinstance(latency, (int, float)) and math.isfinite(latency) and latency >= 0:
+                        bucket["e2e"].append(float(latency))
+                        if (isinstance(ttft, (int, float)) and math.isfinite(ttft) and
+                                isinstance(tokens, int) and tokens > 1 and latency >= ttft):
+                            bucket["tpot"].append((latency - ttft) / (tokens - 1))
+                    break
+    for sample, bucket in values.items():
+        item = samples[sample]
+        if bucket["count"] != item["successful_requests"]:
+            continue  # Wait for a complete snapshot rather than plot a biased distribution.
+        if bucket["tpot"]:
+            item["metrics"]["time_per_output_token"] = nyann_distribution(bucket["tpot"])
+        if "request_latency" not in item["metrics"] and bucket["e2e"]:
+            item["metrics"]["request_latency"] = nyann_distribution(bucket["e2e"])
 
 
 def nyann_stage_windows(log: str, concurrencies: list[int],
@@ -1163,6 +1233,8 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
         log = kube(config["namespace"], "logs", f"job/{job_name}").stdout
         (campaign_dir / "nyann-job.log").write_text(log)
         measurements = nyann_measurements(log, bench["concurrencies"])
+        enrich_nyann_request_metrics(measurements, log, bench["concurrencies"], bench["duration_seconds"],
+                                     sorted(artifact.glob("requests_*.jsonl")))
         try:
             export_nyann_monitoring(config, campaign_dir, baseline, measurements, log, bench)
         except Exception as exc:
@@ -1183,7 +1255,8 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
     fields = ["build", "overlay", *dimensions, "tool", "sample", "concurrency", "status",
               "successful_requests", "error_requests",
               "requests_per_s", "requests_unit", "output_tokens_per_s", "output_tokens_unit",
-              "ttft_p90", "ttft_unit", "itl_p90", "itl_unit", "report", "artifacts", "error",
+              "ttft_p90", "ttft_unit", "itl_p90", "itl_unit", "tpot_p90", "tpot_unit",
+              "e2e_p90", "e2e_unit", "report", "artifacts", "error",
               "llm_d_commit", "vllm_commits", "deepep_commit", "vllm_image"]
     rows = []
     for record in summary["overlays"]:
@@ -1211,6 +1284,10 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
                        "ttft_unit": metrics.get("time_to_first_token", {}).get("unit", ""),
                        "itl_p90": metrics.get("inter_token_latency", {}).get("p90", ""),
                        "itl_unit": metrics.get("inter_token_latency", {}).get("unit", ""),
+                       "tpot_p90": metrics.get("time_per_output_token", {}).get("p90", ""),
+                       "tpot_unit": metrics.get("time_per_output_token", {}).get("unit", ""),
+                       "e2e_p90": metrics.get("request_latency", {}).get("p90", ""),
+                       "e2e_unit": metrics.get("request_latency", {}).get("unit", ""),
                        "report": bench.get("report", ""),
                        "artifacts": bench.get("artifacts", ""), "error": bench.get("error", ""),
                        "llm_d_commit": summary.get("source_commit", ""),
@@ -1932,6 +2009,37 @@ def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination
     return sample
 
 
+def copy_nyann_request_files(config: dict[str, Any], pod_name: str, record: dict[str, Any],
+                             campaign_dir: Path, *, stable: bool) -> list[Path]:
+    """Bring Nyann request metrics to the local report, snapshotting active JSONL first."""
+    namespace = config["namespace"]
+    run_id = f"{config['id']}-{record['name']}-nyann"
+    remote_root = Path("/workload/nyann-agentx") / run_id
+    listing = kube(namespace, "exec", pod_name, "--", "find", str(remote_root), "-maxdepth", "1",
+                   "-type", "f", "-name", "requests_*.jsonl", check=False)
+    if listing.returncode:
+        return []
+    files = []
+    for line in sorted(listing.stdout.splitlines()):
+        remote = Path(line)
+        if remote.parent != remote_root or not re.fullmatch(r"requests_[0-9]+\.jsonl", remote.name):
+            raise RuntimeError(f"Unexpected Nyann request artifact: {remote}")
+        local = campaign_dir / record["name"] / "nyann-requests" / remote.name
+        if stable:
+            TRANSFER.download_file(namespace, pod_name, str(remote), local)
+        else:
+            snapshot = kube(namespace, "exec", pod_name, "--", "sh", "-c",
+                            'snapshot="$(mktemp /tmp/nyann-requests.XXXXXX)"; '
+                            'cp "$1" "$snapshot"; printf "%s" "$snapshot"',
+                            "sh", str(remote)).stdout.strip()
+            try:
+                TRANSFER.download_file(namespace, pod_name, snapshot, local)
+            finally:
+                kube(namespace, "exec", pod_name, "--", "rm", "-f", snapshot, check=False)
+        files.append(local)
+    return files
+
+
 def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: Path) -> Path:
     """Resume this campaign's PVC artifacts after a run-local process has exited."""
     root = Path("/workload")
@@ -2034,6 +2142,9 @@ def download_cluster_report(config: dict[str, Any], output: Path,
                         copy_aiperf_sample(namespace, pod_name, profile, local_artifact)
                     bench["artifacts"] = str(local_artifact)
                     bench["report"] = str(local_artifact / "index.html")
+                if any(bench.get("tool") == "nyann" and bench.get("measurements")
+                       for bench in record.get("benchmarks", [])):
+                    copy_nyann_request_files(config, pod_name, record, campaign_dir, stable=True)
             write_summary(campaign_dir, summary)
     finally:
         deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
@@ -2243,6 +2354,7 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
                         data["dashboard"] = None
                         missing_monitoring.append(data["directory"].name)
         nyann_specs = [bench for bench in config["benchmarks"] if bench["tool"] == "nyann"]
+        missing_nyann_metrics = []
         if nyann_specs:
             spec = nyann_specs[0]
             for record in summary.get("overlays", []):
@@ -2257,11 +2369,23 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
                     if not measurements:
                         continue
                     nyann_result = {"tool": "nyann", "measurements": measurements}
+                folder = campaign_dir / record["name"]
+                log_path = folder / "nyann-live.log"
+                if not log_path.is_file():
+                    log_path = folder / "nyann-job.log"
+                if log_path.is_file():
+                    log = log_path.read_text(errors="replace")
+                    try:
+                        files = copy_nyann_request_files(config, pod_name, record, campaign_dir,
+                                                         stable=nyann_result.get("status") == "completed")
+                        enrich_nyann_request_metrics(nyann_result["measurements"], log,
+                                                     spec["concurrencies"], spec["duration_seconds"], files)
+                    except Exception as exc:
+                        missing_nyann_metrics.append(f"{record['name']}: {exc}")
+                if not all("time_per_output_token" in item["metrics"]
+                           for item in nyann_result["measurements"]):
+                    missing_nyann_metrics.append(f"{record['name']}: TPOT waits for complete request records")
                 if monitoring:
-                    folder = campaign_dir / record["name"]
-                    log_path = folder / "nyann-live.log"
-                    if not log_path.is_file():
-                        log_path = folder / "nyann-job.log"
                     try:
                         if not log_path.is_file():
                             raise RuntimeError("Nyann Job log is unavailable")
@@ -2280,6 +2404,8 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
                    if (path := Path(line)).parent.name in labels}
         progress = preview_progress(config, campaign_dir, summary, completed, started)
         notice = progress + AIPERF_REPORT.nyann_setup(config, campaign_dir)
+        if missing_nyann_metrics:
+            notice += ('<p class="campaign-note">' + html.escape("; ".join(missing_nyann_metrics)) + '</p>')
         if missing_monitoring:
             samples = ", ".join(html.escape(name) for name in missing_monitoring)
             notice += (f'<p class="campaign-note">{samples}: no vLLM monitoring was recorded. '
@@ -2385,8 +2511,22 @@ def report_local(config: dict[str, Any], output: Path) -> int:
         raise ValueError("campaign is still running; use preview-local until it finishes")
     summary.setdefault("source_ref", config["source"]["ref"])
     summary.setdefault("planned_deployments", len(config["overlays"]) * len(config.get("builds", [None])))
+    nyann_spec = next((bench for bench in config["benchmarks"] if bench["tool"] == "nyann"), None)
+    if nyann_spec:
+        for record in summary["overlays"]:
+            folder = campaign_dir / record["name"]
+            log_path = folder / "nyann-job.log"
+            if not log_path.is_file():
+                continue
+            log = log_path.read_text(errors="replace")
+            files = sorted((folder / "nyann-requests").glob("requests_*.jsonl"))
+            for bench in record.get("benchmarks", []):
+                if bench.get("tool") == "nyann" and bench.get("measurements"):
+                    if bench.get("status") == "completed":
+                        bench["measurements"] = nyann_measurements(log, nyann_spec["concurrencies"])
+                    enrich_nyann_request_metrics(bench["measurements"], log,
+                                                 nyann_spec["concurrencies"], nyann_spec["duration_seconds"], files)
     if "monitoring" in config:
-        nyann_spec = next((bench for bench in config["benchmarks"] if bench["tool"] == "nyann"), None)
         for record in summary["overlays"]:
             for bench in record.get("benchmarks", []):
                 if not bench.get("measurements"):
@@ -2400,6 +2540,7 @@ def report_local(config: dict[str, Any], output: Path) -> int:
                     export_nyann_monitoring(config, folder, record["serving_pods"],
                                             bench["measurements"], log_path.read_text(errors="replace"),
                                             nyann_spec)
+    write_summary(campaign_dir, summary)
     write_final_report(campaign_dir, summary)
     print(f"Final report: {campaign_dir / 'index.html'}")
     return 0

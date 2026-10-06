@@ -301,6 +301,13 @@ this monitoring addition. Each completed stage is scraped over its measured
 start/end timestamps (or its configured duration while the final summary is
 still pending); cached dashboards make later refreshes faster. Apply the
 PodMonitor before the benchmark so the historical vLLM series exist in Grafana.
+Nyann's JSON stage summary supplies TTFT, ITL, and end-to-end latency. The
+report also reads its request JSONL to calculate client-side TPOT per completed
+request as `(E2E − TTFT) / (output tokens − 1)`, excluding requests crossing
+stage boundaries and requests with fewer than two output tokens. The cluster
+download copies those JSONL files in checked chunks; completed stages gain
+TPOT once their request records are complete. The Nyann chart defaults to TPOT
+versus output throughput when all plotted stages have TPOT.
 
 The orchestrator applies one serving overlay at a time and submits the AIPerf
 and nyann Jobs to the cluster. A temporary Pod mounts `results_pvc` so completed
