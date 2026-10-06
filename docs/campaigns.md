@@ -143,6 +143,24 @@ Kustomize renderer, but never contacts a Kubernetes API server. To test the
 configured source repo/ref instead, run `python3 campaign/run.py test-local
 <config> --output <new-directory>` without `--source-dir`.
 
+## Run from this checkout
+
+With `KUBECONFIG` set to the target cluster, run the live campaign from the
+local checkout without publishing a runner image:
+
+```bash
+export KUBECONFIG=~/.kube/config.kermit
+just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
+open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-main-001/index.html
+```
+
+The orchestrator applies one serving overlay at a time and submits the AIPerf
+and nyann Jobs to the cluster. A temporary Pod mounts `results_pvc` so completed
+benchmark artifacts can be copied into the local output directory. The final
+HTML and summary are written locally; the temporary Pod is removed at the end.
+Choose a new campaign ID and an output directory that does not yet exist for
+each run.
+
 For a legacy single-overlay campaign without top-level
 `builds`, an overlay may still have its own `build` field:
 

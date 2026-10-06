@@ -20,7 +20,7 @@ import time
 import tempfile
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -773,7 +773,8 @@ def export_campaign_monitoring(config: dict[str, Any], artifact: Path, job_name:
 
 
 def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dict[str, Any],
-                     campaign_dir: Path, baseline: list[str], commit: str | None, source_commit: str) -> dict[str, Any]:
+                     campaign_dir: Path, baseline: list[str], commit: str | None, source_commit: str,
+                     artifact_fetcher: Callable[[Path], Path] | None = None) -> dict[str, Any]:
     tool = bench["tool"]
     run_id = f"{config['id']}-{overlay['name']}-{tool}"
     if len(run_id) > 120:
@@ -820,22 +821,24 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
         raise
     if snapshot(config["namespace"], overlay["pod_selector"]) != baseline or build_commit(config["namespace"]) != commit:
         raise RuntimeError(f"{overlay['name']}: serving deployment changed during {tool} benchmark")
-    artifact = f"/workload/{'aiperf-agentx' if tool == 'aiperf' else 'nyann-agentx'}/{run_id}"
-    if not Path(artifact).exists():
+    artifact = Path(f"/workload/{'aiperf-agentx' if tool == 'aiperf' else 'nyann-agentx'}/{run_id}")
+    if artifact_fetcher is not None:
+        artifact = artifact_fetcher(artifact)
+    if not artifact.exists():
         raise RuntimeError(f"{job_name} completed without expected artifacts: {artifact}")
     measurements = []
     monitoring_error = None
     if tool == "aiperf":
-        measurements = aiperf_measurements(Path(artifact), run_id, bench["concurrencies"])
+        measurements = aiperf_measurements(artifact, run_id, bench["concurrencies"])
         try:
-            export_campaign_monitoring(config, Path(artifact), job_name, baseline, measurements)
+            export_campaign_monitoring(config, artifact, job_name, baseline, measurements)
         except Exception as exc:
             monitoring_error = f"Grafana export failed: {exc}"
     else:
         log = kube(config["namespace"], "logs", f"job/{job_name}").stdout
         (campaign_dir / "nyann-job.log").write_text(log)
         measurements = nyann_measurements(log, bench["concurrencies"])
-    result = {"tool": tool, "job": job_name, "run_id": run_id, "artifacts": artifact,
+    result = {"tool": tool, "job": job_name, "run_id": run_id, "artifacts": str(artifact),
             "report": f"{artifact}/index.html" if tool == "aiperf" else None,
             "measurements": measurements, "status": "failed" if monitoring_error else "completed"}
     if monitoring_error:
@@ -1218,7 +1221,8 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
             shutil.rmtree(overlay_root)
 
 
-def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
+def run(config: dict[str, Any], results_root: Path = Path("/workload"),
+        artifact_fetcher: Callable[[Path], Path] | None = None) -> int:
     destination = results_root / "campaigns" / config["id"]
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "campaign.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -1326,7 +1330,11 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
             (folder / "serving-pods.json").write_text(kube(config["namespace"], "get", "pods", "-l", overlay["pod_selector"], "-o", "json").stdout)
             for bench in config["benchmarks"]:
                 try:
-                    result = submit_benchmark(config, overlay, bench, folder, baseline, commit, source_commit)
+                    if artifact_fetcher is None:
+                        result = submit_benchmark(config, overlay, bench, folder, baseline, commit, source_commit)
+                    else:
+                        result = submit_benchmark(config, overlay, bench, folder, baseline, commit, source_commit,
+                                                  artifact_fetcher)
                 except Exception as exc:
                     result = {"tool": bench["tool"], "status": "failed", "error": str(exc)}
                     if isinstance(exc, CleanupError):
@@ -1375,6 +1383,40 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
     return 1 if failed else 0
 
 
+def run_local(config: dict[str, Any], output: Path) -> int:
+    """Orchestrate with local kubectl; copy Job artifacts from the shared PVC."""
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    namespace = config["namespace"]
+    pod_name = "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
+    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": pod_name, "namespace": namespace,
+           "labels": {"app.kubernetes.io/name": "benchmark-campaign-artifacts"}},
+           "spec": {"restartPolicy": "Always", "containers": [{"name": "artifacts",
+           "image": "docker.io/library/alpine:3.20", "command": ["sleep", "86400"],
+           "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                         "limits": {"cpu": "500m", "memory": "256Mi"}},
+           "volumeMounts": [{"name": "results", "mountPath": "/workload"}]}],
+           "volumes": [{"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}
+    kube(namespace, "get", "localqueue", config["benchmark_queue"])
+    kube(namespace, "get", "pvc", config["results_pvc"])
+    kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
+    try:
+        kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
+
+        def fetch(artifact: Path) -> Path:
+            destination = output / artifact.relative_to("/workload")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            kube(namespace, "cp", f"{pod_name}:{artifact}", str(destination))
+            return destination
+
+        return run(config, output, artifact_fetcher=fetch)
+    finally:
+        deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
+                       f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
+        if deleted.returncode:
+            raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
+
+
 def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     namespace, campaign_id = config["namespace"], config["id"]
     required_name(service_account, "service_account")
@@ -1419,7 +1461,7 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "submit", "run", "test-local"])
+    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
@@ -1440,6 +1482,10 @@ def main() -> int:
             if args.output is None:
                 raise ValueError("--output is required for test-local")
             return test_local(config, args.output, args.source_dir)
+        if args.action == "run-local":
+            if args.output is None:
+                raise ValueError("--output is required for run-local")
+            return run_local(config, args.output)
         return run(config)
     except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         print(f"campaign: {exc}", file=sys.stderr)

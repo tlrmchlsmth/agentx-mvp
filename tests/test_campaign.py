@@ -225,6 +225,36 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(failed["status"], "failed")
             self.assertIn("no LeaderWorkerSet vllm container", failed["overlays"][0]["error"])
 
+    def test_live_local_runner_copies_pvc_artifacts_and_removes_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            output = root / "live-output"
+            actions = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                self.assertEqual(namespace, "vllm")
+                actions.append(args[0])
+                if args[0] == "create":
+                    pod = json.loads(kwargs["input_text"])
+                    self.assertEqual(pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"], "results")
+                if args[0] == "cp":
+                    Path(args[2]).mkdir()
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+            def fake_run(value, results_root, artifact_fetcher=None):
+                self.assertEqual(results_root, output.resolve())
+                self.assertIsNotNone(artifact_fetcher)
+                copied = artifact_fetcher(Path("/workload/aiperf-agentx/sample"))
+                self.assertEqual(copied, output.resolve() / "aiperf-agentx/sample")
+                self.assertTrue(copied.is_dir())
+                return 0
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "run", side_effect=fake_run):
+                self.assertEqual(runner.run_local(config, output), 0)
+            self.assertEqual(actions, ["get", "get", "create", "wait", "cp", "delete"])
+
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

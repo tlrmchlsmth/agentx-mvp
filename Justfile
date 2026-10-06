@@ -82,6 +82,10 @@ campaign-validate config:
 campaign-test-local config source_dir output:
     python3 "{{repo_root}}/campaign/run.py" test-local "{{config}}" --source-dir "{{source_dir}}" --output "{{output}}"
 
+# Orchestrate against the cluster from this checkout; keep the report locally.
+campaign-run-local config output:
+    python3 "{{repo_root}}/campaign/run.py" run-local "{{config}}" --output "{{output}}"
+
 campaign-submit config:
     python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}"
 
