@@ -258,7 +258,7 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ValueError("concurrencies must contain 1-32 values")
         for value in values:
             bounded_int(value, "concurrency", 1, 2048 if tool == "aiperf" else 16384)
-        bounded_int(bench["duration_seconds"], "duration_seconds", 60 if tool == "aiperf" else 1, 7200)
+        bounded_int(bench["duration_seconds"], "duration_seconds", 900 if tool == "aiperf" else 1, 7200)
         if tool == "nyann":
             for key in ("isl", "osl"):
                 bounded_int(bench[key], key, 1, 1000000)

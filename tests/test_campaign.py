@@ -34,7 +34,7 @@ class CampaignTests(unittest.TestCase):
             "overlays": [{"name": name, "path": name, "model_label": "test-model",
                           "pod_selector": "app=test-model", "expected_pods": 2}
                          for name in ("baseline", "candidate")],
-            "benchmarks": [{"tool": "aiperf", "concurrencies": [1, 4], "duration_seconds": 60}],
+            "benchmarks": [{"tool": "aiperf", "concurrencies": [1, 4], "duration_seconds": 900}],
         }
 
     def test_rejects_namespace_escape_and_existing_resources(self):
@@ -45,6 +45,11 @@ class CampaignTests(unittest.TestCase):
             config["overlays"][0]["path"] = "../elsewhere"
             path.write_text(json.dumps(config))
             with self.assertRaisesRegex(ValueError, "relative"):
+                runner.load_config(path)
+            config["overlays"][0]["path"] = "baseline"
+            config["benchmarks"][0]["duration_seconds"] = 600
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "duration_seconds"):
                 runner.load_config(path)
             with self.assertRaisesRegex(ValueError, "cluster-scoped"):
                 runner.validate_manifest("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: vllm\n", "vllm")
@@ -793,7 +798,7 @@ class CampaignTests(unittest.TestCase):
                         "LIVE_BENCHMARK_SOURCE_REF": "feature/bench",
                         "LIVE_BENCHMARK_SOURCE_COMMIT": "a" * 40,
                         "LIVE_BENCHMARK_SOURCE_KIND": "llm-d", "MODEL_LABEL": "test-model"})
-            for script, args in (("live-aiperf/submit.sh", ["1", "60"]),
+            for script, args in (("live-aiperf/submit.sh", ["1", "900"]),
                                  ("live-nyann/submit.sh", ["1", "1024", "512", "60", "0"])):
                 result = subprocess.run(["bash", str(MODULE_PATH.parents[1] / script), *args],
                                         env=env, text=True, capture_output=True)

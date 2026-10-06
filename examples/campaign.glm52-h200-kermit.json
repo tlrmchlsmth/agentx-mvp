@@ -1,5 +1,5 @@
 {
-  "id": "glm52-h200-pd-nightly-007",
+  "id": "glm52-h200-pd-nightly-008",
   "namespace": "ecrncevi-glm52-campaign",
   "source": {
     "repo": "https://github.com/llm-d/llm-d.git",
@@ -60,7 +60,7 @@
     {
       "tool": "aiperf",
       "concurrencies": [1, 8, 32, 64],
-      "duration_seconds": 600
+      "duration_seconds": 900
     },
     {
       "tool": "nyann",

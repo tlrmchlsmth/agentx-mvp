@@ -15,7 +15,7 @@ CONCURRENCY="${1:-}"
 DURATION="${2:-900}"
 IFS=',' read -r -a SWEEP_CONCURRENCIES <<< "$CONCURRENCY"
 if (( ${#SWEEP_CONCURRENCIES[@]} == 0 )); then
-  echo "usage: $0 <concurrency|comma-separated-sweep> [duration_seconds 60-7200]" >&2
+  echo "usage: $0 <concurrency|comma-separated-sweep> [duration_seconds 900-7200]" >&2
   exit 2
 fi
 for sweep_concurrency in "${SWEEP_CONCURRENCIES[@]}"; do
@@ -24,8 +24,8 @@ for sweep_concurrency in "${SWEEP_CONCURRENCIES[@]}"; do
     exit 2
   fi
 done
-if [[ ! "$DURATION" =~ ^[1-9][0-9]*$ ]] || (( DURATION < 60 || DURATION > 7200 )); then
-  echo "usage: $0 <concurrency 1-2048> [duration_seconds 60-7200]" >&2
+if [[ ! "$DURATION" =~ ^[1-9][0-9]*$ ]] || (( DURATION < 900 || DURATION > 7200 )); then
+  echo "usage: $0 <concurrency 1-2048> [duration_seconds 900-7200]" >&2
   exit 2
 fi
 

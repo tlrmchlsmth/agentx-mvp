@@ -121,7 +121,8 @@ performance. The standalone router's InferencePool must select
 `llm-d.ai/inference-serving=true` and `llm-d.ai/model=GLM-5.2-FP8` so cache
 evictor Pods are not treated as model endpoints. The sample also sets
 `VLLM_SERVER_DEV_MODE=1` on both roles so AIPerf can reset each vLLM prefix
-cache before every concurrency run. For other campaigns,
+cache before every concurrency run. AIPerf uses the `inferencex-agentx-mvp`
+scenario, which requires at least 900 seconds per concurrency sample. For other campaigns,
 the generic source script uses
 precompiled native libraries from the pinned first source commit; branch sets
 that change native C++/CUDA code need an overlay-specific full build recipe.
@@ -160,7 +161,7 @@ local checkout without publishing a runner image:
 ```bash
 export KUBECONFIG=~/.kube/config.kermit
 just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
-open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-007/index.html
+open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-008/index.html
 ```
 
 The orchestrator applies one serving overlay at a time and submits the AIPerf
