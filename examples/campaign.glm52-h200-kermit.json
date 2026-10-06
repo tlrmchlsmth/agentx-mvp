@@ -1,5 +1,5 @@
 {
-  "id": "glm52-h200-pd-nightly-main-001",
+  "id": "glm52-h200-pd-nightly-002",
   "namespace": "ecrncevi-glm52-campaign",
   "source": {
     "repo": "https://github.com/llm-d/llm-d.git",
@@ -7,19 +7,6 @@
   },
   "vllm_image": "docker.io/vllm/vllm-openai:nightly",
   "base_url": "http://wide-ep-epp.ecrncevi-glm52-campaign.svc.cluster.local/v1",
-  "build_repo": "https://github.com/vllm-project/vllm.git",
-  "builds": [
-    {
-      "name": "nightly",
-      "steps": []
-    },
-    {
-      "name": "upstream-main",
-      "steps": [
-        {"action": "checkout", "ref": "main"}
-      ]
-    }
-  ],
   "results_pvc": "workload-pvc",
   "benchmark_queue": "live-benchmark-client",
   "campaign_queue": "benchmark-campaign",

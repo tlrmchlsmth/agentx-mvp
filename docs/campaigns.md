@@ -111,9 +111,10 @@ wheel. The saved `serving-pods.json` records the image ID used by each deploymen
 `examples/campaign.kimi-nightly.example.json` shows a concrete Kimi aggregate
 overlay using `vllm/vllm-openai:nightly`; set its llm-d fork/ref and cluster
 PVC and queues before submitting.
-`examples/campaign.glm52-h200-kermit.json` compares nightly with pinned upstream
-vLLM `main` across two GLM 5.2 prefill/decode DisaggregatedSet overlays. Its
-nightly variant only replaces the images. The generic source script uses
+`examples/campaign.glm52-h200-kermit.json` runs the configured vLLM nightly
+image across two GLM 5.2 prefill/decode DisaggregatedSet overlays. It replaces
+both role images without a source build or DeepEP override. For other campaigns,
+the generic source script uses
 precompiled native libraries from the pinned first source commit; branch sets
 that change native C++/CUDA code need an overlay-specific full build recipe.
 DeepEP stays as shipped in the image unless `deepep` is specified explicitly.
@@ -151,7 +152,7 @@ local checkout without publishing a runner image:
 ```bash
 export KUBECONFIG=~/.kube/config.kermit
 just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
-open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-main-001/index.html
+open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-002/index.html
 ```
 
 The orchestrator applies one serving overlay at a time and submits the AIPerf
