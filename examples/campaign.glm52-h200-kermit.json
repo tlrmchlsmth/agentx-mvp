@@ -1,0 +1,74 @@
+{
+  "id": "glm52-h200-pd-nightly-main-001",
+  "namespace": "ecrncevi-glm52-campaign",
+  "source": {
+    "repo": "https://github.com/llm-d/llm-d.git",
+    "ref": "main"
+  },
+  "vllm_image": "docker.io/vllm/vllm-openai:nightly",
+  "build_repo": "https://github.com/vllm-project/vllm.git",
+  "builds": [
+    {
+      "name": "nightly",
+      "steps": []
+    },
+    {
+      "name": "upstream-main",
+      "steps": [
+        {"action": "checkout", "ref": "main"}
+      ]
+    }
+  ],
+  "results_pvc": "workload-pvc",
+  "benchmark_queue": "live-benchmark-client",
+  "campaign_queue": "benchmark-campaign",
+  "rollout_timeout_seconds": 5400,
+  "admission_timeout_seconds": 3600,
+  "cleanup_timeout_seconds": 900,
+  "continue_on_failure": false,
+  "overlays": [
+    {
+      "name": "pd-p1w1d1w1",
+      "path": "guides/wide-ep/modelserver/gpu/vllm-glm-5.2/deployments/p1w1d1w1",
+      "model_label": "GLM-5.2-FP8",
+      "pod_selector": "llm-d.ai/model=GLM-5.2-FP8,llm-d.ai/inference-serving=true",
+      "expected_pods": 2,
+      "dimensions": {
+        "topology": "pd",
+        "prefill_nodes": 1,
+        "decode_nodes": 1,
+        "mtp": "on",
+        "offloading": "off"
+      }
+    },
+    {
+      "name": "pd-p1w1d1w2",
+      "path": "guides/wide-ep/modelserver/gpu/vllm-glm-5.2/deployments/p1w1d1w2",
+      "model_label": "GLM-5.2-FP8",
+      "pod_selector": "llm-d.ai/model=GLM-5.2-FP8,llm-d.ai/inference-serving=true",
+      "expected_pods": 3,
+      "dimensions": {
+        "topology": "pd",
+        "prefill_nodes": 1,
+        "decode_nodes": 2,
+        "mtp": "on",
+        "offloading": "off"
+      }
+    }
+  ],
+  "benchmarks": [
+    {
+      "tool": "aiperf",
+      "concurrencies": [1, 8, 32, 64],
+      "duration_seconds": 600
+    },
+    {
+      "tool": "nyann",
+      "concurrencies": [1, 8, 32, 64],
+      "duration_seconds": 600,
+      "isl": 1024,
+      "osl": 512,
+      "warmup_seconds": 60
+    }
+  ]
+}
