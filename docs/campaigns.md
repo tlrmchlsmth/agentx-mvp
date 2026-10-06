@@ -83,6 +83,17 @@ must never use that queue or it could block its own children.
    while preserving its AIPerf measurements. Omit `monitoring` when no Grafana
    export is wanted.
 
+   For `run-local`, Grafana may live in another namespace. Use
+   `grafana_namespace`, `grafana_service`, `auth_secret`, and `dashboard_uid`
+   instead of `grafana_url`. The runner reads the named Secret, opens a temporary
+   service port-forward during export, and closes it afterward. The GLM 5.2
+   example uses this form. Apply its PodMonitor before the benchmark so
+   Prometheus collects both prefill and decode metrics:
+
+   ```bash
+   kubectl apply -f examples/campaign.glm52-h200-podmonitor.yaml
+   ```
+
 ```bash
 export NAMESPACE=vllm
 export CAMPAIGN_IMAGE=quay.io/your-org/benchmark-orchestrator:<immutable-tag>
@@ -179,7 +190,8 @@ open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-009/preview/index.
 
 The command uses the active campaign's artifact Pod to copy finished samples
 from the results PVC, then regenerates `preview/index.html` with the existing
-AIPerf chart renderer. Run it again to refresh the preview. It leaves the live
+AIPerf chart renderer. With `monitoring` configured it also runs the existing
+Grafana exporter for those samples. Run it again to refresh the preview. It leaves the live
 campaign and its final `index.html` untouched. Before the first sample finishes,
 it reports that no preview is available.
 

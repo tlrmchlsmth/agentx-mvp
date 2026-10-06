@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter
+from contextlib import contextmanager
 import copy
 import csv
 import hashlib
@@ -14,10 +16,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
 import tempfile
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -120,14 +125,20 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ValueError("base_url must be an HTTP(S) model API URL ending in /v1 without credentials")
     if "monitoring" in config:
         monitoring = config["monitoring"]
-        if not isinstance(monitoring, dict) or set(monitoring) != {"grafana_url", "auth_secret", "dashboard_uid"}:
-            raise ValueError("monitoring needs grafana_url, auth_secret, and dashboard_uid")
-        url = monitoring["grafana_url"]
-        if not isinstance(url, str) or len(url) > 512:
-            raise ValueError("monitoring.grafana_url must be an HTTP(S) URL")
-        parsed = urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("monitoring.grafana_url must be an HTTP(S) URL without credentials")
+        remote_keys = {"grafana_url", "auth_secret", "dashboard_uid"}
+        local_keys = {"grafana_namespace", "grafana_service", "auth_secret", "dashboard_uid"}
+        if not isinstance(monitoring, dict) or set(monitoring) not in (remote_keys, local_keys):
+            raise ValueError("monitoring needs either grafana_url or grafana_namespace/grafana_service, plus auth_secret and dashboard_uid")
+        if "grafana_url" in monitoring:
+            url = monitoring["grafana_url"]
+            if not isinstance(url, str) or len(url) > 512:
+                raise ValueError("monitoring.grafana_url must be an HTTP(S) URL")
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError("monitoring.grafana_url must be an HTTP(S) URL without credentials")
+        else:
+            required_name(monitoring["grafana_namespace"], "monitoring.grafana_namespace")
+            required_name(monitoring["grafana_service"], "monitoring.grafana_service")
         required_name(monitoring["auth_secret"], "monitoring.auth_secret")
         uid = monitoring["dashboard_uid"]
         if not isinstance(uid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", uid):
@@ -826,32 +837,75 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
     return measurements
 
 
+@contextmanager
+def grafana_connection(monitoring: dict[str, str]):
+    """Use configured in-cluster URL or a short-lived local service tunnel."""
+    if "grafana_url" in monitoring:
+        user = os.environ.get("CAMPAIGN_GRAFANA_USER")
+        password = os.environ.get("CAMPAIGN_GRAFANA_PASSWORD")
+        if not user or not password:
+            raise RuntimeError("Grafana credentials from monitoring.auth_secret are unavailable")
+        yield monitoring["grafana_url"], f"{user}:{password}"
+        return
+    namespace = monitoring["grafana_namespace"]
+    secret = json.loads(kube(namespace, "get", "secret", monitoring["auth_secret"], "-o", "json").stdout)
+    try:
+        user = base64.b64decode(secret["data"]["admin-user"]).decode()
+        password = base64.b64decode(secret["data"]["admin-password"]).decode()
+    except (KeyError, ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Grafana Secret needs admin-user and admin-password") from exc
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    forward = subprocess.Popen(
+        ["kubectl", "-n", namespace, "port-forward", f"svc/{monitoring['grafana_service']}", f"{port}:80"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    url = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(60):
+            if forward.poll() is not None:
+                raise RuntimeError("Grafana port-forward exited before becoming ready")
+            try:
+                with urllib.request.urlopen(url + "/api/health", timeout=1):
+                    break
+            except (OSError, urllib.error.URLError):
+                time.sleep(0.25)
+        else:
+            raise RuntimeError("Grafana port-forward did not become ready")
+        yield url, f"{user}:{password}"
+    finally:
+        forward.terminate()
+        try:
+            forward.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            forward.kill()
+            forward.wait()
+
+
 def export_campaign_monitoring(config: dict[str, Any], artifact: Path, job_name: str,
                                baseline: list[str], measurements: list[dict[str, Any]]) -> None:
     """Use the existing Grafana exporter on the completed AIPerf sweep."""
     monitoring = config.get("monitoring")
     if not monitoring:
         return
-    user = os.environ.get("CAMPAIGN_GRAFANA_USER")
-    password = os.environ.get("CAMPAIGN_GRAFANA_PASSWORD")
-    if not user or not password:
-        raise RuntimeError("Grafana credentials from monitoring.auth_secret are unavailable")
     log = kube(config["namespace"], "logs", f"job/{job_name}", "--timestamps=true").stdout
     log_path = artifact / "aiperf-job.log"
     log_path.write_text(log)
     names = [entry.split(":", 1)[0] for entry in baseline]
     if not names:
         raise RuntimeError("Grafana export needs the saved serving Pod names")
-    env = os.environ.copy()
-    env["CAMPAIGN_GRAFANA_AUTH"] = f"{user}:{password}"
     directories = [artifact / measurement["sample"] for measurement in measurements]
-    command = [sys.executable, str(ROOT / "export_dashboard.py"),
-               "--grafana-url", monitoring["grafana_url"], "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
-               "--dashboard", monitoring["dashboard_uid"],
-               "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
-               "--aiperf-log", str(log_path), "--pod-regex", "|".join(re.escape(name) for name in names),
-               "results", *(str(directory) for directory in directories), "--pad", "0"]
-    output = call(command, env=env).stdout
+    with grafana_connection(monitoring) as (url, auth):
+        env = os.environ.copy()
+        env["CAMPAIGN_GRAFANA_AUTH"] = auth
+        command = [sys.executable, str(ROOT / "export_dashboard.py"),
+                   "--grafana-url", url, "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
+                   "--dashboard", monitoring["dashboard_uid"],
+                   "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
+                   "--aiperf-log", str(log_path), "--pod-regex", "|".join(re.escape(name) for name in names),
+                   "results", *(str(directory) for directory in directories), "--pad", "0"]
+        output = call(command, env=env).stdout
     (artifact / "grafana-export.log").write_text(output)
     if any(not (directory / "dashboard.html").is_file() or not (directory / "dashboard.html").stat().st_size
            for directory in directories):
@@ -1515,7 +1569,11 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
     """Render completed AIPerf samples from an active run-local campaign."""
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     saved_config = campaign_dir / "campaign.json"
-    if not saved_config.is_file() or json.loads(saved_config.read_text()) != config:
+    if not saved_config.is_file():
+        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    saved = json.loads(saved_config.read_text())
+    if {key: value for key, value in saved.items() if key != "monitoring"} != \
+            {key: value for key, value in config.items() if key != "monitoring"}:
         raise ValueError(f"{campaign_dir} does not match this campaign configuration")
     summary = json.loads((campaign_dir / "summary.json").read_text())
     if summary["status"] != "running":
@@ -1544,6 +1602,7 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
     preview = campaign_dir / "preview"
     preview.mkdir(exist_ok=True)
     runs = []
+    groups: dict[str, list[Path]] = {}
     with tempfile.TemporaryDirectory(prefix="campaign-preview-") as temporary:
         for path in sorted(paths):
             sample = Path(temporary) / path.parent.parent.name / path.parent.name
@@ -1552,12 +1611,41 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
             data = AIPERF_REPORT.run_data(sample)
             if data is None or not data["profile"]:
                 continue  # The writer may still be finishing this sample.
+            groups.setdefault(path.parent.parent.name, []).append(sample)
             data["metadata"].update({"campaign_label": labels[path.parent.parent.name],
                                      "vllm_image": config["vllm_image"]})
             runs.append(data)
         if not runs:
             print("No complete AIPerf profiles yet; preview HTML was not created")
             return 0
+        monitoring = config.get("monitoring")
+        if monitoring:
+            with grafana_connection(monitoring) as (url, auth):
+                for run_id, samples in groups.items():
+                    folder = campaign_dir / labels[run_id]
+                    submission = (folder / "aiperf-submit.log").read_text()
+                    match = JOB_LINE.search(submission)
+                    if match is None:
+                        raise RuntimeError(f"Missing AIPerf Job name for {run_id}")
+                    pods = json.loads((folder / "serving-pods.json").read_text())["items"]
+                    names = [item["metadata"]["name"] for item in pods]
+                    log_path = Path(temporary) / (run_id + ".log")
+                    log_path.write_text(kube(namespace, "logs", f"job/{match.group(1)}",
+                                             "--timestamps=true").stdout)
+                    env = os.environ.copy()
+                    env["CAMPAIGN_GRAFANA_AUTH"] = auth
+                    call([sys.executable, str(ROOT / "export_dashboard.py"),
+                          "--grafana-url", url, "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
+                          "--dashboard", monitoring["dashboard_uid"],
+                          "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
+                          "--aiperf-log", str(log_path),
+                          "--pod-regex", "|".join(re.escape(name) for name in names),
+                          "results", *(str(sample) for sample in samples), "--pad", "0"], env=env)
+                for data in runs:
+                    dashboard = data["directory"] / "dashboard.html"
+                    if not dashboard.is_file():
+                        raise RuntimeError(f"Grafana export did not create {dashboard}")
+                    data["dashboard"] = dashboard.read_bytes()
         notice = (f"<p>In-progress preview: {len(runs)} completed AIPerf samples. "
                   "Unfinished samples and nyann results are not included.</p>")
         AIPERF_REPORT.write_index_from_runs(preview, runs, extra_html=notice,
@@ -1569,6 +1657,8 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
 
 def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     namespace, campaign_id = config["namespace"], config["id"]
+    if "monitoring" in config and "grafana_service" in config["monitoring"]:
+        raise ValueError("monitoring.grafana_service is for run-local; use grafana_url and a namespace-local Secret for submit")
     required_name(service_account, "service_account")
     if not image or any(char.isspace() for char in image):
         raise ValueError("image must be a container image reference")

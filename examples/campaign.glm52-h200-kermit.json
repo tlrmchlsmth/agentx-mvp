@@ -6,6 +6,12 @@
     "ref": "main"
   },
   "vllm_image": "docker.io/vllm/vllm-openai:nightly",
+  "monitoring": {
+    "grafana_namespace": "llm-d-monitoring",
+    "grafana_service": "llmd-grafana",
+    "auth_secret": "llmd-grafana",
+    "dashboard_uid": "wideep-overview"
+  },
   "base_url": "http://wide-ep-epp.ecrncevi-glm52-campaign.svc.cluster.local/v1",
   "results_pvc": "workload-pvc",
   "benchmark_queue": "live-benchmark-client",

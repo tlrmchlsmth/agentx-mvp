@@ -38,6 +38,21 @@ class CampaignTests(unittest.TestCase):
                             "max_context_length": 131072}],
         }
 
+    def test_local_grafana_service_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["monitoring"] = {"grafana_namespace": "llm-d-monitoring",
+                                    "grafana_service": "llmd-grafana",
+                                    "auth_secret": "llmd-grafana",
+                                    "dashboard_uid": "wideep-overview"}
+            path = root / "campaign.json"
+            path.write_text(json.dumps(config))
+            loaded = runner.load_config(path)
+            self.assertEqual(loaded["monitoring"], config["monitoring"])
+            with self.assertRaisesRegex(ValueError, "for run-local"):
+                runner.submit(loaded, "runner:test", "benchmark-campaign")
+
     def test_rejects_namespace_escape_and_existing_resources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
