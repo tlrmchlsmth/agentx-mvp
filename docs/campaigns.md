@@ -112,21 +112,22 @@ or push is needed. Set `CAMPAIGN_IMAGE` only to use another existing runtime.
 
 After submitting, the terminal can close and the laptop can sleep. Check the
 cluster Job with `kubectl -n "$NAMESPACE" get job campaign-<id>` or read its
-logs with `kubectl -n "$NAMESPACE" logs job/campaign-<id>`. Once it finishes,
-download the PVC results and rebuild the standalone HTML with:
+logs with `kubectl -n "$NAMESPACE" logs job/campaign-<id>`. At any point,
+download a single HTML snapshot from the PVC with:
 
 ```bash
 export KUBECONFIG=~/.kube/config.kermit
 just campaign-download-cluster examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-results
 ```
 
-The command prints and saves `~/Downloads/<id>-latest.html`. It downloads the
-campaign state and only the AIPerf inputs needed by the existing report
-generator, using resumable checked chunks. If the JSON uses a Grafana service
-in another namespace, it backfills its dashboards from the laptop during this
-download. The download command reports when the cluster Job is still running;
-rerun it after completion. The benchmark and overlay work continues in the
-cluster independently of the laptop.
+The command prints and saves `~/Downloads/<id>-latest.html`. While the Job is
+running, it captures campaign status, individual Nyann stage progress, and
+completed AIPerf samples through the existing preview renderer; repeat it to refresh
+the file. After completion it downloads the campaign state and the AIPerf
+inputs needed by the final report generator, using resumable checked chunks.
+If the JSON uses a Grafana service in another namespace, dashboards are
+exported from the laptop during the snapshot or final download. Benchmark and
+overlay work continues in the cluster independently of the laptop.
 
 The example fork URL, branch, overlay paths, and model label are placeholders;
 edit them for the actual deployment before submitting. `campaign-validate`

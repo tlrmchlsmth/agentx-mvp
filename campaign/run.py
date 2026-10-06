@@ -1824,40 +1824,52 @@ def download_cluster_report(config: dict[str, Any], output: Path,
     kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
     try:
         kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
-        # Read the status before downloading a tree whose files may still be changing.
+        # Copy only stable files while a runner is writing its campaign tree.
         remote_summary = json.loads(kube(namespace, "exec", pod_name, "--", "cat",
                                          str(remote_campaign / "summary.json")).stdout)
         if remote_summary["status"] == "running":
-            raise RuntimeError(f"Campaign {config['id']} is still running; check job/campaign-{config['id']} "
-                               "and retry after it finishes")
-        TRANSFER.download_tree(namespace, pod_name, str(remote_campaign), campaign_dir)
-        summary = json.loads((campaign_dir / "summary.json").read_text())
-        if summary["status"] == "running":
-            raise RuntimeError(f"Campaign {config['id']} changed during download; retry after it finishes")
-        for record in summary.get("overlays", []):
-            for bench in record.get("benchmarks", []):
-                if bench.get("tool") != "aiperf" or not bench.get("measurements"):
-                    continue
-                remote_artifact = Path(bench["artifacts"])
-                if remote_artifact.parent != Path("/workload/aiperf-agentx") or not remote_artifact.name.startswith(config["id"] + "-"):
-                    raise RuntimeError(f"Unexpected AIPerf artifact path: {remote_artifact}")
-                local_artifact = output.resolve() / remote_artifact.relative_to("/workload")
-                for measurement in bench["measurements"]:
-                    sample = measurement["sample"]
-                    if not re.fullmatch(r"c[1-9][0-9]*(?:-r[1-9][0-9]*)?", sample):
-                        raise RuntimeError(f"Unexpected AIPerf sample: {sample}")
-                    profile = remote_artifact / sample / "profile_export_aiperf.json"
-                    copy_aiperf_sample(namespace, pod_name, profile, local_artifact)
-                bench["artifacts"] = str(local_artifact)
-                bench["report"] = str(local_artifact / "index.html")
-        write_summary(campaign_dir, summary)
+            campaign_dir.mkdir(parents=True, exist_ok=True)
+            TRANSFER.download_file(namespace, pod_name, str(remote_campaign / "campaign.json"),
+                                   campaign_dir / "campaign.json")
+            write_summary(campaign_dir, remote_summary)
+            for record in remote_summary.get("overlays", []):
+                folder = campaign_dir / record["name"]
+                for filename in ("nyann-submit.log", "aiperf-submit.log", "serving-pods.json"):
+                    remote_file = remote_campaign / record["name"] / filename
+                    exists = kube(namespace, "exec", pod_name, "--", "test", "-f", str(remote_file), check=False)
+                    if exists.returncode == 0:
+                        TRANSFER.download_file(namespace, pod_name, str(remote_file), folder / filename)
+            preview_local(config, output, pod_name=pod_name)
+        else:
+            TRANSFER.download_tree(namespace, pod_name, str(remote_campaign), campaign_dir)
+            summary = json.loads((campaign_dir / "summary.json").read_text())
+            if summary["status"] == "running":
+                raise RuntimeError(f"Campaign {config['id']} changed during download; retry after it finishes")
+            for record in summary.get("overlays", []):
+                for bench in record.get("benchmarks", []):
+                    if bench.get("tool") != "aiperf" or not bench.get("measurements"):
+                        continue
+                    remote_artifact = Path(bench["artifacts"])
+                    if remote_artifact.parent != Path("/workload/aiperf-agentx") or not remote_artifact.name.startswith(config["id"] + "-"):
+                        raise RuntimeError(f"Unexpected AIPerf artifact path: {remote_artifact}")
+                    local_artifact = output.resolve() / remote_artifact.relative_to("/workload")
+                    for measurement in bench["measurements"]:
+                        sample = measurement["sample"]
+                        if not re.fullmatch(r"c[1-9][0-9]*(?:-r[1-9][0-9]*)?", sample):
+                            raise RuntimeError(f"Unexpected AIPerf sample: {sample}")
+                        profile = remote_artifact / sample / "profile_export_aiperf.json"
+                        copy_aiperf_sample(namespace, pod_name, profile, local_artifact)
+                    bench["artifacts"] = str(local_artifact)
+                    bench["report"] = str(local_artifact / "index.html")
+            write_summary(campaign_dir, summary)
     finally:
         deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
         if deleted.returncode:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
-    report_local(config, output)
-    return download_latest_local(config, output, destination)
+    if remote_summary["status"] != "running":
+        report_local(config, output)
+    return download_latest_local(config, output, destination, refresh_running=False)
 
 
 def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[str, Any],
@@ -1885,6 +1897,26 @@ def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[s
                 result = benchmarks.get(tool, {})
                 run_id = f"{config['id']}-{name}-{tool}"
                 if tool == "nyann":
+                    live_log = campaign_dir / name / "nyann-live.log"
+                    if live_log.is_file() and result.get("status") not in {"completed", "skipped"}:
+                        log = live_log.read_text(errors="replace")
+                        started_stages = max((int(value) for value in
+                                              re.findall(r'Stage started" stage=(\d+)/\d+ concurrency=\d+', log)),
+                                             default=0)
+                        finished_stages = min(len(bench["concurrencies"]), len(re.findall(
+                            r"(?m)^\s*\d+\s+\d+\s+\d+\s+\d+\s+[\d.]+\s+", log)))
+                        if started_stages:
+                            for index, concurrency in enumerate(bench["concurrencies"], 1):
+                                if index <= finished_stages:
+                                    status = "completed"
+                                elif index == started_stages:
+                                    status = "running"
+                                elif result.get("status") == "failed":
+                                    status = "failed"
+                                else:
+                                    status = "pending"
+                                add_row(name, tool, f"stage-{index} (c{concurrency})", status)
+                            continue
                     if result.get("status") in {"completed", "failed", "skipped"}:
                         status = result["status"]
                     elif record.get("status") in {"failed", "skipped"}:
@@ -1921,12 +1953,13 @@ def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[s
                     if running else "")
     return (f'<div class="campaign-status">{status_line}'
             f'<time class="campaign-updated">Updated {updated}</time></div>' + running_line +
-            '<details id="campaign-progress" class="campaign-detail"><summary>All configurations</summary>'
+            '<details id="campaign-progress" class="campaign-detail"><summary>Campaign progress</summary>'
             "<table><thead><tr><th>Overlay</th><th>Tool</th><th>Sample</th><th>Status</th></tr></thead><tbody>"
             + "".join(rows) + "</tbody></table></details>")
 
 
-def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = False) -> int:
+def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = False,
+                  pod_name: str | None = None) -> int:
     """Render active and completed work into one portable campaign HTML file."""
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     saved_config = campaign_dir / "campaign.json"
@@ -1940,14 +1973,17 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
     if summary["status"] != "running":
         print(f"Campaign is {summary['status']}; use its final report if available")
         return 0
-    pod_name = "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
+    pod_name = pod_name or "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
     namespace = config["namespace"]
     remote_root = "/workload/aiperf-agentx"
-    listing = kube(namespace, "exec", pod_name, "--", "find", remote_root,
-                   "-mindepth", "3", "-maxdepth", "3", "-type", "f",
-                   "-name", "profile_export_aiperf.json").stdout
-    directories = kube(namespace, "exec", pod_name, "--", "find", remote_root,
-                       "-mindepth", "2", "-maxdepth", "2", "-type", "d").stdout
+    if kube(namespace, "exec", pod_name, "--", "test", "-d", remote_root, check=False).returncode == 0:
+        listing = kube(namespace, "exec", pod_name, "--", "find", remote_root,
+                       "-mindepth", "3", "-maxdepth", "3", "-type", "f",
+                       "-name", "profile_export_aiperf.json").stdout
+        directories = kube(namespace, "exec", pod_name, "--", "find", remote_root,
+                           "-mindepth", "2", "-maxdepth", "2", "-type", "d").stdout
+    else:
+        listing = directories = ""
     labels = {}
     for variant in config.get("builds", [None]):
         for overlay in config["overlays"]:
@@ -1959,6 +1995,17 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         path = Path(line)
         if path.parent.parent.name in labels and path.name == "profile_export_aiperf.json":
             paths.append(path)
+    for record in summary.get("overlays", []):
+        folder = campaign_dir / record["name"]
+        submission = folder / "nyann-submit.log"
+        if not submission.is_file():
+            continue
+        match = JOB_LINE.search(submission.read_text())
+        if match is None:
+            continue
+        logs = kube(namespace, "logs", f"job/{match.group(1)}", "--tail=200", check=False)
+        if logs.returncode == 0:
+            (folder / "nyann-live.log").write_text(logs.stdout)
     preview = campaign_dir / "preview"
     preview.mkdir(exist_ok=True)
     runs = []
@@ -1980,7 +2027,7 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
             runs.append(data)
         monitoring = config.get("monitoring")
         missing_monitoring = []
-        if monitoring:
+        if monitoring and runs:
             with grafana_connection(monitoring) as (url, auth):
                 for run_id, samples in groups.items():
                     folder = campaign_dir / labels[run_id]
@@ -2080,7 +2127,8 @@ def watch_preview_local(config: dict[str, Any], output: Path) -> int:
         time.sleep(60)
 
 
-def download_latest_local(config: dict[str, Any], output: Path, destination: Path | None = None) -> Path:
+def download_latest_local(config: dict[str, Any], output: Path, destination: Path | None = None,
+                          *, refresh_running: bool = True) -> Path:
     """Refresh and save the latest self-contained campaign HTML in one command."""
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     saved_config = campaign_dir / "campaign.json"
@@ -2091,7 +2139,7 @@ def download_latest_local(config: dict[str, Any], output: Path, destination: Pat
             {key: value for key, value in config.items() if key != "monitoring"}:
         raise ValueError(f"{campaign_dir} does not match this campaign configuration")
     status = json.loads((campaign_dir / "summary.json").read_text())["status"]
-    if status == "running":
+    if status == "running" and refresh_running:
         preview_local(config, output)
     preview = campaign_dir / "preview" / "index.html"
     final = campaign_dir / "index.html"

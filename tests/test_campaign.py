@@ -496,19 +496,32 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(runner.download_cluster_report(config, output), root / "latest.html")
             self.assertEqual(actions, ["create", "wait", "exec", "delete"])
 
-    def test_download_cluster_report_waits_for_finished_campaign(self):
+    def test_download_cluster_report_saves_running_preview_without_full_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
+            output = Path(directory) / "output"
 
             def fake_kube(namespace, *args, **kwargs):
-                stdout = '{"status":"running"}' if args[0] == "exec" else ""
+                stdout = '{"id":"test-campaign","status":"running","overlays":[]}' if args[0] == "exec" else ""
                 return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
+            def fake_file(namespace, pod, remote, destination):
+                self.assertEqual(remote, "/workload/campaigns/test-campaign/campaign.json")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(json.dumps(config))
+
             with patch.object(runner, "kube", side_effect=fake_kube), \
-                 patch.object(runner.TRANSFER, "download_tree") as tree:
-                with self.assertRaisesRegex(RuntimeError, "still running"):
-                    runner.download_cluster_report(config, Path(directory) / "output")
+                 patch.object(runner.TRANSFER, "download_file", side_effect=fake_file), \
+                 patch.object(runner.TRANSFER, "download_tree") as tree, \
+                 patch.object(runner, "preview_local") as preview, \
+                 patch.object(runner, "report_local") as report, \
+                 patch.object(runner, "download_latest_local", return_value=output / "latest.html") as latest:
+                runner.download_cluster_report(config, output)
                 tree.assert_not_called()
+                report.assert_not_called()
+                self.assertEqual(preview.call_args.kwargs["pod_name"].startswith("campaign-download-"), True)
+                self.assertFalse(latest.call_args.kwargs["refresh_running"])
+            self.assertEqual(json.loads((output / "campaigns/test-campaign/summary.json").read_text())["status"], "running")
 
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -656,9 +669,11 @@ class CampaignTests(unittest.TestCase):
 
             def fake_kube(namespace, *args, **kwargs):
                 if args[0] == "exec":
+                    if args[3] == "test":
+                        return SimpleNamespace(returncode=0, stdout="")
                     listing = (str(remote / "profile_export_aiperf.json") if "-type" in args and
                                args[args.index("-type") + 1] == "f" else str(remote))
-                    return SimpleNamespace(stdout=listing + "\n")
+                    return SimpleNamespace(returncode=0, stdout=listing + "\n")
                 raise AssertionError(args)
 
             def fake_download(namespace, pod, remote_path, target):
@@ -679,7 +694,7 @@ class CampaignTests(unittest.TestCase):
             self.assertNotIn("Disaggregated Serving — Interactivity vs Throughput</h1>", page)
             self.assertIn('<section class="campaign-overview">', page)
             self.assertIn("<strong>1 completed</strong>", page)
-            self.assertIn("<summary>All configurations</summary>", page)
+            self.assertIn("<summary>Campaign progress</summary>", page)
             self.assertIn("<summary>Run identity</summary>", page)
             self.assertIn("baseline", page)
             self.assertIn(config["vllm_image"], page)
@@ -702,7 +717,7 @@ class CampaignTests(unittest.TestCase):
             remote = f"/workload/aiperf-agentx/{config['id']}-baseline-aiperf/c1"
 
             def fake_kube(namespace, *args, **kwargs):
-                return SimpleNamespace(stdout="" if "-name" in args else remote + "\n")
+                return SimpleNamespace(returncode=0, stdout="" if "-name" in args or "test" in args else remote + "\n")
 
             with patch.object(runner, "kube", side_effect=fake_kube):
                 self.assertEqual(runner.preview_local(config, root, auto_refresh=True), 0)
@@ -711,6 +726,25 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("<td>candidate</td><td>aiperf</td><td>c1</td><td>pending</td>", page)
             self.assertIn("<td>baseline</td><td>nyann</td><td>c1, c4</td><td>pending</td>", page)
             self.assertIn("location.reload()", page)
+
+    def test_preview_tracks_individual_nyann_stages_from_live_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["benchmarks"] = [{"tool": "nyann", "concurrencies": [1, 8, 32, 64]}]
+            folder = root / "baseline"
+            (folder / "nyann-live.log").write_text(
+                'msg="Stage started" stage=1/4 concurrency=1 duration=10m0s\n'
+                '  1  109  0  17918  30.3  462.0ms\n'
+                'msg="Stage started" stage=2/4 concurrency=8 duration=10m0s\n'
+                '  8  756  0  122230  204.4  535.4ms\n'
+                'msg="Stage started" stage=3/4 concurrency=32 duration=10m0s\n')
+            summary = {"overlays": [{"name": "baseline", "status": "running", "benchmarks": []}]}
+            page = runner.preview_progress(config, root, summary, set(), set())
+            self.assertIn("<td>stage-1 (c1)</td><td>completed</td>", page)
+            self.assertIn("<td>stage-2 (c8)</td><td>completed</td>", page)
+            self.assertIn("<td>stage-3 (c32)</td><td>running</td>", page)
+            self.assertIn("<td>stage-4 (c64)</td><td>pending</td>", page)
 
     def test_failed_campaign_keeps_last_partial_preview(self):
         with tempfile.TemporaryDirectory() as directory:
