@@ -738,6 +738,14 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(tuned_pods["decode"]["containers"][0]["args"], ["exec vllm serve model"])
             with self.assertRaisesRegex(ValueError, "roles missing"):
                 runner.apply_vllm_cli_args(selected, {"unknown": ["--enforce-eager"]})
+            env_tuned = runner.apply_vllm_env(selected, {
+                "prefill": {"VLLM_SERVER_DEV_MODE": "1"},
+                "decode": {"VLLM_SERVER_DEV_MODE": "1"},
+            })
+            for _, pod in runner.worker_pods(list(yaml.safe_load_all(env_tuned))):
+                self.assertIn({"name": "VLLM_SERVER_DEV_MODE", "value": "1"}, pod["containers"][0]["env"])
+            with self.assertRaisesRegex(ValueError, "roles missing"):
+                runner.apply_vllm_env(selected, {"unknown": {"VLLM_SERVER_DEV_MODE": "1"}})
             nightly = runner.inject_vllm_build_script(selected, {"mode": "nightly", "steps": []})
             self.assertEqual(len(list(yaml.safe_load_all(nightly))), 1)
 

@@ -177,8 +177,8 @@ def load_config(path: Path) -> dict[str, Any]:
     seen = set()
     for overlay in overlays:
         required = {"name", "path", "model_label", "pod_selector", "expected_pods"}
-        if not isinstance(overlay, dict) or not required.issubset(overlay) or set(overlay) - required - {"build", "dimensions", "vllm_cli_args"}:
-            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods; build/dimensions/vllm_cli_args are optional")
+        if not isinstance(overlay, dict) or not required.issubset(overlay) or set(overlay) - required - {"build", "dimensions", "vllm_cli_args", "vllm_env"}:
+            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods; build/dimensions/vllm_cli_args/vllm_env are optional")
         name = required_name(overlay["name"], "overlay.name")
         if name in seen:
             raise ValueError(f"duplicate overlay: {name}")
@@ -202,6 +202,19 @@ def load_config(path: Path) -> dict[str, Any]:
                     for arg in args
                 ):
                     raise ValueError(f"overlay {name}.vllm_cli_args.{role} must contain simple CLI flags")
+        if "vllm_env" in overlay:
+            role_env = overlay["vllm_env"]
+            if not isinstance(role_env, dict) or not role_env or len(role_env) > 8:
+                raise ValueError(f"overlay {name}.vllm_env must map serving roles to environment variables")
+            for role, values in role_env.items():
+                if not isinstance(role, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", role):
+                    raise ValueError(f"overlay {name}.vllm_env has an invalid role")
+                if not isinstance(values, dict) or not values or len(values) > 32 or any(
+                    not isinstance(key, str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", key) or
+                    not isinstance(value, str) or len(value) > 1024
+                    for key, value in values.items()
+                ):
+                    raise ValueError(f"overlay {name}.vllm_env.{role} must map environment names to strings")
         dimensions = overlay.get("dimensions", {})
         reserved = {"build", "overlay", "tool", "sample", "concurrency", "status", "requests_per_s",
                     "output_tokens_per_s", "ttft_p90", "itl_p90", "artifacts", "error",
@@ -424,9 +437,32 @@ def apply_vllm_cli_args(rendered: str, role_args: dict[str, list[str]] | None) -
     return yaml.safe_dump_all(documents, sort_keys=False)
 
 
+def apply_vllm_env(rendered: str, role_env: dict[str, dict[str, str]] | None) -> str:
+    """Set explicit environment variables on selected vLLM serving roles."""
+    if not role_env:
+        return rendered
+    documents = list(yaml.safe_load_all(rendered))
+    matched = set()
+    for role, pod in worker_pods(documents):
+        if role not in role_env:
+            continue
+        containers = [container for container in pod.get("containers", []) if container.get("name") == "vllm"]
+        if len(containers) != 1:
+            raise ValueError(f"role {role} needs exactly one vllm container for vllm_env")
+        environment = containers[0].setdefault("env", [])
+        for key, value in role_env[role].items():
+            environment[:] = [entry for entry in environment if entry.get("name") != key]
+            environment.append({"name": key, "value": value})
+        matched.add(role)
+    if matched != set(role_env):
+        raise ValueError(f"vllm_env roles missing from overlay: {sorted(set(role_env) - matched)}")
+    return yaml.safe_dump_all(documents, sort_keys=False)
+
+
 def prepare_overlay_manifest(rendered: str, config: dict[str, Any], overlay: dict[str, Any]) -> str:
     rendered = apply_vllm_image(rendered, config["vllm_image"])
-    return apply_vllm_cli_args(rendered, overlay.get("vllm_cli_args"))
+    rendered = apply_vllm_cli_args(rendered, overlay.get("vllm_cli_args"))
+    return apply_vllm_env(rendered, overlay.get("vllm_env"))
 
 
 def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None,

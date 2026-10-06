@@ -1,5 +1,5 @@
 {
-  "id": "glm52-h200-pd-nightly-006",
+  "id": "glm52-h200-pd-nightly-007",
   "namespace": "ecrncevi-glm52-campaign",
   "source": {
     "repo": "https://github.com/llm-d/llm-d.git",
@@ -22,6 +22,10 @@
       "pod_selector": "llm-d.ai/model=GLM-5.2-FP8,llm-d.ai/inference-serving=true",
       "expected_pods": 2,
       "vllm_cli_args": {"prefill": ["-cc.cudagraph_mode=NONE"]},
+      "vllm_env": {
+        "prefill": {"VLLM_SERVER_DEV_MODE": "1"},
+        "decode": {"VLLM_SERVER_DEV_MODE": "1"}
+      },
       "dimensions": {
         "topology": "pd",
         "prefill_nodes": 1,
@@ -38,6 +42,10 @@
       "pod_selector": "llm-d.ai/model=GLM-5.2-FP8,llm-d.ai/inference-serving=true",
       "expected_pods": 3,
       "vllm_cli_args": {"prefill": ["-cc.cudagraph_mode=NONE"]},
+      "vllm_env": {
+        "prefill": {"VLLM_SERVER_DEV_MODE": "1"},
+        "decode": {"VLLM_SERVER_DEV_MODE": "1"}
+      },
       "dimensions": {
         "topology": "pd",
         "prefill_nodes": 1,

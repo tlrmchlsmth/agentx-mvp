@@ -119,7 +119,9 @@ both role images without a source build or DeepEP override. Its explicit
 The report labels this setting as `prefill_cuda_graphs=off`; it affects benchmark
 performance. The standalone router's InferencePool must select
 `llm-d.ai/inference-serving=true` and `llm-d.ai/model=GLM-5.2-FP8` so cache
-evictor Pods are not treated as model endpoints. For other campaigns,
+evictor Pods are not treated as model endpoints. The sample also sets
+`VLLM_SERVER_DEV_MODE=1` on both roles so AIPerf can reset each vLLM prefix
+cache before every concurrency run. For other campaigns,
 the generic source script uses
 precompiled native libraries from the pinned first source commit; branch sets
 that change native C++/CUDA code need an overlay-specific full build recipe.
@@ -158,7 +160,7 @@ local checkout without publishing a runner image:
 ```bash
 export KUBECONFIG=~/.kube/config.kermit
 just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
-open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-006/index.html
+open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-007/index.html
 ```
 
 The orchestrator applies one serving overlay at a time and submits the AIPerf
