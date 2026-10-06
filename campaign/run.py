@@ -177,8 +177,8 @@ def load_config(path: Path) -> dict[str, Any]:
     seen = set()
     for overlay in overlays:
         required = {"name", "path", "model_label", "pod_selector", "expected_pods"}
-        if not isinstance(overlay, dict) or not required.issubset(overlay) or set(overlay) - required - {"build", "dimensions"}:
-            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods; build/dimensions are optional")
+        if not isinstance(overlay, dict) or not required.issubset(overlay) or set(overlay) - required - {"build", "dimensions", "vllm_cli_args"}:
+            raise ValueError("each overlay needs name, path, model_label, pod_selector, expected_pods; build/dimensions/vllm_cli_args are optional")
         name = required_name(overlay["name"], "overlay.name")
         if name in seen:
             raise ValueError(f"duplicate overlay: {name}")
@@ -190,6 +190,18 @@ def load_config(path: Path) -> dict[str, Any]:
             if not isinstance(overlay[key], str) or not overlay[key].strip() or "\n" in overlay[key]:
                 raise ValueError(f"overlay {name} requires {key}")
         bounded_int(overlay["expected_pods"], "expected_pods", 1, 1000)
+        if "vllm_cli_args" in overlay:
+            role_args = overlay["vllm_cli_args"]
+            if not isinstance(role_args, dict) or not role_args or len(role_args) > 8:
+                raise ValueError(f"overlay {name}.vllm_cli_args must map serving roles to CLI arguments")
+            for role, args in role_args.items():
+                if not isinstance(role, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", role):
+                    raise ValueError(f"overlay {name}.vllm_cli_args has an invalid role")
+                if not isinstance(args, list) or not args or len(args) > 16 or any(
+                    not isinstance(arg, str) or not re.fullmatch(r"-{1,2}[A-Za-z0-9][A-Za-z0-9_.=-]{0,127}", arg)
+                    for arg in args
+                ):
+                    raise ValueError(f"overlay {name}.vllm_cli_args.{role} must contain simple CLI flags")
         dimensions = overlay.get("dimensions", {})
         reserved = {"build", "overlay", "tool", "sample", "concurrency", "status", "requests_per_s",
                     "output_tokens_per_s", "ttft_p90", "itl_p90", "artifacts", "error",
@@ -381,6 +393,40 @@ def apply_vllm_image(rendered: str, image: str) -> str:
     if not workers:
         raise ValueError("overlay has no LeaderWorkerSet vllm container or DisaggregatedSet vllm container for vllm_image")
     return yaml.safe_dump_all(documents, sort_keys=False)
+
+
+def apply_vllm_cli_args(rendered: str, role_args: dict[str, list[str]] | None) -> str:
+    """Append explicit vLLM flags to selected serving roles, including DisaggregatedSet roles."""
+    if not role_args:
+        return rendered
+    documents = list(yaml.safe_load_all(rendered))
+    matched = set()
+    for role, pod in worker_pods(documents):
+        if role not in role_args:
+            continue
+        containers = [container for container in pod.get("containers", []) if container.get("name") == "vllm"]
+        if len(containers) != 1:
+            raise ValueError(f"role {role} needs exactly one vllm container for vllm_cli_args")
+        container = containers[0]
+        args = container.get("args")
+        if container.get("command", [])[-2:] == ["/bin/bash", "-c"] and isinstance(args, list) and len(args) == 1:
+            script = args[0]
+            if not isinstance(script, str) or "exec vllm serve" not in script:
+                raise ValueError(f"role {role} has no supported vllm serve command")
+            args[0] = script.rstrip() + " " + " ".join(role_args[role])
+        elif isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+            args.extend(role_args[role])
+        else:
+            raise ValueError(f"role {role} has no supported vllm arguments")
+        matched.add(role)
+    if matched != set(role_args):
+        raise ValueError(f"vllm_cli_args roles missing from overlay: {sorted(set(role_args) - matched)}")
+    return yaml.safe_dump_all(documents, sort_keys=False)
+
+
+def prepare_overlay_manifest(rendered: str, config: dict[str, Any], overlay: dict[str, Any]) -> str:
+    rendered = apply_vllm_image(rendered, config["vllm_image"])
+    return apply_vllm_cli_args(rendered, overlay.get("vllm_cli_args"))
 
 
 def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None,
@@ -1009,7 +1055,7 @@ def render_overlay(overlay_root: Path, overlay: dict[str, Any]) -> str:
 def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destination: Path,
                           summary: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, str], bool, bool]:
     """Build every variant before starting any serving overlay."""
-    base_manifests = {overlay["name"]: apply_vllm_image(render_overlay(overlay_root, overlay), config["vllm_image"])
+    base_manifests = {overlay["name"]: prepare_overlay_manifest(render_overlay(overlay_root, overlay), config, overlay)
                       for overlay in config["overlays"]}
     resolved = {}
     pins: dict[tuple[str, str], str] = {}
@@ -1184,7 +1230,7 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
                          {"mode": "nightly", "steps": []})
                 record["vllm_build_inputs"] = build
                 rendered = render_overlay(overlay_root, overlay)
-                rendered = apply_vllm_image(rendered, config["vllm_image"])
+                rendered = prepare_overlay_manifest(rendered, config, overlay)
                 rendered = inject_vllm_build_script(rendered, build, config["results_pvc"])
                 validate_manifest(rendered, config["namespace"])
                 (folder / "manifest.yaml").write_text(rendered)
@@ -1291,7 +1337,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
         applied = False
         try:
             rendered = (base_manifests[base_overlay["name"]] if variant else
-                        apply_vllm_image(render_overlay(overlay_root, overlay), config["vllm_image"]))
+                        prepare_overlay_manifest(render_overlay(overlay_root, overlay), config, overlay))
             build = matrix_builds[variant["name"]] if variant else None
             if build:
                 record["vllm_build_inputs"] = build

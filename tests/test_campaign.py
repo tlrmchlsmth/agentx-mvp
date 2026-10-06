@@ -731,6 +731,13 @@ class CampaignTests(unittest.TestCase):
             for _, pod in selected_pods:
                 self.assertEqual(pod["containers"][0]["image"], "vllm/nightly:latest")
                 self.assertEqual(pod["containers"][1]["image"], "router:tag")
+            tuned = runner.apply_vllm_cli_args(selected, {"prefill": ["-cc.cudagraph_mode=NONE"]})
+            tuned_pods = dict(runner.worker_pods(list(yaml.safe_load_all(tuned))))
+            self.assertEqual(tuned_pods["prefill"]["containers"][0]["args"],
+                             ["exec vllm serve model -cc.cudagraph_mode=NONE"])
+            self.assertEqual(tuned_pods["decode"]["containers"][0]["args"], ["exec vllm serve model"])
+            with self.assertRaisesRegex(ValueError, "roles missing"):
+                runner.apply_vllm_cli_args(selected, {"unknown": ["--enforce-eager"]})
             nightly = runner.inject_vllm_build_script(selected, {"mode": "nightly", "steps": []})
             self.assertEqual(len(list(yaml.safe_load_all(nightly))), 1)
 
