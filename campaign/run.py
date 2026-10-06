@@ -1613,6 +1613,16 @@ def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[s
     """Show every planned benchmark in the same HTML as completed results."""
     records = {record["name"]: record for record in summary.get("overlays", [])}
     rows = []
+    status_counts: Counter[str] = Counter()
+    running = []
+
+    def add_row(name: str, tool: str, sample: str, status: str) -> None:
+        status_counts[status] += 1
+        if status == "running":
+            running.append(f"{name} · {tool} {sample}")
+        rows.append("<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in
+                                      (name, tool, sample, status)) + "</tr>")
+
     for variant in config.get("builds", [None]):
         for overlay in config["overlays"]:
             name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
@@ -1632,14 +1642,13 @@ def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[s
                     else:
                         status = "pending"
                     samples = ", ".join(f"c{value}" for value in bench["concurrencies"])
-                    rows.append("<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in
-                                                  (name, tool, samples, status)) + "</tr>")
+                    add_row(name, tool, samples, status)
                     continue
-                counts = Counter(bench["concurrencies"])
+                repeat_counts = Counter(bench["concurrencies"])
                 seen: Counter[int] = Counter()
                 for concurrency in bench["concurrencies"]:
                     seen[concurrency] += 1
-                    sample = (f"c{concurrency}" if counts[concurrency] == 1 else
+                    sample = (f"c{concurrency}" if repeat_counts[concurrency] == 1 else
                               f"c{concurrency}-r{seen[concurrency]}")
                     if tool == "aiperf" and (run_id, sample) in completed:
                         status = "completed"
@@ -1651,13 +1660,18 @@ def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[s
                         status = "running"
                     else:
                         status = "pending"
-                    cells = (name, tool, sample, status)
-                    rows.append("<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in cells) + "</tr>")
+                    add_row(name, tool, sample, status)
     updated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return (f"<section id=\"campaign-progress\"><h2>Campaign progress</h2>"
-            f"<p>Updated {updated}. Running samples appear here before their final metrics are available.</p>"
+    summary_parts = [f"<strong>{status_counts[status]} {status}</strong>" for status in
+                     ("completed", "running", "pending", "failed", "skipped") if status_counts[status]]
+    status_line = '<span class="separator">·</span>'.join(summary_parts)
+    running_line = (f'<p class="campaign-running">Now running: {html.escape("; ".join(running))}</p>'
+                    if running else "")
+    return (f'<div class="campaign-status">{status_line}'
+            f'<time class="campaign-updated">Updated {updated}</time></div>' + running_line +
+            '<details id="campaign-progress" class="campaign-detail"><summary>All configurations</summary>'
             "<table><thead><tr><th>Overlay</th><th>Tool</th><th>Sample</th><th>Status</th></tr></thead><tbody>"
-            + "".join(rows) + "</tbody></table></section>")
+            + "".join(rows) + "</tbody></table></details>")
 
 
 def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = False) -> int:
@@ -1756,22 +1770,23 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         started = {(path.parent.name, path.name) for line in directories.splitlines()
                    if (path := Path(line)).parent.name in labels}
         progress = preview_progress(config, campaign_dir, summary, completed, started)
-        notice = (f"<p>In-progress preview: {len(runs)} completed AIPerf samples. "
-                  "Running samples are listed below; final metrics appear when each finishes.</p>" + progress)
+        notice = progress
         if missing_monitoring:
             samples = ", ".join(html.escape(name) for name in missing_monitoring)
-            notice += (f"<p>No vLLM Grafana samples were recorded during {samples}; "
-                       "their per-run vLLM dashboards are omitted. Other available monitoring "
-                       "series may still appear in the overlay.</p>")
+            notice += (f'<p class="campaign-note">{samples}: no vLLM monitoring was recorded. '
+                       'Available GPU series still appear in the overlay.</p>')
         render = Path(temporary) / "render"
         render.mkdir()
         if runs:
             AIPERF_REPORT.write_index_from_runs(render, runs, extra_html=notice,
-                                                model_label=f"Campaign {config['id']} preview",
-                                                save_monitoring_overlay=False)
+                                                model_label=f"Campaign {config['id']}",
+                                                save_monitoring_overlay=False,
+                                                compact_header=True)
             page = (render / "index.html").read_text()
         else:
-            page = AIPERF_REPORT.document(f"Campaign {config['id']} preview", notice)
+            page = AIPERF_REPORT.document(f"Campaign {config['id']}",
+                                          '<section class="campaign-overview">' + notice + '</section>')
+            page = page.replace('</head>', AIPERF_REPORT.preview_header_css() + '</head>', 1)
         if auto_refresh:
             page = page.replace("</body>", "<script>setTimeout(() => location.reload(), 90000);</script></body>", 1)
         staged = render / "index.html"

@@ -346,8 +346,32 @@ def write_index(root: Path) -> None:
     write_index_from_runs(root, runs)
 
 
+def preview_header_css() -> str:
+    return """<style>
+.campaign-overview{background:#181b1f;border:1px solid #2a2a2e;border-radius:7px;padding:14px 16px;margin:12px 0 20px}
+.campaign-status{display:flex;align-items:baseline;flex-wrap:wrap;gap:8px;font-size:13px}
+.campaign-status strong{color:#f0f1f2;font-size:15px;font-weight:600}
+.campaign-status .separator{color:#555}
+.campaign-updated{margin-left:auto;color:#8e8e8e;font-size:11px}
+.campaign-running{color:#b9c9da;font-size:12px;margin-top:7px}
+.campaign-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:12px}
+.campaign-actions button{background:#1e2127;border:1px solid #58a6ff;border-radius:5px;color:#d8eaff;cursor:pointer;padding:7px 11px;font:inherit;font-size:12px}
+.campaign-actions button:hover{background:#25364a}
+.campaign-detail{color:#aeb3bb;font-size:12px;margin-top:10px}
+.campaign-actions .campaign-detail{margin-top:0}
+.campaign-detail summary{cursor:pointer;width:max-content;max-width:100%;color:#9dc7ee}
+.campaign-detail[open]{width:100%}
+.campaign-detail table{border-collapse:collapse;width:100%;font-size:12px;margin-top:9px}
+.campaign-detail th,.campaign-detail td{border-bottom:1px solid #2a2a2e;padding:5px 8px;text-align:left}
+.campaign-detail th{color:#8e8e8e;font-weight:500}
+.campaign-detail p{margin-top:8px;overflow-wrap:anywhere}
+.campaign-note{font-size:12px;color:#d3bd85;margin-top:10px}
+</style>"""
+
+
 def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html: str = "",
-                          model_label: str | None = None, save_monitoring_overlay: bool = True) -> None:
+                          model_label: str | None = None, save_monitoring_overlay: bool = True,
+                          compact_header: bool = False) -> None:
     """Render selected runs into one portable AIPerf report."""
     renderer_path = support_file("gen_interactivity_chart.py")
     module_spec = importlib.util.spec_from_file_location("agentx_v2_charts", renderer_path)
@@ -418,18 +442,33 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
         source_row(data)
         for data in sorted({sweep_key(data): data for data in runs}.values(), key=sweep_key)
     )
-    source = '<div class="subtitle">' + source_rows + '</div>'
+    source = ('<details class="campaign-detail"><summary>Run identity</summary>' + source_rows + '</details>'
+              if compact_header else '<div class="subtitle">' + source_rows + '</div>')
     overlay_control = ""
     if overlay_html:
         encoded_overlay = base64.b64encode(overlay_html).decode("ascii")
         overlay_control = (
-            '<p><button id="monitoring-overlay">Overlay monitoring across concurrencies</button></p>'
+            ('<button id="monitoring-overlay">Overlay monitoring across concurrencies</button>' if compact_header
+             else '<p><button id="monitoring-overlay">Overlay monitoring across concurrencies</button></p>') +
             '<script>document.getElementById("monitoring-overlay").addEventListener("click",()=>{'
             f'const b=atob("{encoded_overlay}");const a=new Uint8Array(b.length);'
             'for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);'
             'window.open(URL.createObjectURL(new Blob([a],{type:"text/html"})),"_blank");});</script>'
         )
-    page = page.replace('<div id="root"></div>', extra_html + source + overlay_control + '<div id="root"></div>', 1)
+    if compact_header:
+        title = html.escape(model_label or str(first_metadata.get("model_label", "Live llm-d")))
+        rendered_title = f'<h1>{title} Disaggregated Serving — Interactivity vs Throughput</h1>'
+        page = page.replace(rendered_title, f'<h1>{title}</h1>', 1)
+        subtitle_start = page.find('<div class="subtitle">', page.find(f'<h1>{title}</h1>'))
+        if subtitle_start >= 0:
+            subtitle_end = page.find('</div>', subtitle_start)
+            page = page[:subtitle_start] + page[subtitle_end + len('</div>'):]
+        page = page.replace('</head>', preview_header_css() + '</head>', 1)
+        header = '<section class="campaign-overview">' + extra_html + \
+                 '<div class="campaign-actions">' + overlay_control + source + '</div></section>'
+    else:
+        header = extra_html + source + overlay_control
+    page = page.replace('<div id="root"></div>', header + '<div id="root"></div>', 1)
     page = page.replace("</body>", pareto_section_html() + "\n</body>", 1)
     output.write_text(page, encoding="utf-8")
 
