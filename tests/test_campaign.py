@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 import tempfile
@@ -259,8 +260,11 @@ class CampaignTests(unittest.TestCase):
                 if args[0] == "create":
                     pod = json.loads(kwargs["input_text"])
                     self.assertEqual(pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"], "results")
+                if args[0] == "exec":
+                    return SimpleNamespace(stdout="/workload/aiperf-agentx/sample/c1/profile_export_aiperf.json\n",
+                                           stderr="", returncode=0)
                 if args[0] == "cp":
-                    Path(args[2]).mkdir()
+                    Path(args[2]).write_text("{}")
                 return SimpleNamespace(stdout="", stderr="", returncode=0)
 
             def fake_run(value, results_root, artifact_fetcher=None):
@@ -269,12 +273,14 @@ class CampaignTests(unittest.TestCase):
                 copied = artifact_fetcher(Path("/workload/aiperf-agentx/sample"))
                 self.assertEqual(copied, output.resolve() / "aiperf-agentx/sample")
                 self.assertTrue(copied.is_dir())
+                self.assertTrue((copied / "c1/profile_export_aiperf.json").is_file())
+                self.assertFalse((copied / "c1/profile_export_raw.jsonl").exists())
                 return 0
 
             with patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner, "run", side_effect=fake_run):
                 self.assertEqual(runner.run_local(config, output), 0)
-            self.assertEqual(actions, ["get", "get", "create", "wait", "cp", "delete"])
+            self.assertEqual(actions, ["get", "get", "create", "wait", "exec", *(["cp"] * 6), "delete"])
 
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -396,22 +402,51 @@ class CampaignTests(unittest.TestCase):
             (source / "benchmark-metadata.json").write_text(json.dumps({
                 "run_id": f"{run_id}-c1", "concurrency": 1,
                 "source_kind": "llm-d", "source_ref": "main", "source_commit": "a" * 40}))
+            copy_attempts = []
 
             def fake_kube(namespace, *args, **kwargs):
                 if args[0] == "exec":
                     return SimpleNamespace(stdout=str(remote / "profile_export_aiperf.json") + "\n")
                 if args[0] == "cp":
-                    runner.shutil.copytree(source, Path(args[2]))
-                    return SimpleNamespace(stdout="")
+                    filename = Path(args[2]).name
+                    if filename == "profile_export_aiperf.json":
+                        copy_attempts.append(args)
+                        if len(copy_attempts) == 1:
+                            return SimpleNamespace(returncode=1, stderr="temporary WebSocket disconnect")
+                    if not (source / filename).is_file():
+                        return SimpleNamespace(returncode=1, stderr="file not found")
+                    runner.shutil.copyfile(source / filename, Path(args[2]))
+                    return SimpleNamespace(returncode=0, stderr="")
                 raise AssertionError(args)
 
-            with patch.object(runner, "kube", side_effect=fake_kube):
+            with patch.object(runner, "kube", side_effect=fake_kube), patch.object(runner.time, "sleep"):
                 self.assertEqual(runner.preview_local(config, root), 0)
+            self.assertEqual(len(copy_attempts), 2)
             page = (campaign / "preview/index.html").read_text()
             self.assertIn("In-progress preview: 1 completed AIPerf samples", page)
             self.assertIn("baseline", page)
             self.assertIn(config["vllm_image"], page)
             self.assertIn('id="root"', page)
+
+    def test_monitoring_overlay_excludes_samples_without_scraped_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = []
+            dashboard = ('const panels = {"1":{"title":"Requests","unit":"req/s",'
+                         '"queries":[{"expr":"vllm:num_requests_running","series":'
+                         '[{"labels":{},"values":[[0,"1"]]}]}]}};\n'
+                         'const rows = [{"type":"panel","id":"1"}];\n')
+            for concurrency in (1, 8, 32):
+                sample = root / f"c{concurrency}"
+                sample.mkdir()
+                (sample / "dashboard.html").write_text(dashboard)
+                runs.append({"directory": sample,
+                             "metadata": {"run_id": f"sweep-c{concurrency}", "concurrency": concurrency},
+                             "dashboard": None if concurrency == 1 else dashboard.encode()})
+            self.assertIsNone(runner.AIPERF_REPORT.monitoring_overlay(root, runs[:2], save_file=False))
+            page = runner.AIPERF_REPORT.monitoring_overlay(root, runs, save_file=False).decode()
+            labels = json.loads(re.search(r"const labels = (\[.*?\]);", page).group(1))
+            self.assertEqual(labels, ["sweep / c8", "sweep / c32"])
 
     def test_rejects_unsafe_source_and_records_checkout_failure(self):
         with tempfile.TemporaryDirectory() as directory:

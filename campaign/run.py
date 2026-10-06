@@ -1555,7 +1555,16 @@ def run_local(config: dict[str, Any], output: Path) -> int:
         def fetch(artifact: Path) -> Path:
             destination = output / artifact.relative_to("/workload")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            kube(namespace, "cp", f"{pod_name}:{artifact}", str(destination))
+            if artifact.parent.name == "aiperf-agentx":
+                profiles = kube(namespace, "exec", pod_name, "--", "find", str(artifact),
+                                "-mindepth", "2", "-maxdepth", "2", "-type", "f",
+                                "-name", "profile_export_aiperf.json").stdout.splitlines()
+                if not profiles:
+                    raise RuntimeError(f"No completed AIPerf profiles in {artifact}")
+                for profile in profiles:
+                    copy_aiperf_sample(namespace, pod_name, Path(profile), destination)
+            else:
+                kube(namespace, "cp", f"{pod_name}:{artifact}", str(destination))
             return destination
 
         return run(config, output, artifact_fetcher=fetch)
@@ -1564,6 +1573,33 @@ def run_local(config: dict[str, Any], output: Path) -> int:
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
         if deleted.returncode:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
+
+
+def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination: Path) -> Path:
+    """Copy report inputs without transferring potentially huge raw traces."""
+    sample_name = profile.parent.name
+    if profile.name != "profile_export_aiperf.json" or not re.fullmatch(r"c[1-9][0-9]*(?:-r[1-9][0-9]*)?", sample_name):
+        raise ValueError(f"Invalid AIPerf profile path: {profile}")
+    sample = destination / sample_name
+    sample.mkdir(parents=True, exist_ok=True)
+    for filename in ("profile_export_aiperf.json", "benchmark-metadata.json",
+                     "serving-pods.yaml", "aiperf-job.yaml", "llm-d-deployment.yaml", "dashboard.html"):
+        required = filename in {"profile_export_aiperf.json", "benchmark-metadata.json"}
+        target = sample / filename
+        for attempt in range(3):
+            result = kube(namespace, "cp", f"{pod_name}:{profile.parent / filename}",
+                          str(target), check=False)
+            if result.returncode == 0:
+                break
+            target.unlink(missing_ok=True)
+            if not required:
+                break
+            if attempt < 2:
+                time.sleep(1)
+        else:
+            if required:
+                raise RuntimeError(f"Could not copy {profile.parent / filename}: {result.stderr.strip()}")
+    return sample
 
 
 def preview_local(config: dict[str, Any], output: Path) -> int:
@@ -1606,9 +1642,8 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
     groups: dict[str, list[Path]] = {}
     with tempfile.TemporaryDirectory(prefix="campaign-preview-") as temporary:
         for path in sorted(paths):
-            sample = Path(temporary) / path.parent.parent.name / path.parent.name
-            sample.parent.mkdir(parents=True, exist_ok=True)
-            kube(namespace, "cp", f"{pod_name}:{path.parent}", str(sample))
+            sample = copy_aiperf_sample(namespace, pod_name, path,
+                                        Path(temporary) / path.parent.parent.name)
             data = AIPERF_REPORT.run_data(sample)
             if data is None or not data["profile"]:
                 continue  # The writer may still be finishing this sample.

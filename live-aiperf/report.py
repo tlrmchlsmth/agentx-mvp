@@ -664,7 +664,7 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]], *, save_file: boo
         except (KeyError, TypeError, ValueError):
             continue
         path = data["directory"] / "dashboard.html"
-        if path.is_file():
+        if data.get("dashboard") and path.is_file():
             # The concurrency alone is not a unique identity in a merged
             # Prometheus view: reruns (and even separate sweeps) can contain
             # the same c<N>. Keep both the sweep and c<N>-r<M> visible so

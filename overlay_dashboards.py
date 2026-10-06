@@ -216,6 +216,17 @@ function makePanelInteractive(panel, plot) {{
   new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
 }}
 
+// Building dozens of Plotly charts at page load blocks the overlay window.
+// Render each chart when it approaches the viewport instead.
+const panelObserver = new IntersectionObserver((entries, observer) => {{
+  for (const entry of entries) {{
+    if (!entry.isIntersecting) continue;
+    observer.unobserve(entry.target);
+    entry.target.renderPlot();
+    delete entry.target.renderPlot;
+  }}
+}}, {{ rootMargin: '300px 0px' }});
+
 if (rows.length === 0) {{
   currentGrid = document.createElement('div');
   currentGrid.className = 'grid';
@@ -272,8 +283,8 @@ function renderPanel(container, pid, m) {{
   plotDiv.className = 'plot';
   div.appendChild(plotDiv);
   container.appendChild(div);
-  makePanelInteractive(div, plotDiv);
 
+  div.renderPlot = () => {{
   const traces = [];
   const traceConcurrencies = [];
   let traceIndex = 0;
@@ -341,8 +352,11 @@ function renderPanel(container, pid, m) {{
   }}, {{ responsive: true, edits: {{ legendPosition: true }}, displayModeBar: true, displaylogo: false, scrollZoom: true, modeBarButtonsToRemove: ['lasso2d','select2d'] }}).then(() => {{
     plotDiv._traceConcurrencies = traceConcurrencies;
     plotDiv.dataset.ready = 'true';
+    makePanelInteractive(div, plotDiv);
     applyConcurrencyFilter();
   }});
+  }};
+  panelObserver.observe(div);
 }}
 </script>
 </body>
