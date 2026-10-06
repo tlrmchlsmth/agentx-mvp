@@ -248,6 +248,8 @@ def load_config(path: Path) -> dict[str, Any]:
         fields = {"tool", "concurrencies", "duration_seconds"}
         if tool == "nyann":
             fields |= {"isl", "osl", "warmup_seconds"}
+        elif tool == "aiperf":
+            fields |= {"max_context_length"}
         elif tool != "aiperf":
             raise ValueError("tool must be aiperf or nyann")
         if set(bench) != fields or tool in tools:
@@ -259,6 +261,8 @@ def load_config(path: Path) -> dict[str, Any]:
         for value in values:
             bounded_int(value, "concurrency", 1, 2048 if tool == "aiperf" else 16384)
         bounded_int(bench["duration_seconds"], "duration_seconds", 900 if tool == "aiperf" else 1, 7200)
+        if tool == "aiperf":
+            bounded_int(bench["max_context_length"], "max_context_length", 1024, 1000000)
         if tool == "nyann":
             for key in ("isl", "osl"):
                 bounded_int(bench[key], key, 1, 1000000)
@@ -873,6 +877,7 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
         env["BASE_URL"] = config["base_url"]
     concurrencies = ",".join(str(value) for value in bench["concurrencies"])
     if tool == "aiperf":
+        env["MAX_CONTEXT_LENGTH"] = str(bench["max_context_length"])
         cmd = ["bash", str(ROOT / "live-aiperf/submit.sh"), concurrencies, str(bench["duration_seconds"])]
     else:
         cmd = ["bash", str(ROOT / "live-nyann/submit.sh"), concurrencies,

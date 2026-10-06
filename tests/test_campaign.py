@@ -34,7 +34,8 @@ class CampaignTests(unittest.TestCase):
             "overlays": [{"name": name, "path": name, "model_label": "test-model",
                           "pod_selector": "app=test-model", "expected_pods": 2}
                          for name in ("baseline", "candidate")],
-            "benchmarks": [{"tool": "aiperf", "concurrencies": [1, 4], "duration_seconds": 900}],
+            "benchmarks": [{"tool": "aiperf", "concurrencies": [1, 4], "duration_seconds": 900,
+                            "max_context_length": 131072}],
         }
 
     def test_rejects_namespace_escape_and_existing_resources(self):

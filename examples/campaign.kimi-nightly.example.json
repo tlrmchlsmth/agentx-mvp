@@ -32,7 +32,7 @@
     }
   ],
   "benchmarks": [
-    {"tool": "aiperf", "concurrencies": [1, 4, 8, 16], "duration_seconds": 900},
+    {"tool": "aiperf", "concurrencies": [1, 4, 8, 16], "duration_seconds": 900, "max_context_length": 131072},
     {"tool": "nyann", "concurrencies": [1, 4, 8], "duration_seconds": 900, "isl": 1024, "osl": 512, "warmup_seconds": 60}
   ]
 }
