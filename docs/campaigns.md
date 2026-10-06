@@ -113,14 +113,17 @@ Use a local llm-d checkout and an output directory that does not yet exist:
 ```bash
 just campaign-test-local examples/campaign.kimi-nightly.example.json \
   ../llm-d /tmp/kimi-nightly-local-test
-cat /tmp/kimi-nightly-local-test/summary.json
+open /tmp/kimi-nightly-local-test/index.html
 ```
 
 This renders every build and overlay combination with `kubectl kustomize`,
 applies `vllm_image` and the build script, validates the manifests, and saves
-their YAML plus any planned `prebuild-job.yaml`. `summary.json` lists the
-cases and requested benchmark concurrencies. No serving Pod or benchmark
-runs locally, so this command does not generate an HTML performance report. The command uses
+their YAML plus any planned `prebuild-job.yaml`. It writes deterministic mock
+AIPerf and nyann measurements, then passes the AIPerf artifacts through the
+same `live-aiperf/report.py` and `gen_interactivity_chart.py` path as a live
+campaign. When AIPerf is configured, the single `index.html` is labeled
+**MOCK DATA**. No serving Pod,
+benchmark, or Grafana query runs locally. The command uses
 the local checkout instead of fetching `source.repo/ref`; source build branches
 and optional DeepEP branches are still resolved from their Git remotes. The
 local test needs Python dependencies, `git`, and `kubectl` for its offline

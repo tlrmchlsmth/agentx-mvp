@@ -822,7 +822,9 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
         return f"<td>{html.escape(value)}</td>"
 
     body = "".join("<tr>" + "".join(html_cell(row, field) for field in fields) + "</tr>" for row in rows)
-    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + \
+    mock_notice = ("<p><strong>MOCK DATA:</strong> generated locally to test report rendering; "
+                   "no benchmark or Grafana query ran.</p>" if summary.get("mode") == "mock-test" else "")
+    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + mock_notice + \
         "<h2>Builds</h2><table><tr><th>Build</th><th>Status</th><th>Resolved inputs</th><th>Error</th></tr>" + \
         "".join(build_rows) + "</table>" + \
         "<h2>All configurations</h2><table><tr>" + header + "</tr>" + body + "</table>"
@@ -925,6 +927,58 @@ def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destinatio
     return resolved, base_manifests, failed, stopped
 
 
+def write_mock_report(config: dict[str, Any], destination: Path, summary: dict[str, Any]) -> None:
+    """Feed deterministic mock artifacts to the existing AIPerf report path."""
+    summary["mode"] = "mock-test"
+    for record in summary["overlays"]:
+        if record["status"] != "validated":
+            continue
+        for bench in record["benchmarks"]:
+            concurrencies = bench.pop("concurrencies")
+            if bench["tool"] == "aiperf":
+                run_id = f"{config['id']}-{record['name']}-aiperf"
+                artifact = destination / "mock-artifacts" / run_id
+                counts = Counter(concurrencies)
+                seen: Counter[int] = Counter()
+                for concurrency in concurrencies:
+                    seen[concurrency] += 1
+                    sample = (f"c{concurrency}" if counts[concurrency] == 1 else
+                              f"c{concurrency}-r{seen[concurrency]}")
+                    folder = artifact / sample
+                    folder.mkdir(parents=True)
+                    (folder / "benchmark-metadata.json").write_text(json.dumps({
+                        "run_id": f"{run_id}-{sample}", "concurrency": concurrency,
+                        "source_kind": "llm-d", "source_ref": config["source"]["ref"],
+                        "source_commit": summary["source_commit"], "model_label": overlay_model_label(config, record),
+                        "topology": record.get("dimensions", {}).get("topology", "unknown"),
+                        "total_gpu_count": 2, "prefill_gpu_count": 1, "decode_gpu_count": 1,
+                        "mock_data": True,
+                    }, indent=2) + "\n")
+                    (folder / "profile_export_aiperf.json").write_text(json.dumps({
+                        "request_throughput": {"avg": concurrency, "unit": "req/s"},
+                        "output_token_throughput": {"avg": concurrency * 100, "unit": "tokens/s"},
+                        "input_token_throughput": {"avg": concurrency * 200, "unit": "tokens/s"},
+                        "e2e_output_token_throughput": {"avg": 100, "unit": "tokens/s"},
+                        "time_to_first_token": {"p90": 100, "unit": "ms"},
+                        "inter_token_latency": {"p90": 10, "unit": "ms"},
+                    }, indent=2) + "\n")
+                bench.update({"status": "mocked", "artifacts": str(artifact),
+                              "measurements": aiperf_measurements(artifact, run_id, concurrencies)})
+            else:
+                bench.update({"status": "mocked", "measurements": [
+                    {"sample": f"stage-{index}", "concurrency": concurrency,
+                     "metrics": {"request_throughput": {"avg": concurrency, "unit": "req/s"},
+                                 "output_token_throughput": {"avg": concurrency * 100, "unit": "tokens/s"},
+                                 "time_to_first_token": {"p90": 100, "unit": "ms"},
+                                 "inter_token_latency": {"p90": 10, "unit": "ms"}}}
+                    for index, concurrency in enumerate(concurrencies, 1)]})
+    write_final_report(destination, summary)
+
+
+def overlay_model_label(config: dict[str, Any], record: dict[str, Any]) -> str:
+    return next(overlay["model_label"] for overlay in config["overlays"] if overlay["name"] == record["overlay"])
+
+
 def test_local(config: dict[str, Any], destination: Path, source_dir: Path | None = None) -> int:
     """Render and validate every campaign case without contacting Kubernetes."""
     destination.mkdir(parents=True, exist_ok=False)
@@ -1009,7 +1063,10 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
         summary["status"] = "failed" if any(item["status"] == "failed" for item in
                                              [*summary["builds"], *summary["overlays"]]) else "validated"
         summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-        save_plan()
+        if summary["status"] == "validated" and any(bench["tool"] == "aiperf" for bench in config["benchmarks"]):
+            write_mock_report(config, destination, summary)
+        else:
+            save_plan()
         print(f"Local campaign test {summary['status']}; artifacts: {destination}", flush=True)
         return 0 if summary["status"] == "validated" else 1
     except Exception as exc:
