@@ -1606,13 +1606,13 @@ def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination
     return sample
 
 
-def download_pvc_artifacts(config: dict[str, Any], remote: str, output: Path) -> Path:
-    """Resume a named artifact directory after a run-local process has exited."""
+def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: Path) -> Path:
+    """Resume this campaign's PVC artifacts after a run-local process has exited."""
     root = Path("/workload")
-    path = Path(remote)
-    if not path.is_absolute() or ".." in path.parts or path == root or root not in path.parents:
-        raise ValueError("--remote must be an artifact directory below /workload")
-    destination = output.resolve() / path.relative_to(root)
+    if remote is not None:
+        path = Path(remote)
+        if not path.is_absolute() or ".." in path.parts or path == root or root not in path.parents:
+            raise ValueError("--remote must be an artifact directory below /workload")
     pod_name = "campaign-download-" + secrets.token_hex(8)
     namespace = config["namespace"]
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": pod_name, "namespace": namespace},
@@ -1625,14 +1625,37 @@ def download_pvc_artifacts(config: dict[str, Any], remote: str, output: Path) ->
     kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
     try:
         kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
-        TRANSFER.download_tree(namespace, pod_name, str(path), destination)
+        listing = kube(namespace, "exec", pod_name, "--", "sh", "-c",
+                       'for root in /workload/aiperf-agentx /workload/nyann-agentx; do '
+                       'if test -d "$root"; then find "$root" -mindepth 1 -maxdepth 1 -type d; fi; done').stdout
+        expected = set()
+        for variant in config.get("builds", [None]):
+            for overlay in config["overlays"]:
+                name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
+                expected.update(f"{config['id']}-{name}-{bench['tool']}" for bench in config["benchmarks"])
+        available = sorted(Path(line) for line in listing.splitlines()
+                           if Path(line).name in expected and Path(line).parent.name in
+                           {"aiperf-agentx", "nyann-agentx"})
+        if remote is None:
+            paths = available
+            if not paths:
+                raise RuntimeError(f"No PVC artifact directories exist for campaign {config['id']}")
+        else:
+            paths = [path]
+            if path not in available:
+                choices = ", ".join(str(item) for item in available) or "none"
+                raise RuntimeError(f"Artifact directory {path} does not exist for this campaign. Available: {choices}. "
+                                   "Omit --remote to download all available artifacts.")
+        for item in paths:
+            destination = output.resolve() / item.relative_to(root)
+            TRANSFER.download_tree(namespace, pod_name, str(item), destination)
+            print(f"Downloaded artifacts: {destination}", flush=True)
     finally:
         deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
         if deleted.returncode:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
-    print(f"Downloaded artifacts: {destination}", flush=True)
-    return destination
+    return output.resolve()
 
 
 def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[str, Any],
@@ -2002,8 +2025,8 @@ def main() -> int:
             download_latest_local(config, args.output, args.dest)
             return 0
         if args.action == "download-artifacts":
-            if args.output is None or args.remote is None:
-                raise ValueError("--output and --remote are required for download-artifacts")
+            if args.output is None:
+                raise ValueError("--output is required for download-artifacts")
             download_pvc_artifacts(config, args.remote, args.output)
             return 0
         if args.watch:

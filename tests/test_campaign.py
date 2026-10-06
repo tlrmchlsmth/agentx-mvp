@@ -304,18 +304,24 @@ class CampaignTests(unittest.TestCase):
                 if args[0] == "create":
                     pod = json.loads(kwargs["input_text"])
                     self.assertEqual(pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"], "results")
+                if args[0] == "exec":
+                    return SimpleNamespace(returncode=0, stderr="", stdout=(
+                        "/workload/aiperf-agentx/test-campaign-baseline-aiperf\n"))
                 return SimpleNamespace(returncode=0, stderr="", stdout="")
 
             def fake_tree(namespace, pod, remote, destination):
                 actions.append("download")
-                self.assertEqual(remote, "/workload/nyann-agentx/run-1")
-                self.assertEqual(destination, output.resolve() / "nyann-agentx/run-1")
+                self.assertEqual(remote, "/workload/aiperf-agentx/test-campaign-baseline-aiperf")
+                self.assertEqual(destination, output.resolve() / "aiperf-agentx/test-campaign-baseline-aiperf")
                 return destination
 
             with patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner.TRANSFER, "download_tree", side_effect=fake_tree):
-                runner.download_pvc_artifacts(config, "/workload/nyann-agentx/run-1", output)
-            self.assertEqual(actions, ["create", "wait", "download", "delete"])
+                runner.download_pvc_artifacts(config, None, output)
+                with self.assertRaisesRegex(RuntimeError, "Available: /workload/aiperf-agentx/test-campaign-baseline-aiperf"):
+                    runner.download_pvc_artifacts(config, "/workload/nyann-agentx/RUN_ID", output)
+            self.assertEqual(actions, ["create", "wait", "exec", "download", "delete",
+                                       "create", "wait", "exec", "delete"])
             with self.assertRaisesRegex(ValueError, "below /workload"):
                 runner.download_pvc_artifacts(config, "/workload/../etc", output)
 

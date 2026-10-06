@@ -219,13 +219,17 @@ the same local output after an interrupted campaign, run:
 
 ```bash
 just campaign-download-artifacts examples/campaign.glm52-h200-kermit.json \
-  /workload/nyann-agentx/<run-id> /tmp/glm52-campaign-live
+  /tmp/glm52-campaign-live
 ```
 
-The command creates and removes a temporary PVC-mounted Pod. Repeating it
-verifies the saved chunks and downloads only what remains. The original
-artifact files stay on the PVC. AIPerf's raw traces are still excluded from
-the automatic report download; use this command to retrieve them explicitly.
+The command discovers existing AIPerf and Nyann run directories for the
+configured campaign; a benchmark that did not run has no directory to fetch.
+To fetch one directory, use `campaign-download-artifact CONFIG REMOTE OUTPUT`
+with a path printed by the discovery command. Both commands create and remove
+a temporary PVC-mounted Pod. Repeating a download verifies saved chunks and
+downloads only what remains. The original artifact files stay on the PVC.
+AIPerf's raw traces are still excluded from the automatic report download;
+these commands retrieve them explicitly.
 
 If monitoring was added to the JSON after a `run-local` campaign started,
 regenerate its final HTML after the campaign finishes:
