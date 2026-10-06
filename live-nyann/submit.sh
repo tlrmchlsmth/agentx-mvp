@@ -36,14 +36,13 @@ if [[ ! "$WARMUP" =~ ^[0-9][0-9]*$ ]] || (( WARMUP > 3600 )); then
   exit 2
 fi
 
-KUBECTL_REQUEST_TIMEOUT="${KUBECTL_REQUEST_TIMEOUT:-30s}"
 NAMESPACE="${LIVE_NYANN_NAMESPACE:-}"
 if [[ -z "$NAMESPACE" ]]; then
   echo "Discovering the deployed vLLM namespace..."
   DEPLOYMENT_NAMESPACES=()
   while IFS=$'\t' read -r namespace commit; do
     [[ "$commit" =~ ^[0-9a-f]{40}$ ]] && DEPLOYMENT_NAMESPACES+=("$namespace")
-  done < <(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get configmaps --all-namespaces -o go-template='{{range .items}}{{if eq .metadata.name "vllm-build-ref"}}{{.metadata.namespace}}{{"\t"}}{{index .data "VLLM_BUILD_COMMIT"}}{{"\n"}}{{end}}{{end}}')
+  done < <(kubectl get configmaps --all-namespaces -o go-template='{{range .items}}{{if eq .metadata.name "vllm-build-ref"}}{{.metadata.namespace}}{{"\t"}}{{index .data "VLLM_BUILD_COMMIT"}}{{"\n"}}{{end}}{{end}}')
   if (( ${#DEPLOYMENT_NAMESPACES[@]} != 1 )); then
     echo "Could not identify exactly one deployed vLLM namespace (found: ${DEPLOYMENT_NAMESPACES[*]:-none})" >&2
     echo "Set LIVE_NYANN_NAMESPACE when choosing intentionally among multiple deployments." >&2
@@ -57,7 +56,7 @@ if [[ ! "$BENCHMARK_QUEUE" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || (( ${#BENCH
   echo "invalid LIVE_BENCHMARK_QUEUE: ${BENCHMARK_QUEUE}" >&2
   exit 2
 fi
-kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get localqueue "$BENCHMARK_QUEUE" -n "$NAMESPACE" -o name >/dev/null || {
+kubectl get localqueue "$BENCHMARK_QUEUE" -n "$NAMESPACE" -o name >/dev/null || {
   echo "Missing Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE}; run just live-benchmark-kueue-setup ${NAMESPACE}" >&2
   exit 1
 }
@@ -74,8 +73,8 @@ if [[ -n "${LIVE_BENCHMARK_SOURCE_COMMIT:-}" ]]; then
   SOURCE_KIND="${LIVE_BENCHMARK_SOURCE_KIND:-llm-d}"
 else
   echo "Reading deployed vLLM build metadata..."
-  SOURCE_REF="$(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
-  SOURCE_COMMIT="$(kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
+  SOURCE_REF="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
+  SOURCE_COMMIT="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
   SOURCE_KIND=vllm
 fi
 if [[ ! "$SOURCE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
@@ -91,7 +90,7 @@ echo "Discovering the serving model..."
 while IFS= read -r discovered_model; do
   [[ -n "$discovered_model" ]] && DISCOVERED_MODELS+=("$discovered_model")
 done < <(
-  kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get pods -n "$NAMESPACE" -l llm-d.ai/inference-serving=true \
+  kubectl get pods -n "$NAMESPACE" -l llm-d.ai/inference-serving=true \
     -o go-template='{{range .items}}{{index .metadata.labels "llm-d.ai/model"}}{{"\n"}}{{end}}' \
     | awk 'NF' | sort -u
 )
@@ -129,7 +128,7 @@ POD_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/nyann-serving-pods.XXXXXX.yaml")"
 JOB_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/nyann-job.XXXXXX.yaml")"
 NYANN_CONFIG="$(mktemp "${TMPDIR:-/tmp}/nyann-config.XXXXXX.star")"
 trap 'rm -f "$POD_SNAPSHOT" "$JOB_MANIFEST" "$NYANN_CONFIG"' EXIT
-kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" get pods -n "$NAMESPACE" -l "$BASE_SELECTOR" -o yaml > "$POD_SNAPSHOT"
+kubectl get pods -n "$NAMESPACE" -l "$BASE_SELECTOR" -o yaml > "$POD_SNAPSHOT"
 
 MAX_CONCURRENCY="${SWEEP_CONCURRENCIES[0]}"
 for sweep_concurrency in "${SWEEP_CONCURRENCIES[@]}"; do
@@ -252,12 +251,12 @@ spec:
             name: ${ARTIFACT_CONFIGMAP}
 EOF
 
-kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" create configmap "$ARTIFACT_CONFIGMAP" -n "$NAMESPACE" \
+kubectl create configmap "$ARTIFACT_CONFIGMAP" -n "$NAMESPACE" \
   --from-file=nyann-config.star="$NYANN_CONFIG" \
   --from-file=nyann-job.yaml="$JOB_MANIFEST" \
   --from-file=serving-pods.yaml="$POD_SNAPSHOT" \
-  --dry-run=client -o yaml | kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" create -f -
-kubectl --request-timeout="$KUBECTL_REQUEST_TIMEOUT" apply -f "$JOB_MANIFEST"
+  --dry-run=client -o yaml | kubectl create -f -
+kubectl apply -f "$JOB_MANIFEST"
 
 echo "Job queued: ${JOB_NAME} (Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE})"
 echo "nyann-bench image: ${NYANN_IMAGE}"
