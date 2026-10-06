@@ -776,6 +776,13 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
               "llm_d_commit", "vllm_commits", "deepep_commit", "vllm_image"]
     rows = []
     for record in summary["overlays"]:
+        build_inputs = record.get("vllm_build_inputs")
+        steps = build_inputs.get("steps", []) if build_inputs else []
+        vllm_commits = (
+            ", ".join(f"{step['action']} {step['ref']}@{step['commit']}" for step in steps)
+            if steps else "N/A (using configured image; no source commit)" if build_inputs else
+            "unknown (build not resolved)"
+        )
         for bench in record.get("benchmarks") or [{"tool": "", "status": record["status"], "error": record.get("error", "")}]:
             for measurement in bench.get("measurements") or [{}]:
                 metrics = measurement.get("metrics", {})
@@ -795,9 +802,7 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
                        "report": bench.get("report", ""),
                        "artifacts": bench.get("artifacts", ""), "error": bench.get("error", ""),
                        "llm_d_commit": summary.get("source_commit", ""),
-                       "vllm_commits": ", ".join(
-                           f"{step['action']} {step['ref']}@{step['commit']}"
-                           for step in record.get("vllm_build_inputs", {}).get("steps", [])),
+                       "vllm_commits": vllm_commits,
                        "deepep_commit": record.get("vllm_build_inputs", {}).get("deepep", {}).get("commit", ""),
                        "vllm_image": summary.get("vllm_image", "")}
                 row.update(record.get("dimensions", {}))
@@ -814,7 +819,9 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
             inputs += f"; DeepEP {deepep['ref']}@{deepep['commit'][:12]}"
         build_rows.append("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in
                         (build["name"], build["status"], inputs, build.get("error", ""))) + "</tr>")
-    header = "".join(f"<th>{html.escape(field.replace('_', ' ').title())}</th>" for field in fields)
+    headings = {"llm_d_commit": "llm-d commit", "vllm_commits": "vLLM source commits",
+                "deepep_commit": "DeepEP commit", "vllm_image": "vLLM image"}
+    header = "".join(f"<th>{html.escape(headings.get(field, field.replace('_', ' ').title()))}</th>" for field in fields)
     def html_cell(row: dict[str, Any], field: str) -> str:
         value = str(row.get(field, ""))
         if field == "report" and value:

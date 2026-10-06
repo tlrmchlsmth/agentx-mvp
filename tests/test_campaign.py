@@ -209,6 +209,7 @@ class CampaignTests(unittest.TestCase):
             page = (output / "index.html").read_text()
             self.assertIn("MOCK DATA", page)
             self.assertIn("nightly / baseline", page)
+            self.assertIn("N/A (using configured image; no source commit)", page)
             self.assertIn(config["vllm_image"], (output / "nightly-baseline/manifest.yaml").read_text())
             self.assertFalse((output / "nightly-baseline/prebuild-job.yaml").exists())
             with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
