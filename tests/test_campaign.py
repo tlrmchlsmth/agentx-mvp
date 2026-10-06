@@ -664,6 +664,9 @@ class CampaignTests(unittest.TestCase):
                              (8, 16, 24))
             self.assertIn("/ decode GPUs", page)
             self.assertIn("/ total GPUs", page)
+            decode_metrics = json.loads(re.search(
+                r'const DECODE_NORMALIZED_METRICS = new Set\((\[.*?\])\);', page).group(1))
+            self.assertIn("output_token_throughput_per_user", decode_metrics)
 
     def test_aggregate_pod_gpus_are_not_double_counted_for_total(self):
         counts = runner.AIPERF_REPORT.pod_json_gpu_counts({"items": [{

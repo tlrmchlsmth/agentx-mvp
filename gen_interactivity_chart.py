@@ -373,6 +373,7 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
     axis_metrics = sorted(metric_units)
     decode_normalized_metrics = [
         'output_token_throughput',
+        'output_token_throughput_per_user',
         'e2e_output_token_throughput',
         'effective_decode_throughput',
         'active_decode_throughput',
