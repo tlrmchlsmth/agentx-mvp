@@ -470,6 +470,19 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("<td>baseline</td><td>nyann</td><td>c1, c4</td><td>pending</td>", page)
             self.assertIn("location.reload()", page)
 
+    def test_failed_campaign_keeps_last_partial_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            campaign = root / "campaigns" / config["id"]
+            preview = campaign / "preview"
+            preview.mkdir(parents=True)
+            (campaign / "summary.json").write_text(json.dumps({"status": "failed"}))
+            (campaign / "index.html").write_text("minimal final report")
+            (preview / "index.html").write_text("completed sample charts")
+            self.assertEqual(runner.watch_preview_local(config, root), 1)
+            self.assertEqual((preview / "index.html").read_text(), "completed sample charts")
+
     def test_monitoring_overlay_includes_partial_gpu_data_and_excludes_empty_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

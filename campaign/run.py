@@ -1802,6 +1802,10 @@ def watch_preview_local(config: dict[str, Any], output: Path) -> int:
     while True:
         summary = json.loads((campaign_dir / "summary.json").read_text())
         if summary["status"] != "running":
+            if summary["status"] == "failed":
+                print(f"Campaign failed; retained the last partial preview in {campaign_dir / 'preview/index.html'}",
+                      file=sys.stderr)
+                return 1
             final = campaign_dir / "index.html"
             if final.is_file():
                 preview = campaign_dir / "preview"
@@ -1811,9 +1815,6 @@ def watch_preview_local(config: dict[str, Any], output: Path) -> int:
                 staged.replace(preview / "index.html")
                 print(f"Final report: {preview / 'index.html'}")
                 return 0
-            if summary["status"] == "failed":
-                print(f"Campaign failed before a final report was written: {campaign_dir}", file=sys.stderr)
-                return 1
         else:
             try:
                 preview_local(config, output, auto_refresh=True)

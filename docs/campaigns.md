@@ -190,8 +190,10 @@ open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-009/preview/index.
 The command updates `preview/index.html` every minute; the open page reloads
 periodically. Its progress table shows active and pending samples even before
 the first result finishes. Completed AIPerf results use the existing chart
-renderer and Grafana exporter. At the end, the preview file becomes the final
-self-contained report. Omit `--watch` to take one snapshot. A sample with no
+renderer and Grafana exporter. On success, the preview file becomes the final
+self-contained report; on failure, it retains the last partial preview.
+Copy `preview/index.html` to download a standalone snapshot at any time.
+Omit `--watch` to take one snapshot. A sample with no
 scraped vLLM metrics keeps its AIPerf charts and displays a missing-monitoring
 notice instead of an empty per-run Grafana dashboard. The monitoring overlay
 still includes any available GPU or other time series for that sample and
