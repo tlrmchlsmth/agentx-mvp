@@ -508,6 +508,7 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
             key: value for key, value in data["profile"].items()
             if isinstance(value, dict) and any(isinstance(item, (int, float)) for item in value.values())
         }
+        profile.setdefault("concurrency", {"avg": concurrency, "unit": "requests"})
         config["runs"][concurrency] = profile
         if data["dashboard"] is not None:
             config.setdefault("dashboards", {})[f"c{concurrency}"] = base64.b64encode(data["dashboard"]).decode("ascii")
@@ -516,20 +517,24 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
 
     first_metadata = runs[0]["metadata"]
     output = root / "index.html"
-    nyann_runs = [data for data in runs if data["metadata"].get("benchmark_tool") == "nyann"]
-    has_tpot = nyann_runs and all("p90" in data["profile"].get("time_per_output_token", {})
-                                   for data in runs)
-    nyann_latency_stat = ("p90" if all("p90" in data["profile"].get("time_to_first_token", {})
-                                      for data in nyann_runs) else "p95")
-    chart_defaults = ({
-        "throughput": {"xMetric": "request_throughput", "yMetric": "output_token_throughput", "yNorm": "none"},
-        "latency": {"xMetric": "time_per_output_token" if has_tpot else "time_to_first_token",
-                    "xStat": "p90" if has_tpot else nyann_latency_stat,
-                    "yMetric": "output_token_throughput", "yNorm": "none"},
-    } if nyann_runs else {
-        "throughput": {"xMetric": "e2e_output_token_throughput", "yMetric": "output_token_throughput", "yNorm": "decode"},
-        "latency": {"xMetric": "e2e_output_token_throughput", "yMetric": "input_token_throughput", "yNorm": "prefill"},
-    })
+    latency_choices = (
+        ("time_per_output_token", "p90"),
+        ("inter_token_latency", "p99"),
+        ("time_to_first_token", "p90"),
+        ("request_latency", "p90"),
+        ("inter_token_latency", "avg"),
+        ("time_to_first_token", "avg"),
+    )
+    latency_metric, latency_stat = next(
+        ((metric, stat) for metric, stat in latency_choices
+         if all(isinstance(data["profile"].get(metric, {}).get(stat), (int, float)) for data in runs)),
+        ("request_throughput", "avg"),
+    )
+    chart_defaults = {
+        "throughput": {"xMetric": "concurrency", "yMetric": "output_token_throughput", "yNorm": "none"},
+        "latency": {"xMetric": "output_token_throughput", "yMetric": latency_metric,
+                    "yStat": latency_stat, "yNorm": "none"},
+    }
     renderer.generate_html(
         configs, str(output), str(root), metric_units,
         model_label=model_label or str(first_metadata.get("model_label", "Live llm-d")),
