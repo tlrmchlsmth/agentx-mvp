@@ -366,6 +366,7 @@ def preview_header_css() -> str:
 .campaign-detail th{color:#8e8e8e;font-weight:500}
 .campaign-detail p{margin-top:8px;overflow-wrap:anywhere}
 .campaign-note{font-size:12px;color:#d3bd85;margin-top:10px}
+.campaign-benchmark-summary{font-size:12px;color:#d8eaff;margin:10px 0 4px;overflow-wrap:anywhere}
 </style>"""
 
 
@@ -400,6 +401,49 @@ def campaign_banner(campaign: dict[str, Any]) -> str:
         banner += ('<details class="campaign-detail"><summary>Failure details</summary><pre>'
                    + html.escape("\n\n".join(errors)) + '</pre></details>')
     return banner
+
+
+def nyann_setup(config: dict[str, Any], campaign_dir: Path | None = None) -> str:
+    """Show the configured Nyann sweep and the fixed scenario used by submit.sh."""
+    benchmarks = [bench for bench in config.get("benchmarks", []) if bench.get("tool") == "nyann"]
+    if not benchmarks:
+        return ""
+    sections = []
+    models = ", ".join(sorted({str(overlay["model_label"]) for overlay in config.get("overlays", [])
+                               if overlay.get("model_label")}))
+    target = config.get("base_url") or f"http://llm-d-inference-gateway-istio.{config['namespace']}.svc.cluster.local/v1"
+    images = set()
+    if campaign_dir is not None:
+        for log in campaign_dir.glob("*/nyann-submit.log"):
+            match = re.search(r"(?m)^nyann-bench image: (.+)$", log.read_text(errors="replace"))
+            if match:
+                images.add(match.group(1).strip())
+    for bench in benchmarks:
+        concurrencies = bench["concurrencies"]
+        stages = ", ".join(f"c{value}" for value in concurrencies)
+        warmup = (f"{bench['warmup_seconds']} s at c{max(concurrencies)}"
+                  if bench["warmup_seconds"] else "disabled")
+        headline = (f"Nyann synthetic workload · ISL {bench['isl']} · OSL {bench['osl']} · "
+                    f"{stages} · {bench['duration_seconds']} s/stage · warmup {warmup}")
+        settings = [
+            ("Tool", bench["tool"]), ("Workload", "synthetic"), ("Turns", "1"),
+            ("Input sequence length (ISL)", f"{bench['isl']} tokens"),
+            ("Output sequence length (OSL)", f"{bench['osl']} tokens"),
+            ("Concurrency stages", stages), ("Duration per stage", f"{bench['duration_seconds']} s"),
+            ("Warmup", warmup), ("Target", str(target)), ("Model", models or "unspecified"),
+        ]
+        if images:
+            settings.append(("Nyann image", ", ".join(sorted(images))))
+        rows = "".join(f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
+                       for key, value in settings)
+        exact = html.escape(json.dumps(bench, indent=2))
+        sections.append(
+            '<div class="campaign-benchmark">'
+            f'<p class="campaign-benchmark-summary">{html.escape(headline)}</p>'
+            '<details class="campaign-detail"><summary>Full Nyann benchmark configuration</summary>'
+            f'<table><tbody>{rows}</tbody></table><p>Configured JSON</p><pre>{exact}</pre>'
+            '</details></div>')
+    return "".join(sections)
 
 
 def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html: str = "",

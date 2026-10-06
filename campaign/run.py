@@ -1206,9 +1206,11 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
                 continue
             runs.extend(nyann_chart_runs(destination, summary, record, bench, gpu_metadata))
     write_summary(destination, summary)
+    campaign_config = AIPERF_REPORT.read_json(destination / "campaign.json")
     AIPERF_REPORT.write_index_from_runs(destination, runs, model_label=f"Campaign {summary['id']}",
                                         save_monitoring_overlay=False, compact_header=True,
-                                        campaign=summary)
+                                        campaign=summary,
+                                        extra_html=AIPERF_REPORT.nyann_setup(campaign_config, destination))
 
 
 def render_overlay(overlay_root: Path, overlay: dict[str, Any]) -> str:
@@ -2157,7 +2159,7 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         started = {(path.parent.name, path.name) for line in directories.splitlines()
                    if (path := Path(line)).parent.name in labels}
         progress = preview_progress(config, campaign_dir, summary, completed, started)
-        notice = progress
+        notice = progress + AIPERF_REPORT.nyann_setup(config, campaign_dir)
         if missing_monitoring:
             samples = ", ".join(html.escape(name) for name in missing_monitoring)
             notice += (f'<p class="campaign-note">{samples}: no vLLM monitoring was recorded. '

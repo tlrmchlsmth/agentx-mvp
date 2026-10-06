@@ -615,8 +615,18 @@ class CampaignTests(unittest.TestCase):
                                                                 "metrics": {"request_throughput": {"avg": 7}}}]})
             summary = {"id": "campaign", "status": "completed", "source_commit": "a" * 40,
                        "vllm_image": "vllm/example@sha256:abc", "overlays": records}
+            (destination / "campaign.json").write_text(json.dumps({
+                "namespace": "benchmark", "base_url": "http://benchmark.example/v1",
+                "overlays": [{"name": "pd", "model_label": "GLM"}],
+                "benchmarks": [{"tool": "nyann", "concurrencies": [1, 4],
+                                "duration_seconds": 600, "isl": 1024, "osl": 512,
+                                "warmup_seconds": 60}]}))
             runner.write_final_report(destination, summary)
             page = (destination / "index.html").read_text()
+            self.assertIn("ISL 1024 · OSL 512", page)
+            self.assertIn("Full Nyann benchmark configuration", page)
+            self.assertIn("http://benchmark.example/v1", page)
+            self.assertIn("&quot;warmup_seconds&quot;: 60", page)
             self.assertIn("branch2 / pd", page)
             self.assertIn("branch3 / pd", page)
             self.assertIn("b" * 40, page)
@@ -758,7 +768,9 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
-            config["benchmarks"] = [{"tool": "nyann", "concurrencies": [1, 8, 32], "duration_seconds": 600}]
+            config["benchmarks"] = [{"tool": "nyann", "concurrencies": [1, 8, 32],
+                                     "duration_seconds": 600, "isl": 1024, "osl": 512,
+                                     "warmup_seconds": 60}]
             campaign = root / "campaigns" / config["id"]
             folder = campaign / "baseline"
             folder.mkdir(parents=True)
@@ -766,7 +778,9 @@ class CampaignTests(unittest.TestCase):
             (campaign / "summary.json").write_text(json.dumps({
                 "id": config["id"], "status": "running", "vllm_image": config["vllm_image"],
                 "overlays": [{"name": "baseline", "status": "running", "benchmarks": []}]}))
-            (folder / "nyann-submit.log").write_text("Job queued: nyann-example in test namespace\n")
+            (folder / "nyann-submit.log").write_text(
+                "Job queued: nyann-example in test namespace\n"
+                "nyann-bench image: ghcr.io/neuralmagic/nyann-bench:latest\n")
 
             def fake_kube(namespace, *args, **kwargs):
                 if args[0] == "exec":
@@ -788,6 +802,9 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(set(runs), {"c1", "c8"})
             self.assertEqual(runs["c8"]["output_token_throughput"]["avg"], 204.4)
             self.assertIn("stage-3 (c32)</td><td>running", page)
+            self.assertIn("ISL 1024 · OSL 512", page)
+            self.assertIn("600 s/stage · warmup 60 s at c32", page)
+            self.assertIn("ghcr.io/neuralmagic/nyann-bench:latest", page)
 
     def test_failed_campaign_keeps_last_partial_preview(self):
         with tempfile.TemporaryDirectory() as directory:
