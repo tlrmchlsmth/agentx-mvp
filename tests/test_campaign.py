@@ -627,6 +627,15 @@ class CampaignTests(unittest.TestCase):
     def test_nyann_tpot_is_visible_in_default_chart_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "pd").mkdir()
+            (root / "pd" / "serving-pods.json").write_text(json.dumps({"items": [
+                {"metadata": {"labels": {"llm-d.ai/role": "prefill"}},
+                 "spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "8"}}}]}},
+                {"metadata": {"labels": {"disaggregatedset.x-k8s.io/role": "decode"}},
+                 "spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "8"}}}]}},
+                {"metadata": {"labels": {"llm-d.ai/role": "decode"}},
+                 "spec": {"containers": [{"resources": {"requests": {"nvidia.com/gpu": "8"}}}]}}
+            ]}))
             summary = {"id": "nyann-chart", "status": "completed", "overlays": [{
                 "name": "pd", "status": "completed", "benchmarks": [{
                     "tool": "nyann", "status": "completed", "measurements": [{
@@ -649,6 +658,19 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("TPOT p50 (ms)", page)
             self.assertIn("E2E p90 (ms)", page)
             self.assertIn("Time per output token (TPOT)", page)
+            configs = json.loads(re.search(r'const CONFIGS = (\{.*?\});', page).group(1))
+            config = next(iter(configs.values()))
+            self.assertEqual((config["prefillGPUs"], config["decodeGPUs"], config["totalGPUs"]),
+                             (8, 16, 24))
+            self.assertIn("/ decode GPUs", page)
+            self.assertIn("/ total GPUs", page)
+
+    def test_aggregate_pod_gpus_are_not_double_counted_for_total(self):
+        counts = runner.AIPERF_REPORT.pod_json_gpu_counts({"items": [{
+            "metadata": {"labels": {"llm-d.ai/role": "aggregate"}},
+            "spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "8"}}}]},
+        }]})
+        self.assertEqual(counts, {"prefill_gpus": 8, "decode_gpus": 8, "total_gpus": 8})
 
     def test_nyann_monitoring_uses_stage_windows_and_cached_exporter(self):
         with tempfile.TemporaryDirectory() as directory:

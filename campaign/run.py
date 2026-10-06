@@ -1383,6 +1383,16 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
 def nyann_chart_runs(destination: Path, summary: dict[str, Any], record: dict[str, Any],
                      bench: dict[str, Any], gpu_metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Shape Nyann measurements for the shared interactive chart renderer."""
+    gpu_metadata = dict(gpu_metadata or {})
+    pod_snapshot = destination / record["name"] / "serving-pods.json"
+    if pod_snapshot.is_file():
+        counts = AIPERF_REPORT.pod_json_gpu_counts(json.loads(pod_snapshot.read_text()))
+        if counts["total_gpus"] > 0:
+            gpu_metadata.update({
+                "prefill_gpu_count": counts["prefill_gpus"],
+                "decode_gpu_count": counts["decode_gpus"],
+                "total_gpu_count": counts["total_gpus"],
+            })
     build = record.get("vllm_build_inputs", {})
     steps = build.get("steps", [])
     identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
@@ -1412,7 +1422,7 @@ def nyann_chart_runs(destination: Path, summary: dict[str, Any], record: dict[st
                 "source_commit": summary.get("source_commit", ""),
                 "vllm_image": summary.get("vllm_image", ""),
                 "vllm_build_steps": steps, "deepep_build": build.get("deepep"),
-                **(gpu_metadata or {}),
+                **gpu_metadata,
             },
             "yaml": "", "aiperf_job_yaml": "", "llmd_yaml": "",
             "dashboard": dashboard.read_bytes() if dashboard.is_file() else None,

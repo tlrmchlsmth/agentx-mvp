@@ -356,6 +356,7 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
             'label': meta['label'],
             'decodeGPUs': meta['decode_gpus'],
             'prefillGPUs': meta['prefill_gpus'],
+            'totalGPUs': meta.get('total_gpus', meta['decode_gpus'] + meta['prefill_gpus']),
             'pods': meta['pods'],
         }
         data_js[cfg] = {}
@@ -749,12 +750,12 @@ let gpuCostPerHour = 0;
 function applyNorm(val, norm, meta) {{
   if (val == null) return null;
   if (norm.startsWith('cost') && (val <= 0 || gpuCostPerHour <= 0)) return null;
-  if (norm === 'decode') return val / meta.decodeGPUs;
-  if (norm === 'prefill') return val / meta.prefillGPUs;
-  if (norm === 'total') return val / (meta.decodeGPUs + meta.prefillGPUs);
-  if (norm === 'cost_decode') return (meta.decodeGPUs * gpuCostPerHour * 1e6) / (val * 3600);
-  if (norm === 'cost_prefill') return (meta.prefillGPUs * gpuCostPerHour * 1e6) / (val * 3600);
-  if (norm === 'cost_total') return ((meta.decodeGPUs + meta.prefillGPUs) * gpuCostPerHour * 1e6) / (val * 3600);
+  if (norm === 'decode') return meta.decodeGPUs > 0 ? val / meta.decodeGPUs : null;
+  if (norm === 'prefill') return meta.prefillGPUs > 0 ? val / meta.prefillGPUs : null;
+  if (norm === 'total') return meta.totalGPUs > 0 ? val / meta.totalGPUs : null;
+  if (norm === 'cost_decode') return meta.decodeGPUs > 0 ? (meta.decodeGPUs * gpuCostPerHour * 1e6) / (val * 3600) : null;
+  if (norm === 'cost_prefill') return meta.prefillGPUs > 0 ? (meta.prefillGPUs * gpuCostPerHour * 1e6) / (val * 3600) : null;
+  if (norm === 'cost_total') return meta.totalGPUs > 0 ? (meta.totalGPUs * gpuCostPerHour * 1e6) / (val * 3600) : null;
   return val;
 }}
 
@@ -831,7 +832,7 @@ function hoverText(cfg, c, d) {{
   const ttft = d.time_to_first_token;
   const tpot = d.time_per_output_token;
   const e2e = d.request_latency;
-  const norm = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '?';
+  const norm = out && meta.decodeGPUs > 0 ? (out.avg / meta.decodeGPUs).toFixed(1) : '?';
   return `<b>${{meta.label}} @ c${{C_LABELS[c]}}</b><br>` +
     `Output: ${{out?.avg?.toFixed(1) ?? '?'}} tok/s (${{norm}} tok/s/decode GPU)<br>` +
     `ITL p50: ${{itl?.p50?.toFixed(1) ?? '?'}} ms · p99: ${{itl?.p99?.toFixed(1) ?? '?'}} ms<br>` +
@@ -1146,7 +1147,7 @@ root.appendChild(sec2Wrap);
 
   for (const cfg of CONFIG_KEYS) {{
     const meta = CONFIGS[cfg];
-    const totalGPUs = meta.decodeGPUs + meta.prefillGPUs;
+    const totalGPUs = meta.totalGPUs;
     for (const c of CONCURRENCIES) {{
       if (!DATA[cfg] || !DATA[cfg][c]) continue;
       const d = DATA[cfg][c];
@@ -1158,10 +1159,10 @@ root.appendChild(sec2Wrap);
       const ttft = d.time_to_first_token;
       const tpot = d.time_per_output_token;
       const e2e = d.request_latency;
-      const outPerGpu = out ? (out.avg / meta.decodeGPUs).toFixed(1) : '-';
-      const inpPerGpu = inp ? (inp.avg / meta.prefillGPUs).toFixed(1) : '-';
+      const outPerGpu = out && meta.decodeGPUs > 0 ? (out.avg / meta.decodeGPUs).toFixed(1) : '-';
+      const inpPerGpu = inp && meta.prefillGPUs > 0 ? (inp.avg / meta.prefillGPUs).toFixed(1) : '-';
       const totalTps = total?.avg ?? ((out?.avg ?? 0) + (inp?.avg ?? 0));
-      const totalPerGpu = totalTps > 0 ? (totalTps / totalGPUs).toFixed(1) : '-';
+      const totalPerGpu = totalTps > 0 && totalGPUs > 0 ? (totalTps / totalGPUs).toFixed(1) : '-';
 
       const tr = document.createElement('tr');
       tr.dataset.cfg = cfg;

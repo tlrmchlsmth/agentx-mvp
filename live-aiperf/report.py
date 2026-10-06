@@ -243,6 +243,27 @@ def snapshot_gpu_counts(snapshot: str) -> dict[str, float]:
     return counts
 
 
+def pod_json_gpu_counts(snapshot: dict[str, Any]) -> dict[str, float]:
+    """Count serving GPUs from the captured Kubernetes Pod objects."""
+    counts = {"prefill_gpus": 0.0, "decode_gpus": 0.0, "total_gpus": 0.0}
+    for pod in snapshot.get("items", []):
+        labels = pod.get("metadata", {}).get("labels", {})
+        role = labels.get("llm-d.ai/role") or labels.get("disaggregatedset.x-k8s.io/role")
+        gpus = 0.0
+        for container in pod.get("spec", {}).get("containers", []):
+            resources = container.get("resources", {})
+            allocation = resources.get("limits", {}).get("nvidia.com/gpu")
+            if allocation is None:
+                allocation = resources.get("requests", {}).get("nvidia.com/gpu", 0)
+            gpus += float(allocation)
+        counts["total_gpus"] += gpus
+        if role in ("prefill", "aggregate", "both"):
+            counts["prefill_gpus"] += gpus
+        if role in ("decode", "aggregate", "both"):
+            counts["decode_gpus"] += gpus
+    return counts
+
+
 def gpu_counts(data: dict[str, Any]) -> dict[str, float]:
     """Use explicit run metadata, with a YAML-snapshot fallback for old runs."""
     recovered = snapshot_gpu_counts(data["yaml"])
@@ -493,6 +514,7 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
             "label": source_label,
             "decode_gpus": counts["decode_gpus"],
             "prefill_gpus": counts["prefill_gpus"],
+            "total_gpus": counts["total_gpus"],
             "pods": str(metadata.get("topology", "live deployment")),
             "runs": {},
             "version": vllm_version(metadata),
