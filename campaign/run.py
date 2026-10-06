@@ -1023,7 +1023,7 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
     return result
 
 
-def write_summary(destination: Path, summary: dict[str, Any], *, embedded_reports: bool = False) -> str:
+def write_summary(destination: Path, summary: dict[str, Any]) -> None:
     tmp = destination / "summary.json.tmp"
     tmp.write_text(json.dumps(summary, indent=2) + "\n")
     tmp.replace(destination / "summary.json")
@@ -1034,7 +1034,6 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
               "ttft_p90", "ttft_unit", "itl_p90", "itl_unit", "report", "artifacts", "error",
               "llm_d_commit", "vllm_commits", "deepep_commit", "vllm_image"]
     rows = []
-    identities = []
     for record in summary["overlays"]:
         build_inputs = record.get("vllm_build_inputs")
         steps = build_inputs.get("steps", []) if build_inputs else []
@@ -1043,11 +1042,7 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
             if steps else "N/A (using configured image; no source commit)" if build_inputs else
             "unknown (build not resolved)"
         )
-        identities.append({"build": record.get("build", ""), "overlay": record.get("overlay", record["name"]),
-                           "status": record["status"], "llm_d_commit": summary.get("source_commit", ""),
-                           "vllm_commits": vllm_commits,
-                           "deepep_commit": build_inputs.get("deepep", {}).get("commit", "") if build_inputs else "",
-                           "vllm_image": summary.get("vllm_image", "")})
+        deepep_commit = build_inputs.get("deepep", {}).get("commit", "") if build_inputs else ""
         for bench in record.get("benchmarks") or [{"tool": "", "status": record["status"], "error": record.get("error", "")}]:
             for measurement in bench.get("measurements") or [{}]:
                 metrics = measurement.get("metrics", {})
@@ -1068,7 +1063,7 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
                        "artifacts": bench.get("artifacts", ""), "error": bench.get("error", ""),
                        "llm_d_commit": summary.get("source_commit", ""),
                        "vllm_commits": vllm_commits,
-                       "deepep_commit": identities[-1]["deepep_commit"],
+                       "deepep_commit": deepep_commit,
                        "vllm_image": summary.get("vllm_image", "")}
                 row.update(record.get("dimensions", {}))
                 rows.append(row)
@@ -1076,65 +1071,21 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    build_rows = []
-    for build in summary.get("builds", []):
-        inputs = ", ".join(f"{step['action']} {step['ref']}@{step['commit'][:12]}" for step in build.get("inputs", {}).get("steps", [])) or "nightly image"
-        deepep = build.get("inputs", {}).get("deepep")
-        if deepep:
-            inputs += f"; DeepEP {deepep['ref']}@{deepep['commit'][:12]}"
-        build_rows.append("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in
-                        (build["name"], build["status"], inputs, build.get("error", ""))) + "</tr>")
-    display_fields = ["build", "overlay", *dimensions, "tool", "sample", "concurrency", "status",
-                      "successful_requests", "error_requests", "requests_per_s", "output_tokens_per_s",
-                      "ttft_p90", "itl_p90", "report", "error"]
-    headings = {"llm_d_commit": "llm-d commit", "vllm_commits": "vLLM source commits",
-                "deepep_commit": "DeepEP commit", "vllm_image": "vLLM image",
-                "requests_per_s": "Requests/s", "output_tokens_per_s": "Output tokens/s",
-                "ttft_p90": "TTFT p90", "itl_p90": "ITL p90"}
-    def header(names: list[str]) -> str:
-        return "".join(f"<th>{html.escape(headings.get(field, field.replace('_', ' ').title()))}</th>" for field in names)
-
-    def html_cell(row: dict[str, Any], field: str) -> str:
-        value = str(row.get(field, ""))
-        unit_field = {"requests_per_s": "requests_unit", "output_tokens_per_s": "output_tokens_unit",
-                      "ttft_p90": "ttft_unit", "itl_p90": "itl_unit"}.get(field)
-        if unit_field and value:
-            value += " " + str(row.get(unit_field, ""))
-        if field == "report" and value:
-            if embedded_reports:
-                return "<td>AIPerf charts below</td>"
-            try:
-                relative = Path(value).relative_to("/workload")
-            except ValueError:
-                pass
-            else:
-                href = "../../" + relative.as_posix()
-                return f'<td><a href="{html.escape(href, quote=True)}">AIPerf dashboard</a></td>'
-        return f"<td>{html.escape(value)}</td>"
-
-    body = "".join("<tr>" + "".join(html_cell(row, field) for field in display_fields) + "</tr>" for row in rows)
-    identity_fields = ["build", "overlay", "status", "llm_d_commit", "vllm_commits", "deepep_commit", "vllm_image"]
-    identity_body = "".join("<tr>" + "".join(html_cell(row, field) for field in identity_fields) + "</tr>"
-                            for row in identities)
-    mock_notice = ("<p><strong>MOCK DATA:</strong> generated locally to test report rendering; "
-                   "no benchmark or Grafana query ran.</p>" if summary.get("mode") == "mock-test" else "")
-    fragment = ("<style>.campaign-identity{width:100%;table-layout:fixed;border-collapse:collapse}"
-                ".campaign-identity th,.campaign-identity td{overflow-wrap:anywhere;vertical-align:top}"
-                ".campaign-measurements{overflow-x:auto}"
-                ".campaign-identity th,.campaign-identity td,.campaign-measurements th,.campaign-measurements td"
-                "{border:1px solid #444;padding:6px;text-align:left}</style>" +
-                f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>") + mock_notice + \
-        "<h2>Builds</h2><table><tr><th>Build</th><th>Status</th><th>Resolved inputs</th><th>Error</th></tr>" + \
-        "".join(build_rows) + "</table>" + \
-        "<h2>Run identity</h2><table class='campaign-identity'><tr>" + header(identity_fields) + "</tr>" + identity_body + "</table>" + \
-        "<h2>All configurations</h2><div class='campaign-measurements'><table><tr>" + header(display_fields) + "</tr>" + body + "</table></div>"
-    return fragment
 
 
 def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
-    """Embed every completed AIPerf sweep in the same HTML as the matrix and nyann rows."""
+    """Pass campaign samples to the existing interactive report renderer."""
     runs = []
     for record in summary["overlays"]:
+        build = record.get("vllm_build_inputs", {})
+        steps = build.get("steps", [])
+        identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
+        dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
+        label = f"{record.get('build', 'nightly')} / {record.get('overlay', record['name'])}"
+        label += f" — vLLM {identity or summary.get('vllm_image', 'nightly image')}"
+        if dimensions:
+            label += f" ({dimensions})"
+        gpu_metadata = {}
         for bench in record.get("benchmarks", []):
             if bench.get("tool") != "aiperf" or (bench.get("status") != "completed" and not bench.get("measurements")):
                 continue
@@ -1144,29 +1095,52 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
                 data = AIPERF_REPORT.run_data(directory)
                 if data is None:
                     continue
-                label = f"{record.get('build', 'default')} / {record.get('overlay', record['name'])}"
-                dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
-                build = record.get("vllm_build_inputs", {})
-                steps = build.get("steps", [])
-                identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
-                label += f" — vLLM {identity or summary.get('vllm_image', 'nightly image')}"
                 data["metadata"].update({
-                    "campaign_label": f"{label} ({dimensions})" if dimensions else label,
+                    "campaign_label": f"{label} / AIPerf",
+                    "benchmark_tool": "aiperf",
                     "vllm_image": summary.get("vllm_image", ""),
                     "vllm_build_steps": steps,
                     "vllm_build_commit": record.get("vllm_build_commit", steps[0]["commit"] if steps else ""),
                     "deepep_build": build.get("deepep"),
                 })
+                gpu_metadata = {key: data["metadata"][key] for key in
+                                ("prefill_gpu_count", "decode_gpu_count", "total_gpu_count")
+                                if key in data["metadata"]}
                 metadata_file = directory / "benchmark-metadata.json"
                 metadata_file.write_text(json.dumps(data["metadata"], indent=2) + "\n")
                 runs.append(data)
                 sweep_runs += 1
             if sweep_runs:
                 AIPERF_REPORT.write_index(artifact)
-    fragment = write_summary(destination, summary, embedded_reports=bool(runs))
-    if runs:
-        AIPERF_REPORT.write_index_from_runs(destination, runs, extra_html=fragment,
-                                            model_label=f"Campaign {summary['id']}", save_monitoring_overlay=False)
+        for bench in record.get("benchmarks", []):
+            if bench.get("tool") != "nyann" or not bench.get("measurements"):
+                continue
+            repeats = Counter(item["concurrency"] for item in bench["measurements"])
+            seen: Counter[int] = Counter()
+            for measurement in bench["measurements"]:
+                concurrency = measurement["concurrency"]
+                seen[concurrency] += 1
+                runs.append({
+                    "directory": destination / record["name"] / "nyann" / measurement["sample"],
+                    "profile": measurement["metrics"],
+                    "metadata": {
+                        "run_id": f"{bench.get('run_id', summary['id'] + '-' + record['name'] + '-nyann')}-c{concurrency}",
+                        "concurrency": concurrency,
+                        "repeat_count": repeats[concurrency], "repeat_index": seen[concurrency],
+                        "campaign_label": f"{label} / Nyann",
+                        "benchmark_tool": "nyann", "model_label": summary["id"],
+                        "source_kind": "llm-d", "source_ref": summary.get("source_ref", "unknown"),
+                        "source_commit": summary.get("source_commit", ""),
+                        "vllm_image": summary.get("vllm_image", ""),
+                        "vllm_build_steps": steps, "deepep_build": build.get("deepep"),
+                        **gpu_metadata,
+                    },
+                    "yaml": "", "aiperf_job_yaml": "", "llmd_yaml": "", "dashboard": None,
+                })
+    write_summary(destination, summary)
+    AIPERF_REPORT.write_index_from_runs(destination, runs, model_label=f"Campaign {summary['id']}",
+                                        save_monitoring_overlay=False, compact_header=True,
+                                        campaign=summary)
 
 
 def render_overlay(overlay_root: Path, overlay: dict[str, Any]) -> str:
@@ -1400,7 +1374,9 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "campaign.json").write_text(json.dumps(config, indent=2) + "\n")
     summary: dict[str, Any] = {"id": config["id"], "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
-                               "vllm_image": config["vllm_image"], "overlays": []}
+                               "source_ref": config["source"]["ref"], "vllm_image": config["vllm_image"],
+                               "planned_deployments": len(config["overlays"]) * len(config.get("builds", [None])),
+                               "overlays": []}
     write_summary(destination, summary)
     try:
         overlay_root, source_commit = fetch_source(config["source"])
@@ -2153,6 +2129,8 @@ def report_local(config: dict[str, Any], output: Path) -> int:
     summary = json.loads((campaign_dir / "summary.json").read_text())
     if summary["status"] == "running":
         raise ValueError("campaign is still running; use preview-local until it finishes")
+    summary.setdefault("source_ref", config["source"]["ref"])
+    summary.setdefault("planned_deployments", len(config["overlays"]) * len(config.get("builds", [None])))
     if "monitoring" in config:
         for record in summary["overlays"]:
             for bench in record.get("benchmarks", []):

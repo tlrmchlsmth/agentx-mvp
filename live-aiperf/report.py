@@ -369,9 +369,43 @@ def preview_header_css() -> str:
 </style>"""
 
 
+def campaign_banner(campaign: dict[str, Any]) -> str:
+    """Summarize campaign state above the shared interactive charts."""
+    records = campaign.get("overlays", [])
+    completed = sum(record.get("status") == "completed" for record in records)
+    samples = {
+        tool: sum(len(bench.get("measurements", [])) for record in records
+                  for bench in record.get("benchmarks", []) if bench.get("tool") == tool)
+        for tool in ("aiperf", "nyann")
+    }
+    status = html.escape(str(campaign.get("status", "unknown")))
+    planned = campaign.get("planned_deployments", len(records))
+    counts = (f"{completed}/{planned} deployments completed ({len(records)} attempted) · "
+              f"{samples['aiperf']} AIPerf samples · {samples['nyann']} Nyann stages")
+    banner = (f'<div class="campaign-status"><strong>Campaign {status}</strong>'
+              f'<span>{counts}</span></div>')
+    if campaign.get("mode") == "mock-test":
+        banner += '<p class="campaign-note"><strong>MOCK DATA:</strong> no benchmark or Grafana query ran.</p>'
+    errors = []
+    for field in ("error", "report_error"):
+        if campaign.get(field):
+            errors.append(f"Campaign: {campaign[field]}")
+    for record in records:
+        if record.get("error"):
+            errors.append(f"{record['name']}: {record['error']}")
+        for bench in record.get("benchmarks", []):
+            if bench.get("error"):
+                errors.append(f"{record['name']} / {bench['tool']}: {bench['error']}")
+    if errors:
+        banner += ('<details class="campaign-detail"><summary>Failure details</summary><pre>'
+                   + html.escape("\n\n".join(errors)) + '</pre></details>')
+    return banner
+
+
 def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html: str = "",
                           model_label: str | None = None, save_monitoring_overlay: bool = True,
-                          compact_header: bool = False) -> None:
+                          compact_header: bool = False,
+                          campaign: dict[str, Any] | None = None) -> None:
     """Render selected runs into one portable AIPerf report."""
     renderer_path = support_file("gen_interactivity_chart.py")
     module_spec = importlib.util.spec_from_file_location("agentx_v2_charts", renderer_path)
@@ -380,8 +414,17 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
     renderer = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(renderer)
 
+    if campaign is not None:
+        extra_html = campaign_banner(campaign) + extra_html
     if not runs:
-        raise SystemExit(f"No completed live AIPerf runs in {root}")
+        if campaign is None:
+            raise SystemExit(f"No completed live AIPerf runs in {root}")
+        title = model_label or f"Campaign {campaign['id']}"
+        page = document(title, f'<h1>{html.escape(title)}</h1><section class="campaign-overview">'
+                        + extra_html + '</section>')
+        (root / "index.html").write_text(page.replace('</head>', preview_header_css() + '</head>', 1),
+                                         encoding="utf-8")
+        return
 
     overlay_html = monitoring_overlay(root, runs, save_file=save_monitoring_overlay)
 
@@ -424,13 +467,18 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
 
     first_metadata = runs[0]["metadata"]
     output = root / "index.html"
+    chart_defaults = ({
+        "throughput": {"xMetric": "request_throughput", "yMetric": "output_token_throughput", "yNorm": "none"},
+        "latency": {"xMetric": "time_to_first_token", "xStat": "p90",
+                    "yMetric": "output_token_throughput", "yNorm": "none"},
+    } if any(data["metadata"].get("benchmark_tool") == "nyann" for data in runs) else {
+        "throughput": {"xMetric": "e2e_output_token_throughput", "yMetric": "output_token_throughput", "yNorm": "decode"},
+        "latency": {"xMetric": "e2e_output_token_throughput", "yMetric": "input_token_throughput", "yNorm": "prefill"},
+    })
     renderer.generate_html(
         configs, str(output), str(root), metric_units,
         model_label=model_label or str(first_metadata.get("model_label", "Live llm-d")),
-        chart_defaults={
-            "throughput": {"xMetric": "e2e_output_token_throughput", "yMetric": "output_token_throughput", "yNorm": "decode"},
-            "latency": {"xMetric": "e2e_output_token_throughput", "yMetric": "input_token_throughput", "yNorm": "prefill"},
-        },
+        chart_defaults=chart_defaults,
     )
     page = output.read_text(encoding="utf-8")
     page = page.replace(

@@ -344,12 +344,10 @@ class CampaignTests(unittest.TestCase):
             page = (output / "index.html").read_text()
             self.assertIn("MOCK DATA", page)
             self.assertIn("nightly / baseline", page)
-            self.assertIn("N/A (using configured image; no source commit)", page)
-            identity_table = page.split("<table class='campaign-identity'>", 1)[1].split("</table>", 1)[0]
-            self.assertEqual(identity_table.count("<tr>"), 3)  # header and one row per overlay
-            measurements_table = page.split("<div class='campaign-measurements'>", 1)[1].split("</table>", 1)[0]
-            self.assertNotIn("<th>Artifacts</th>", measurements_table)
-            self.assertNotIn("<th>vLLM source commits</th>", measurements_table)
+            self.assertIn("Campaign validated", page)
+            self.assertIn("<summary>Run identity</summary>", page)
+            self.assertNotIn("<h2>Builds</h2>", page)
+            self.assertNotIn("<h2>All configurations</h2>", page)
             self.assertIn(config["vllm_image"], (output / "nightly-baseline/manifest.yaml").read_text())
             self.assertFalse((output / "nightly-baseline/prebuild-job.yaml").exists())
             with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
@@ -527,11 +525,11 @@ class CampaignTests(unittest.TestCase):
             measurements = runner.aiperf_measurements(root, run_id, [1, 4, 1])
             self.assertEqual(len(measurements), 3)
             self.assertEqual(sum(item["metrics"]["request_throughput"]["avg"] for item in measurements), 12)
-            fragment = runner.write_summary(root, {"id": "test", "status": "completed", "overlays": [
+            runner.write_summary(root, {"id": "test", "status": "completed", "overlays": [
                 {"name": "build-baseline", "build": "build", "overlay": "baseline", "status": "completed",
                  "benchmarks": [{"tool": "aiperf", "status": "completed", "measurements": measurements,
                                  "report": f"/workload/aiperf-agentx/{run_id}/index.html"}]}]})
-            self.assertIn(f"../../aiperf-agentx/{run_id}/index.html", fragment)
+            self.assertIn(f"/workload/aiperf-agentx/{run_id}/index.html", (root / "comparison.csv").read_text())
             self.assertFalse((root / "index.html").exists())
             with self.assertRaisesRegex(RuntimeError, "unexpected|expected"):
                 runner.aiperf_measurements(root, run_id, [1, 4, 4])
@@ -551,6 +549,18 @@ class CampaignTests(unittest.TestCase):
                  "benchmarks": [{"tool": "nyann", "status": "completed", "measurements": measurements}]}]})
             comparison = (Path(directory) / "comparison.csv").read_text()
             self.assertIn("build,pd,nyann,stage-1,1,completed,10,1,2.0,req/s,20,tokens/s,30,ms,4,ms", comparison)
+
+    def test_failed_campaign_without_samples_uses_shared_report_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner.write_final_report(root, {"id": "empty-campaign", "status": "failed",
+                                             "error": "source checkout failed", "overlays": [],
+                                             "planned_deployments": 2})
+            page = (root / "index.html").read_text()
+            self.assertIn("Campaign failed", page)
+            self.assertIn("0/2 deployments completed", page)
+            self.assertIn("source checkout failed", page)
+            self.assertNotIn("<h2>All configurations</h2>", page)
 
     def test_final_html_embeds_all_aiperf_variants_and_nyann_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -601,6 +611,13 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("branch2@bbbbbbbbbbbb", page)
             self.assertIn("branch3@cccccccccccc", page)
             self.assertIn("nyann", page)
+            chart = re.search(r"const CONFIGS = (\{.*?\});", page)
+            self.assertIsNotNone(chart)
+            labels = [item["label"] for item in json.loads(chart.group(1)).values()]
+            self.assertTrue(any("/ Nyann" in label for label in labels))
+            self.assertTrue(any("/ AIPerf" in label for label in labels))
+            self.assertNotIn("<h2>Builds</h2>", page)
+            self.assertNotIn("<h2>All configurations</h2>", page)
             self.assertIn(base64.b64encode(dashboard.encode()).decode(), page)
             self.assertIn('id="monitoring-overlay"', page)
             self.assertFalse((destination / "monitoring-overlay.html").exists())

@@ -362,20 +362,15 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
 - `<build>-<overlay>/manifest.yaml`, `serving-pods.json`, and submit logs.
 - `summary.json`: resolved build inputs, every combination, benchmark status,
   artifacts, and per-concurrency AIPerf and nyann measurements.
-- `comparison.csv` and `index.html`: the final HTML is one portable report for
-  every build, overlay, and sweep. A compact run identity table has one row
-  per deployment with its llm-d commit, every pinned vLLM build commit, any
-  DeepEP commit, and the configured image. A separate measurements table shows
-  AIPerf and nyann throughput, latency, dimensions, and status. The CSV keeps
-  every metric and artifact path per sample. The chart labels identify each variant by
-  its build commits; the source details below the charts retain full hashes,
-  the configured image, and any DeepEP commit. Nightly runs show their image
-  because they have no pinned vLLM source commit; the commits cell says this
-  explicitly. The existing AIPerf renderer
-  draws cross-variant charts and embeds saved Grafana dashboards in that same
-  HTML file. Every requested AIPerf sample is checked, including repeated
-  concurrencies. Nyann rows come from its per-stage Job summary, also saved
-  as `nyann-job.log`.
+- `comparison.csv` and `index.html`: the CSV keeps every deployment, sample,
+  measurement, resolved commit, status, and artifact path. The single HTML uses
+  the existing interactive chart renderer for AIPerf samples and Nyann stages
+  across builds and overlays. Its compact header shows campaign status and
+  failures; Run identity expands to show full llm-d and vLLM source commits,
+  the configured image, and optional DeepEP commit. It embeds saved Grafana
+  dashboards for AIPerf samples. Every requested AIPerf sample is checked,
+  including repeated concurrencies. Nyann stages come from its Job summary,
+  also saved as `nyann-job.log`.
 
 Full AIPerf and nyann artifacts stay in their existing `/workload/aiperf-agentx`
 and `/workload/nyann-agentx` directories, keyed by campaign, overlay, and tool.
