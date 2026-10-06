@@ -195,6 +195,16 @@ Grafana exporter for those samples. Run it again to refresh the preview. It leav
 campaign and its final `index.html` untouched. Before the first sample finishes,
 it reports that no preview is available.
 
+If monitoring was added to the JSON after a `run-local` campaign started,
+regenerate its final HTML after the campaign finishes:
+
+```bash
+python3 campaign/run.py report-local examples/campaign.glm52-h200-kermit.json --output /tmp/glm52-campaign-live
+```
+
+This exports Grafana dashboards for completed AIPerf samples and rebuilds the
+existing chart report from the saved local artifacts.
+
 The orchestrator applies one serving overlay at a time and submits the AIPerf
 and nyann Jobs to the cluster. A temporary Pod mounts `results_pvc` so completed
 benchmark artifacts can be copied into the local output directory. The final

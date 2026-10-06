@@ -1655,6 +1655,31 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
     return 0
 
 
+def report_local(config: dict[str, Any], output: Path) -> int:
+    """Backfill Grafana dashboards and regenerate a finished local campaign report."""
+    campaign_dir = output.resolve() / "campaigns" / config["id"]
+    saved_config = campaign_dir / "campaign.json"
+    if not saved_config.is_file():
+        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    saved = json.loads(saved_config.read_text())
+    if {key: value for key, value in saved.items() if key != "monitoring"} != \
+            {key: value for key, value in config.items() if key != "monitoring"}:
+        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    summary = json.loads((campaign_dir / "summary.json").read_text())
+    if summary["status"] == "running":
+        raise ValueError("campaign is still running; use preview-local until it finishes")
+    if "monitoring" in config:
+        for record in summary["overlays"]:
+            for bench in record.get("benchmarks", []):
+                if bench.get("tool") != "aiperf" or not bench.get("measurements"):
+                    continue
+                export_campaign_monitoring(config, Path(bench["artifacts"]), bench["job"],
+                                           record["serving_pods"], bench["measurements"])
+    write_final_report(campaign_dir, summary)
+    print(f"Final report: {campaign_dir / 'index.html'}")
+    return 0
+
+
 def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     namespace, campaign_id = config["namespace"], config["id"]
     if "monitoring" in config and "grafana_service" in config["monitoring"]:
@@ -1701,7 +1726,7 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local", "preview-local"])
+    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local", "preview-local", "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
@@ -1730,6 +1755,10 @@ def main() -> int:
             if args.output is None:
                 raise ValueError("--output is required for preview-local")
             return preview_local(config, args.output)
+        if args.action == "report-local":
+            if args.output is None:
+                raise ValueError("--output is required for report-local")
+            return report_local(config, args.output)
         return run(config)
     except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         print(f"campaign: {exc}", file=sys.stderr)
