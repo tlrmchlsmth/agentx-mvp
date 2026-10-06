@@ -458,6 +458,29 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "without credentials"):
                 runner.load_config(path)
 
+    def test_campaign_passes_explicit_model_api_url_to_benchmarks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["base_url"] = "http://wide-ep-epp.vllm.svc.cluster.local/v1"
+            path = root / "config.json"
+            path.write_text(json.dumps(config))
+            runner.load_config(path)
+            config["base_url"] = "http://user:password@wide-ep-epp.vllm/v1"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "base_url"):
+                runner.load_config(path)
+            config["base_url"] = "http://wide-ep-epp.vllm.svc.cluster.local/v1"
+
+            def capture_call(args, **kwargs):
+                self.assertEqual(kwargs["env"]["BASE_URL"], config["base_url"])
+                raise RuntimeError("URL passed to submitter")
+
+            with patch.object(runner, "call", side_effect=capture_call):
+                with self.assertRaisesRegex(RuntimeError, "URL passed to submitter"):
+                    runner.submit_benchmark(config, config["overlays"][0], config["benchmarks"][0],
+                                            root, [], None, "a" * 40)
+
     def test_campaign_monitoring_uses_existing_exporter_and_secret_env(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

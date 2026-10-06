@@ -99,7 +99,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text())
     if not isinstance(config, dict):
         raise ValueError("campaign must be a JSON object")
-    allowed = {"id", "namespace", "source", "vllm_image", "build_repo", "builds", "monitoring", "results_pvc", "benchmark_queue",
+    allowed = {"id", "namespace", "source", "vllm_image", "build_repo", "builds", "monitoring", "base_url", "results_pvc", "benchmark_queue",
                "campaign_queue", "overlays", "benchmarks", "rollout_timeout_seconds",
                "admission_timeout_seconds", "cleanup_timeout_seconds", "continue_on_failure"}
     if set(config) - allowed:
@@ -111,6 +111,13 @@ def load_config(path: Path) -> dict[str, Any]:
     image = config.get("vllm_image")
     if not isinstance(image, str) or not image or len(image) > 512 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*", image):
         raise ValueError("vllm_image must be an explicit container image reference")
+    if "base_url" in config:
+        url = config["base_url"]
+        if not isinstance(url, str) or len(url) > 512:
+            raise ValueError("base_url must be an HTTP(S) model API URL")
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or not parsed.path.endswith("/v1"):
+            raise ValueError("base_url must be an HTTP(S) model API URL ending in /v1 without credentials")
     if "monitoring" in config:
         monitoring = config["monitoring"]
         if not isinstance(monitoring, dict) or set(monitoring) != {"grafana_url", "auth_secret", "dashboard_uid"}:
@@ -779,6 +786,8 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
                 "LIVE_BENCHMARK_SOURCE_REF": config["source"]["ref"],
                 "LIVE_BENCHMARK_SOURCE_COMMIT": source_commit,
                 "LIVE_BENCHMARK_SOURCE_KIND": "llm-d"})
+    if "base_url" in config:
+        env["BASE_URL"] = config["base_url"]
     concurrencies = ",".join(str(value) for value in bench["concurrencies"])
     if tool == "aiperf":
         cmd = ["bash", str(ROOT / "live-aiperf/submit.sh"), concurrencies, str(bench["duration_seconds"])]

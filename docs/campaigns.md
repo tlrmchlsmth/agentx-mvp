@@ -20,6 +20,8 @@ must never use that queue or it could block its own children.
    it for prebuild Jobs.
    The overlays' `imagePullPolicy` still controls whether a moving tag is
    refreshed; use `Always` for a nightly tag.
+   Set `base_url` to the in-cluster `/v1` model API endpoint when the serving
+   router is not at the benchmark submitters' default Istio gateway address.
    Set
    `build_repo` and list named `builds` with ordered `steps` when comparing vLLM
    branches. The first

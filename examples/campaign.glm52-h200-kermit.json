@@ -6,6 +6,7 @@
     "ref": "main"
   },
   "vllm_image": "docker.io/vllm/vllm-openai:nightly",
+  "base_url": "http://wide-ep-epp.ecrncevi-glm52-campaign.svc.cluster.local/v1",
   "build_repo": "https://github.com/vllm-project/vllm.git",
   "builds": [
     {
