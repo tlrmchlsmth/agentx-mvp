@@ -298,8 +298,6 @@ def load_config(path: Path) -> dict[str, Any]:
             for key in ("isl", "osl"):
                 bounded_int(bench[key], key, 1, 1000000)
             bounded_int(bench["warmup_seconds"], "warmup_seconds", 0, 3600)
-    if "monitoring" in config and "aiperf" not in tools:
-        raise ValueError("monitoring requires an aiperf benchmark")
     if len("campaign-" + config["id"]) > 63:
         raise ValueError("campaign ID is too long for Kubernetes Job/ConfigMap names")
     combined_names = set()
@@ -913,6 +911,50 @@ def nyann_live_measurements(log: str, concurrencies: list[int], duration_seconds
     return [stages[index] for index in sorted(stages)]
 
 
+def nyann_stage_windows(log: str, concurrencies: list[int],
+                        measurements: list[dict[str, Any]], duration_seconds: int) -> dict[str, tuple[float, float]]:
+    """Use Nyann's recorded stage times, or completed live rows and scheduled duration."""
+    decoder = json.JSONDecoder()
+    for match in reversed(list(re.finditer(r"(?m)^\{", log))):
+        try:
+            candidate, _ = decoder.raw_decode(log[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("stages"), list):
+            continue
+        timestamps = candidate.get("timestamps", {}).get("stages", [])
+        if len(timestamps) != len(concurrencies) or [stage.get("concurrency") for stage in timestamps] != concurrencies:
+            raise RuntimeError("Nyann stage timestamps differ from the requested sweep")
+        windows = {}
+        for index, stage in enumerate(timestamps, 1):
+            start, end = stage["start_time"], stage["end_time"]
+            if not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or end <= start:
+                raise RuntimeError(f"Nyann stage {index} has invalid timestamps")
+            windows[f"stage-{index}"] = (start, end)
+        return windows
+    starts = {}
+    for match in re.finditer(
+        r'(?m)^time=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z).*?'
+        r'Stage started" stage=(\d+)/\d+ concurrency=(\d+)', log):
+        timestamp, index, concurrency = match.groups()
+        index = int(index)
+        if 1 <= index <= len(concurrencies) and concurrencies[index - 1] == int(concurrency):
+            starts[index] = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+    windows = {}
+    for measurement in measurements:
+        match = re.fullmatch(r"stage-(\d+)", measurement["sample"])
+        if match is None:
+            continue
+        index = int(match.group(1))
+        if index not in starts:
+            continue
+        start = starts[index]
+        end = starts.get(index + 1, start + duration_seconds)
+        if end > start:
+            windows[measurement["sample"]] = (start, end)
+    return windows
+
+
 @contextmanager
 def grafana_connection(monitoring: dict[str, str]):
     """Use configured in-cluster URL or a short-lived local service tunnel."""
@@ -987,6 +1029,55 @@ def export_campaign_monitoring(config: dict[str, Any], artifact: Path, job_name:
     if any(not (directory / "dashboard.html").is_file() or not (directory / "dashboard.html").stat().st_size
            for directory in directories):
         raise RuntimeError("Grafana exporter did not produce every AIPerf dashboard")
+
+
+def export_nyann_monitoring(config: dict[str, Any], overlay_dir: Path, serving_pods: list[str],
+                            measurements: list[dict[str, Any]], log: str, bench: dict[str, Any]) -> None:
+    """Export one Grafana dashboard for each completed Nyann stage."""
+    monitoring = config.get("monitoring")
+    if not monitoring or not measurements:
+        return
+    names = [entry.split(":", 1)[0] for entry in serving_pods]
+    if not names:
+        raise RuntimeError("Nyann Grafana export needs the serving Pod names")
+    windows = nyann_stage_windows(log, bench["concurrencies"], measurements, bench["duration_seconds"])
+    if {item["sample"] for item in measurements} - set(windows):
+        raise RuntimeError("Nyann log has no time window for a completed stage")
+    tasks = []
+    for measurement in measurements:
+        sample = measurement["sample"]
+        start, end = windows[sample]
+        directory = overlay_dir / "nyann" / sample
+        directory.mkdir(parents=True, exist_ok=True)
+        dashboard = directory / "dashboard.html"
+        marker = directory / "dashboard-window.json"
+        identity = {"start": start, "end": end, "pods": names,
+                    "dashboard_uid": monitoring["dashboard_uid"]}
+        if dashboard.is_file() and dashboard.stat().st_size and AIPERF_REPORT.read_json(marker) == identity:
+            continue
+        tasks.append((sample, start, end, directory, dashboard, marker, identity))
+    if not tasks:
+        return
+    with grafana_connection(monitoring) as (url, auth):
+        env = os.environ.copy()
+        env["CAMPAIGN_GRAFANA_AUTH"] = auth
+        for sample, start, end, directory, dashboard, marker, identity in tasks:
+            staged = directory / "dashboard.html.tmp"
+            command = [sys.executable, str(ROOT / "export_dashboard.py"),
+                       "--grafana-url", url, "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
+                       "--dashboard", monitoring["dashboard_uid"],
+                       "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
+                       "--pod-regex", "|".join(re.escape(name) for name in names),
+                       "--metrics-namespace", config["namespace"],
+                       "single", "--start", str(start), "--end", str(end), "--output", str(staged)]
+            try:
+                call(command, env=env)
+                if not staged.is_file() or not staged.stat().st_size:
+                    raise RuntimeError(f"Grafana exporter did not produce {sample} dashboard")
+                staged.replace(dashboard)
+                marker.write_text(json.dumps(identity, indent=2) + "\n")
+            finally:
+                staged.unlink(missing_ok=True)
 
 
 def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dict[str, Any],
@@ -1067,6 +1158,10 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
         log = kube(config["namespace"], "logs", f"job/{job_name}").stdout
         (campaign_dir / "nyann-job.log").write_text(log)
         measurements = nyann_measurements(log, bench["concurrencies"])
+        try:
+            export_nyann_monitoring(config, campaign_dir, baseline, measurements, log, bench)
+        except Exception as exc:
+            monitoring_error = f"Grafana export failed: {exc}"
     result = {"tool": tool, "job": job_name, "run_id": run_id, "artifacts": str(artifact),
             "report": f"{artifact}/index.html" if tool == "aiperf" else None,
             "measurements": measurements, "status": "failed" if monitoring_error else "completed"}
@@ -1142,8 +1237,10 @@ def nyann_chart_runs(destination: Path, summary: dict[str, Any], record: dict[st
     for measurement in bench["measurements"]:
         concurrency = measurement["concurrency"]
         seen[concurrency] += 1
+        directory = destination / record["name"] / "nyann" / measurement["sample"]
+        dashboard = directory / "dashboard.html"
         runs.append({
-            "directory": destination / record["name"] / "nyann" / measurement["sample"],
+            "directory": directory,
             "profile": measurement["metrics"],
             "metadata": {
                 "run_id": f"{bench.get('run_id', summary['id'] + '-' + record['name'] + '-nyann')}-c{concurrency}",
@@ -1157,7 +1254,8 @@ def nyann_chart_runs(destination: Path, summary: dict[str, Any], record: dict[st
                 "vllm_build_steps": steps, "deepep_build": build.get("deepep"),
                 **(gpu_metadata or {}),
             },
-            "yaml": "", "aiperf_job_yaml": "", "llmd_yaml": "", "dashboard": None,
+            "yaml": "", "aiperf_job_yaml": "", "llmd_yaml": "",
+            "dashboard": dashboard.read_bytes() if dashboard.is_file() else None,
         })
     return runs
 
@@ -2154,6 +2252,23 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
                     if not measurements:
                         continue
                     nyann_result = {"tool": "nyann", "measurements": measurements}
+                if monitoring:
+                    folder = campaign_dir / record["name"]
+                    log_path = folder / "nyann-live.log"
+                    if not log_path.is_file():
+                        log_path = folder / "nyann-job.log"
+                    try:
+                        if not log_path.is_file():
+                            raise RuntimeError("Nyann Job log is unavailable")
+                        pods_file = folder / "serving-pods.json"
+                        if pods_file.is_file():
+                            pods = [item["metadata"]["name"] for item in json.loads(pods_file.read_text())["items"]]
+                        else:
+                            pods = record.get("serving_pods", [])
+                        export_nyann_monitoring(config, folder, pods, nyann_result["measurements"],
+                                                log_path.read_text(errors="replace"), spec)
+                    except Exception as exc:
+                        missing_monitoring.append(f"{record['name']} Nyann: {exc}")
                 runs.extend(nyann_chart_runs(campaign_dir, summary, record, nyann_result))
         completed = {(path.parent.parent.name, path.parent.name) for path in paths}
         started = {(path.parent.name, path.name) for line in directories.splitlines()
@@ -2266,12 +2381,20 @@ def report_local(config: dict[str, Any], output: Path) -> int:
     summary.setdefault("source_ref", config["source"]["ref"])
     summary.setdefault("planned_deployments", len(config["overlays"]) * len(config.get("builds", [None])))
     if "monitoring" in config:
+        nyann_spec = next((bench for bench in config["benchmarks"] if bench["tool"] == "nyann"), None)
         for record in summary["overlays"]:
             for bench in record.get("benchmarks", []):
-                if bench.get("tool") != "aiperf" or not bench.get("measurements"):
+                if not bench.get("measurements"):
                     continue
-                export_campaign_monitoring(config, Path(bench["artifacts"]), bench["job"],
-                                           record["serving_pods"], bench["measurements"])
+                if bench.get("tool") == "aiperf":
+                    export_campaign_monitoring(config, Path(bench["artifacts"]), bench["job"],
+                                               record["serving_pods"], bench["measurements"])
+                elif bench.get("tool") == "nyann" and nyann_spec:
+                    folder = campaign_dir / record["name"]
+                    log_path = folder / "nyann-job.log"
+                    export_nyann_monitoring(config, folder, record["serving_pods"],
+                                            bench["measurements"], log_path.read_text(errors="replace"),
+                                            nyann_spec)
     write_final_report(campaign_dir, summary)
     print(f"Final report: {campaign_dir / 'index.html'}")
     return 0

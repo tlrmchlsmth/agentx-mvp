@@ -293,8 +293,14 @@ regenerate its final HTML after the campaign finishes:
 python3 campaign/run.py report-local examples/campaign.glm52-h200-kermit.json --output /tmp/glm52-campaign-live
 ```
 
-This exports Grafana dashboards for completed AIPerf samples and rebuilds the
-existing chart report from the saved local artifacts.
+This exports Grafana dashboards for completed AIPerf samples and Nyann stages,
+then rebuilds the existing chart report from the saved local artifacts. For a
+running Nyann campaign, add the `monitoring` block to the local JSON and run
+`campaign-download-cluster` again. The saved campaign identity check permits
+this monitoring addition. Each completed stage is scraped over its measured
+start/end timestamps (or its configured duration while the final summary is
+still pending); cached dashboards make later refreshes faster. Apply the
+PodMonitor before the benchmark so the historical vLLM series exist in Grafana.
 
 The orchestrator applies one serving overlay at a time and submits the AIPerf
 and nyann Jobs to the cluster. A temporary Pod mounts `results_pvc` so completed
@@ -369,7 +375,7 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
   across builds and overlays. Its compact header shows campaign status and
   failures; Run identity expands to show full llm-d and vLLM source commits,
   the configured image, and optional DeepEP commit. It embeds saved Grafana
-  dashboards for AIPerf samples. Every requested AIPerf sample is checked,
+  dashboards for AIPerf samples and Nyann stages. Every requested AIPerf sample is checked,
   including repeated concurrencies. Nyann stages come from its Job summary,
   also saved as `nyann-job.log`.
 

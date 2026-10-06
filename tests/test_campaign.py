@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -562,6 +563,53 @@ class CampaignTests(unittest.TestCase):
                  "benchmarks": [{"tool": "nyann", "status": "completed", "measurements": measurements}]}]})
             comparison = (Path(directory) / "comparison.csv").read_text()
             self.assertIn("build,pd,nyann,stage-1,1,completed,10,1,2.0,req/s,20,tokens/s,30,ms,4,ms", comparison)
+
+    def test_nyann_monitoring_uses_stage_windows_and_cached_exporter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["benchmarks"] = [{"tool": "nyann", "concurrencies": [1, 8],
+                                     "duration_seconds": 600, "isl": 1024, "osl": 512,
+                                     "warmup_seconds": 60}]
+            config["monitoring"] = {"grafana_url": "http://grafana.example",
+                                    "auth_secret": "grafana", "dashboard_uid": "wideep-overview"}
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config))
+            runner.load_config(config_path)
+            measurements = [{"sample": "stage-1", "concurrency": 1, "metrics": {}}]
+            live_log = ('time=2026-10-06T19:00:00.000Z msg="Stage started" stage=1/2 concurrency=1\n'
+                        '  1  100  0  1000  1.0  2.0ms  2.0ms  2.0ms  2.0ms  2.0ms  2.0ms  2.0ms  2.0ms  2.0ms\n'
+                        'time=2026-10-06T19:10:00.000Z msg="Stage started" stage=2/2 concurrency=8\n')
+            expected_start = runner.datetime.fromisoformat("2026-10-06T19:00:00+00:00").timestamp()
+            self.assertEqual(runner.nyann_stage_windows(live_log, [1, 8], measurements, 600),
+                             {"stage-1": (expected_start, expected_start + 600)})
+            final_log = json.dumps({"stages": [{"concurrency": 1}, {"concurrency": 8}],
+                                    "timestamps": {"stages": [
+                                        {"concurrency": 1, "start_time": 100, "end_time": 695},
+                                        {"concurrency": 8, "start_time": 700, "end_time": 1298}]}})
+            self.assertEqual(runner.nyann_stage_windows(final_log, [1, 8], measurements, 600),
+                             {"stage-1": (100, 695), "stage-2": (700, 1298)})
+            commands = []
+
+            def fake_call(args, **kwargs):
+                commands.append((args, kwargs))
+                Path(args[args.index("--output") + 1]).write_text("<html>Grafana panel</html>")
+                return SimpleNamespace(stdout="exported")
+
+            with patch.object(runner, "grafana_connection", return_value=nullcontext(("http://grafana", "secret"))), \
+                 patch.object(runner, "call", side_effect=fake_call):
+                runner.export_nyann_monitoring(config, root, ["pod-one:uid"], measurements,
+                                               live_log, config["benchmarks"][0])
+                runner.export_nyann_monitoring(config, root, ["pod-one:uid"], measurements,
+                                               live_log, config["benchmarks"][0])
+            self.assertEqual(len(commands), 1)
+            command, kwargs = commands[0]
+            self.assertIn("single", command)
+            self.assertEqual(command[command.index("--start") + 1], str(expected_start))
+            self.assertEqual(command[command.index("--end") + 1], str(expected_start + 600))
+            self.assertEqual(kwargs["env"]["CAMPAIGN_GRAFANA_AUTH"], "secret")
+            self.assertNotIn("secret", " ".join(command))
+            self.assertTrue((root / "nyann/stage-1/dashboard.html").is_file())
 
     def test_failed_campaign_without_samples_uses_shared_report_document(self):
         with tempfile.TemporaryDirectory() as directory:
