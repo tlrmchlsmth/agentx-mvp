@@ -859,12 +859,22 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
     try:
         wait_job(config, job_name, config["admission_timeout_seconds"] + runtime)
     except Exception as failure:
+        diagnostics_path = campaign_dir / f"{tool}-job-failure.txt"
+        diagnostics = []
+        for label, args in (("Job", ("describe", "job", job_name)),
+                            ("Pods", ("describe", "pods", "-l", f"job-name={job_name}"))):
+            try:
+                result = kube(config["namespace"], *args, check=False)
+                diagnostics.append(f"## {label}\n{result.stdout}{result.stderr}")
+            except Exception as exc:
+                diagnostics.append(f"## {label}\nCould not collect diagnostics: {exc}\n")
+        diagnostics_path.write_text("\n".join(diagnostics))
         deleted = kube(config["namespace"], "delete", "job", job_name, "--ignore-not-found",
                        "--cascade=foreground", "--wait=true",
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
         if deleted.returncode:
             raise CleanupError(f"could not remove child Job {job_name}: {deleted.stderr.strip()}") from failure
-        raise
+        raise RuntimeError(f"{failure}; diagnostics: {diagnostics_path}") from failure
     if snapshot(config["namespace"], overlay["pod_selector"]) != baseline or build_commit(config["namespace"]) != commit:
         raise RuntimeError(f"{overlay['name']}: serving deployment changed during {tool} benchmark")
     artifact = Path(f"/workload/{'aiperf-agentx' if tool == 'aiperf' else 'nyann-agentx'}/{run_id}")
