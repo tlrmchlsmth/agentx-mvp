@@ -193,7 +193,11 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
   artifacts, and per-concurrency AIPerf and nyann measurements.
 - `comparison.csv` and `index.html`: the final HTML is one portable report for
   every build, overlay, and sweep. Its table includes AIPerf and nyann
-  throughput, latency, dimensions, and status. The existing AIPerf renderer
+  throughput, latency, dimensions, status, the llm-d commit, and every pinned
+  vLLM build commit for that run. The chart labels identify each variant by
+  its build commits; the source details below the charts retain full hashes,
+  the configured image, and any DeepEP commit. Nightly runs show their image
+  because they have no pinned vLLM source commit. The existing AIPerf renderer
   draws cross-variant charts and embeds saved Grafana dashboards in that same
   HTML file. Every requested AIPerf sample is checked, including repeated
   concurrencies. Nyann rows come from its per-stage Job summary, also saved

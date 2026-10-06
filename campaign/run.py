@@ -187,7 +187,8 @@ def load_config(path: Path) -> dict[str, Any]:
         reserved = {"build", "overlay", "tool", "sample", "concurrency", "status", "requests_per_s",
                     "output_tokens_per_s", "ttft_p90", "itl_p90", "artifacts", "error",
                     "successful_requests", "error_requests", "requests_unit", "output_tokens_unit",
-                    "ttft_unit", "itl_unit", "report"}
+                    "ttft_unit", "itl_unit", "report", "llm_d_commit", "vllm_commits",
+                    "deepep_commit", "vllm_image"}
         if not isinstance(dimensions, dict) or len(dimensions) > 16 or any(
             not isinstance(key, str) or not DIMENSION_NAME.fullmatch(key) or key in reserved or
             not isinstance(value, (str, int, float, bool)) or len(str(value)) > 80
@@ -771,7 +772,8 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
     fields = ["build", "overlay", *dimensions, "tool", "sample", "concurrency", "status",
               "successful_requests", "error_requests",
               "requests_per_s", "requests_unit", "output_tokens_per_s", "output_tokens_unit",
-              "ttft_p90", "ttft_unit", "itl_p90", "itl_unit", "report", "artifacts", "error"]
+              "ttft_p90", "ttft_unit", "itl_p90", "itl_unit", "report", "artifacts", "error",
+              "llm_d_commit", "vllm_commits", "deepep_commit", "vllm_image"]
     rows = []
     for record in summary["overlays"]:
         for bench in record.get("benchmarks") or [{"tool": "", "status": record["status"], "error": record.get("error", "")}]:
@@ -791,7 +793,13 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
                        "itl_p90": metrics.get("inter_token_latency", {}).get("p90", ""),
                        "itl_unit": metrics.get("inter_token_latency", {}).get("unit", ""),
                        "report": bench.get("report", ""),
-                       "artifacts": bench.get("artifacts", ""), "error": bench.get("error", "")}
+                       "artifacts": bench.get("artifacts", ""), "error": bench.get("error", ""),
+                       "llm_d_commit": summary.get("source_commit", ""),
+                       "vllm_commits": ", ".join(
+                           f"{step['action']} {step['ref']}@{step['commit']}"
+                           for step in record.get("vllm_build_inputs", {}).get("steps", [])),
+                       "deepep_commit": record.get("vllm_build_inputs", {}).get("deepep", {}).get("commit", ""),
+                       "vllm_image": summary.get("vllm_image", "")}
                 row.update(record.get("dimensions", {}))
                 rows.append(row)
     with (destination / "comparison.csv").open("w", newline="") as output:
@@ -843,14 +851,30 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
             if bench.get("tool") != "aiperf" or (bench.get("status") != "completed" and not bench.get("measurements")):
                 continue
             artifact = Path(bench["artifacts"])
+            sweep_runs = 0
             for directory in sorted(artifact.iterdir()):
                 data = AIPERF_REPORT.run_data(directory)
                 if data is None:
                     continue
                 label = f"{record.get('build', 'default')} / {record.get('overlay', record['name'])}"
                 dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
-                data["metadata"]["campaign_label"] = f"{label} ({dimensions})" if dimensions else label
+                build = record.get("vllm_build_inputs", {})
+                steps = build.get("steps", [])
+                identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
+                label += f" — vLLM {identity or summary.get('vllm_image', 'nightly image')}"
+                data["metadata"].update({
+                    "campaign_label": f"{label} ({dimensions})" if dimensions else label,
+                    "vllm_image": summary.get("vllm_image", ""),
+                    "vllm_build_steps": steps,
+                    "vllm_build_commit": record.get("vllm_build_commit", steps[0]["commit"] if steps else ""),
+                    "deepep_build": build.get("deepep"),
+                })
+                metadata_file = directory / "benchmark-metadata.json"
+                metadata_file.write_text(json.dumps(data["metadata"], indent=2) + "\n")
                 runs.append(data)
+                sweep_runs += 1
+            if sweep_runs:
+                AIPERF_REPORT.write_index(artifact)
     fragment = write_summary(destination, summary, embedded_reports=bool(runs))
     if runs:
         AIPERF_REPORT.write_index_from_runs(destination, runs, extra_html=fragment,
@@ -1085,7 +1109,8 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
     destination = results_root / "campaigns" / config["id"]
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "campaign.json").write_text(json.dumps(config, indent=2) + "\n")
-    summary: dict[str, Any] = {"id": config["id"], "status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "overlays": []}
+    summary: dict[str, Any] = {"id": config["id"], "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
+                               "vllm_image": config["vllm_image"], "overlays": []}
     write_summary(destination, summary)
     try:
         overlay_root, source_commit = fetch_source(config["source"])

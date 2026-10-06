@@ -265,6 +265,7 @@ class CampaignTests(unittest.TestCase):
             destination.mkdir(parents=True)
             records = []
             for build, throughput in (("branch2", 10), ("branch3", 20)):
+                build_commit = ("b" if build == "branch2" else "c") * 40
                 run_id = f"campaign-{build}-pd-aiperf"
                 sample = root / "aiperf-agentx" / run_id / "c1"
                 sample.mkdir(parents=True)
@@ -282,6 +283,9 @@ class CampaignTests(unittest.TestCase):
                 (sample / "dashboard.html").write_text(dashboard)
                 records.append({"name": f"{build}-pd", "build": build, "overlay": "pd",
                                 "dimensions": {"mtp": "off"}, "status": "completed",
+                                "vllm_build_inputs": {"mode": "source", "steps": [
+                                    {"action": "checkout", "ref": "branch0", "commit": "d" * 40},
+                                    {"action": "merge", "ref": build, "commit": build_commit}]},
                                 "benchmarks": [{"tool": "aiperf", "status": "completed",
                                                 "artifacts": str(sample.parent),
                                                 "report": f"/workload/aiperf-agentx/{run_id}/index.html",
@@ -289,17 +293,32 @@ class CampaignTests(unittest.TestCase):
             records[0]["benchmarks"].append({"tool": "nyann", "status": "completed",
                                               "measurements": [{"sample": "stage-1", "concurrency": 4,
                                                                 "metrics": {"request_throughput": {"avg": 7}}}]})
-            summary = {"id": "campaign", "status": "completed", "overlays": records}
+            summary = {"id": "campaign", "status": "completed", "source_commit": "a" * 40,
+                       "vllm_image": "vllm/example@sha256:abc", "overlays": records}
             runner.write_final_report(destination, summary)
             page = (destination / "index.html").read_text()
             self.assertIn("branch2 / pd", page)
             self.assertIn("branch3 / pd", page)
+            self.assertIn("b" * 40, page)
+            self.assertIn("c" * 40, page)
+            self.assertIn("branch2@bbbbbbbbbbbb", page)
+            self.assertIn("branch3@cccccccccccc", page)
             self.assertIn("nyann", page)
             self.assertIn(base64.b64encode(dashboard.encode()).decode(), page)
             self.assertIn('id="monitoring-overlay"', page)
             self.assertFalse((destination / "monitoring-overlay.html").exists())
             self.assertNotIn('src="https://cdn.plot.ly', page)
             self.assertNotIn("../../aiperf-agentx", page)
+            comparison = (destination / "comparison.csv").read_text()
+            self.assertIn("merge branch2@" + "b" * 40, comparison)
+            self.assertIn("merge branch3@" + "c" * 40, comparison)
+            for build, commit in (("branch2", "b" * 40), ("branch3", "c" * 40)):
+                metadata = json.loads((root / "aiperf-agentx" / f"campaign-{build}-pd-aiperf" /
+                                       "c1/benchmark-metadata.json").read_text())
+                self.assertEqual(metadata["vllm_build_steps"][-1]["commit"], commit)
+                self.assertEqual(metadata["source_commit"], "a" * 40)
+                self.assertIn(commit, (root / "aiperf-agentx" / f"campaign-{build}-pd-aiperf" /
+                                       "index.html").read_text())
 
     def test_rejects_unsafe_source_and_records_checkout_failure(self):
         with tempfile.TemporaryDirectory() as directory:

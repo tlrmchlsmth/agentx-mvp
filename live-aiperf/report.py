@@ -298,15 +298,38 @@ def source_commit(metadata: dict[str, Any]) -> str:
     return str(metadata.get("source_commit") or metadata.get("vllm_build_commit") or "")
 
 
+def vllm_version(metadata: dict[str, Any]) -> str:
+    steps = metadata.get("vllm_build_steps")
+    if isinstance(steps, list) and steps:
+        return " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
+    return str(metadata.get("vllm_image") or source_commit(metadata))
+
+
 def source_row(data: dict[str, Any]) -> str:
     metadata = data["metadata"]
     ref = source_ref(metadata)
     commit = source_commit(metadata)
     kind = str(metadata.get("source_kind") or "vllm")
     identity = f'{html.escape(kind)} <code>{html.escape(ref)}</code>'
+    if metadata.get("campaign_label"):
+        identity = f'<strong>{html.escape(str(metadata["campaign_label"]))}</strong> — ' + identity
+    build = metadata.get("vllm_build_steps") or []
+    if build:
+        vllm_identity = "; vLLM inputs " + ", ".join(
+            f"{html.escape(step['action'])} {html.escape(step['ref'])}@<code>{html.escape(step['commit'])}</code>"
+            for step in build)
+    elif metadata.get("vllm_image"):
+        vllm_identity = f'; vLLM image <code>{html.escape(str(metadata["vllm_image"]))}</code>'
+    else:
+        vllm_identity = ""
+    deepep = metadata.get("deepep_build")
+    if isinstance(deepep, dict):
+        vllm_identity += (f'; DeepEP {html.escape(str(deepep["ref"]))}@'
+                          f'<code>{html.escape(str(deepep["commit"]))}</code>')
     counts = gpu_counts(data)
     return (
         f'<p>{identity} <code>{html.escape(commit)}</code> '
+        f'{vllm_identity} '
         f'— {number(counts["prefill_gpus"])} prefill GPUs, '
         f'{number(counts["decode_gpus"])} decode GPUs</p>'
     )
@@ -354,7 +377,7 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
             "prefill_gpus": counts["prefill_gpus"],
             "pods": str(metadata.get("topology", "live deployment")),
             "runs": {},
-            "version": source_commit(metadata),
+            "version": vllm_version(metadata),
             "yamls": {
                 "aiperf-job.yaml": data["aiperf_job_yaml"],
                 "serving-pods.yaml": data["yaml"],
