@@ -664,7 +664,7 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]], *, save_file: boo
         except (KeyError, TypeError, ValueError):
             continue
         path = data["directory"] / "dashboard.html"
-        if data.get("dashboard") and path.is_file():
+        if path.is_file():
             # The concurrency alone is not a unique identity in a merged
             # Prometheus view: reruns (and even separate sweeps) can contain
             # the same c<N>. Keep both the sweep and c<N>-r<M> visible so
@@ -681,14 +681,29 @@ def monitoring_overlay(root: Path, runs: list[dict[str, Any]], *, save_file: boo
     spec.loader.exec_module(overlay)
     file_data = []
     labels = []
+    notes = []
     for concurrency, label, path in sorted(paths, key=lambda item: (item[0], item[1])):
         panels, rows = overlay.extract_data(path)
+        queries = [query for panel in panels.values() for query in panel.get("queries", [])]
+        if not any(series.get("values") for query in queries for series in query.get("series", [])):
+            continue
+        has_vllm_data = any(
+            "vllm:" in query.get("expr", "") and
+            any(series.get("values") for series in query.get("series", []))
+            for query in queries
+        )
+        if not has_vllm_data:
+            notes.append(f"{label}: no vLLM metrics were scraped; only other available monitoring series are shown.")
+            label += " (no vLLM metrics)"
         file_data.append((panels, rows, label))
         labels.append(label)
+    if len(file_data) < 2:
+        return None
     merged = overlay.merge(file_data)
     page = overlay.generate_html(
         merged, file_data[0][1], labels,
         str(Path(__file__).with_name("plotly-basic-2.35.2.min.js.gz")),
+        notes=notes,
     )
     if save_file:
         (root / "monitoring-overlay.html").write_text(page, encoding="utf-8")

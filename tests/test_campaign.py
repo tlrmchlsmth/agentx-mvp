@@ -348,7 +348,10 @@ class CampaignTests(unittest.TestCase):
                     "output_token_throughput": {"avg": throughput * 100, "unit": "tokens/s"},
                     "time_to_first_token": {"p90": 50, "unit": "ms"},
                     "inter_token_latency": {"p90": 5, "unit": "ms"}}))
-                dashboard = '<script>const panels = {"gpu":{"title":"GPU","unit":"percent"}};\nconst rows = [];\n</script>'
+                dashboard = ('<script>const panels = {"gpu":{"title":"GPU","unit":"percent",'
+                             '"queries":[{"expr":"DCGM_FI_DEV_GPU_UTIL","series":'
+                             '[{"labels":{},"values":[[0,"50"]]}]}]}};\n'
+                             'const rows = [];\n</script>')
                 (sample / "dashboard.html").write_text(dashboard)
                 records.append({"name": f"{build}-pd", "build": build, "overlay": "pd",
                                 "dimensions": {"mtp": "off"}, "status": "completed",
@@ -462,25 +465,28 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("<td>baseline</td><td>nyann</td><td>c1, c4</td><td>pending</td>", page)
             self.assertIn("location.reload()", page)
 
-    def test_monitoring_overlay_excludes_samples_without_scraped_metrics(self):
+    def test_monitoring_overlay_includes_partial_gpu_data_and_excludes_empty_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = []
-            dashboard = ('const panels = {"1":{"title":"Requests","unit":"req/s",'
-                         '"queries":[{"expr":"vllm:num_requests_running","series":'
-                         '[{"labels":{},"values":[[0,"1"]]}]}]}};\n'
-                         'const rows = [{"type":"panel","id":"1"}];\n')
-            for concurrency in (1, 8, 32):
+            for concurrency in (1, 8, 32, 64):
                 sample = root / f"c{concurrency}"
                 sample.mkdir()
+                expr = "DCGM_FI_DEV_GPU_UTIL" if concurrency == 1 else "vllm:num_requests_running"
+                values = [] if concurrency == 64 else [[0, "1"]]
+                dashboard = (f'const panels = {{"1":{{"title":"Requests","unit":"req/s",'
+                             f'"queries":[{{"expr":"{expr}","series":'
+                             f'[{{"labels":{{}},"values":{json.dumps(values)}}}]}}]}}}};\n'
+                             'const rows = [{"type":"panel","id":"1"}];\n')
                 (sample / "dashboard.html").write_text(dashboard)
                 runs.append({"directory": sample,
                              "metadata": {"run_id": f"sweep-c{concurrency}", "concurrency": concurrency},
                              "dashboard": None if concurrency == 1 else dashboard.encode()})
-            self.assertIsNone(runner.AIPERF_REPORT.monitoring_overlay(root, runs[:2], save_file=False))
+            self.assertIsNone(runner.AIPERF_REPORT.monitoring_overlay(root, runs[1::2], save_file=False))
             page = runner.AIPERF_REPORT.monitoring_overlay(root, runs, save_file=False).decode()
             labels = json.loads(re.search(r"const labels = (\[.*?\]);", page).group(1))
-            self.assertEqual(labels, ["sweep / c8", "sweep / c32"])
+            self.assertEqual(labels, ["sweep / c1 (no vLLM metrics)", "sweep / c8", "sweep / c32"])
+            self.assertIn("sweep / c1: no vLLM metrics were scraped", page)
 
     def test_rejects_unsafe_source_and_records_checkout_failure(self):
         with tempfile.TemporaryDirectory() as directory:

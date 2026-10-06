@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
+import html
 import json
 import os
 import re
@@ -43,13 +44,14 @@ def merge(file_data):
     return merged
 
 
-def generate_html(merged, rows, labels, plotly_bundle=None):
+def generate_html(merged, rows, labels, plotly_bundle=None, *, notes=None):
     # A merged view must keep every input distinguishable.  In particular,
     # do not collapse repeated c<N> labels into one color/filter entry.
     labels = list(dict.fromkeys(labels))
     merged_json = json.dumps(merged)
     rows_json = json.dumps(rows)
     labels_json = json.dumps(labels)
+    notice_html = "".join(f'<p class="subtitle">{html.escape(note)}</p>' for note in (notes or []))
 
     plotly_tag = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
     if plotly_bundle:
@@ -97,6 +99,7 @@ def generate_html(merged, rows, labels, plotly_bundle=None):
 <body>
 <h1>Overlay Dashboard</h1>
 <div class="subtitle">{', '.join(labels)}</div>
+{notice_html}
 <div class="toolbar"><span class="toolbar-label">Run / concurrency</span><span id="concurrencyFilters"></span><button id="showAll">All</button><button id="showNone">None</button></div>
 <div id="root"></div>
 <script>

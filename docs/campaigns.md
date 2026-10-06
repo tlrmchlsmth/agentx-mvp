@@ -193,7 +193,9 @@ the first result finishes. Completed AIPerf results use the existing chart
 renderer and Grafana exporter. At the end, the preview file becomes the final
 self-contained report. Omit `--watch` to take one snapshot. A sample with no
 scraped vLLM metrics keeps its AIPerf charts and displays a missing-monitoring
-notice instead of an empty Grafana dashboard.
+notice instead of an empty per-run Grafana dashboard. The monitoring overlay
+still includes any available GPU or other time series for that sample and
+labels its missing vLLM coverage.
 
 If monitoring was added to the JSON after a `run-local` campaign started,
 regenerate its final HTML after the campaign finishes:

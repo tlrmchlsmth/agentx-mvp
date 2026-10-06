@@ -1761,7 +1761,8 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         if missing_monitoring:
             samples = ", ".join(html.escape(name) for name in missing_monitoring)
             notice += (f"<p>No vLLM Grafana samples were recorded during {samples}; "
-                       "those empty dashboards are omitted. Scraping may have begun after these runs.</p>")
+                       "their per-run vLLM dashboards are omitted. Other available monitoring "
+                       "series may still appear in the overlay.</p>")
         render = Path(temporary) / "render"
         render.mkdir()
         if runs:
