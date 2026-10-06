@@ -90,6 +90,10 @@ campaign-run-local config output:
 campaign-download-latest config output:
     python3 "{{repo_root}}/campaign/run.py" download-latest "{{config}}" --output "{{output}}"
 
+# Resume a PVC artifact directory into an existing local output directory.
+campaign-download-artifacts config remote output:
+    python3 "{{repo_root}}/campaign/run.py" download-artifacts "{{config}}" --remote "{{remote}}" --output "{{output}}"
+
 campaign-submit config:
     python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}"
 

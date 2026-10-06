@@ -210,6 +210,23 @@ This refreshes a running campaign before saving `~/Downloads/<campaign-id>-lates
 For a completed campaign it copies the final report; for a failed campaign it
 copies the last partial preview. The Python command also accepts `--dest PATH`.
 
+The local runner downloads AIPerf report inputs and Nyann artifacts from the
+results PVC in independently verified chunks. It starts with 1 MiB chunks,
+doubles the size after four successful chunks (up to 32 MiB), and halves it
+after a transfer or checksum failure. A `.part` file and checkpoint preserve
+verified chunks if the process exits. To resume a PVC artifact directory into
+the same local output after an interrupted campaign, run:
+
+```bash
+just campaign-download-artifacts examples/campaign.glm52-h200-kermit.json \
+  /workload/nyann-agentx/<run-id> /tmp/glm52-campaign-live
+```
+
+The command creates and removes a temporary PVC-mounted Pod. Repeating it
+verifies the saved chunks and downloads only what remains. The original
+artifact files stay on the PVC. AIPerf's raw traces are still excluded from
+the automatic report download; use this command to retrieve them explicitly.
+
 If monitoring was added to the JSON after a `run-local` campaign started,
 regenerate its final HTML after the campaign finishes:
 

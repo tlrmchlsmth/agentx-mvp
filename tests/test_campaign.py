@@ -268,9 +268,12 @@ class CampaignTests(unittest.TestCase):
                 if args[0] == "exec":
                     return SimpleNamespace(stdout="/workload/aiperf-agentx/sample/c1/profile_export_aiperf.json\n",
                                            stderr="", returncode=0)
-                if args[0] == "cp":
-                    Path(args[2]).write_text("{}")
                 return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+            def fake_download(namespace, pod, remote, destination):
+                actions.append("download")
+                destination.write_text("{}")
+                return destination
 
             def fake_run(value, results_root, artifact_fetcher=None):
                 self.assertEqual(results_root, output.resolve())
@@ -283,9 +286,38 @@ class CampaignTests(unittest.TestCase):
                 return 0
 
             with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner.TRANSFER, "download_file", side_effect=fake_download), \
                  patch.object(runner, "run", side_effect=fake_run):
                 self.assertEqual(runner.run_local(config, output), 0)
-            self.assertEqual(actions, ["get", "get", "create", "wait", "exec", *(["cp"] * 6), "delete"])
+            self.assertEqual(actions, ["get", "get", "create", "wait", "exec", *(["download"] * 6), "delete"])
+
+    def test_download_artifacts_uses_temporary_pvc_pod_and_existing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            output = root / "existing-output"
+            output.mkdir()
+            actions = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                actions.append(args[0])
+                if args[0] == "create":
+                    pod = json.loads(kwargs["input_text"])
+                    self.assertEqual(pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"], "results")
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            def fake_tree(namespace, pod, remote, destination):
+                actions.append("download")
+                self.assertEqual(remote, "/workload/nyann-agentx/run-1")
+                self.assertEqual(destination, output.resolve() / "nyann-agentx/run-1")
+                return destination
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner.TRANSFER, "download_tree", side_effect=fake_tree):
+                runner.download_pvc_artifacts(config, "/workload/nyann-agentx/run-1", output)
+            self.assertEqual(actions, ["create", "wait", "download", "delete"])
+            with self.assertRaisesRegex(ValueError, "below /workload"):
+                runner.download_pvc_artifacts(config, "/workload/../etc", output)
 
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -417,21 +449,21 @@ class CampaignTests(unittest.TestCase):
                     listing = (str(remote / "profile_export_aiperf.json") if "-type" in args and
                                args[args.index("-type") + 1] == "f" else str(remote))
                     return SimpleNamespace(stdout=listing + "\n")
-                if args[0] == "cp":
-                    filename = Path(args[2]).name
-                    if filename == "profile_export_aiperf.json":
-                        copy_attempts.append(args)
-                        if len(copy_attempts) == 1:
-                            return SimpleNamespace(returncode=1, stderr="temporary WebSocket disconnect")
-                    if not (source / filename).is_file():
-                        return SimpleNamespace(returncode=1, stderr="file not found")
-                    runner.shutil.copyfile(source / filename, Path(args[2]))
-                    return SimpleNamespace(returncode=0, stderr="")
                 raise AssertionError(args)
 
-            with patch.object(runner, "kube", side_effect=fake_kube), patch.object(runner.time, "sleep"):
+            def fake_download(namespace, pod, remote_path, target):
+                filename = Path(remote_path).name
+                if filename == "profile_export_aiperf.json":
+                    copy_attempts.append(remote_path)
+                if not (source / filename).is_file():
+                    raise RuntimeError("file not found")
+                runner.shutil.copyfile(source / filename, target)
+                return target
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner.TRANSFER, "download_file", side_effect=fake_download):
                 self.assertEqual(runner.preview_local(config, root), 0)
-            self.assertEqual(len(copy_attempts), 2)
+            self.assertEqual(len(copy_attempts), 1)
             page = (campaign / "preview/index.html").read_text()
             self.assertIn("<h1>Campaign test-campaign</h1>", page)
             self.assertNotIn("Disaggregated Serving — Interactivity vs Throughput</h1>", page)

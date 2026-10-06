@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -35,6 +36,11 @@ if REPORT_SPEC is None or REPORT_SPEC.loader is None:
     raise RuntimeError("Could not load the live AIPerf report reader")
 AIPERF_REPORT = importlib.util.module_from_spec(REPORT_SPEC)
 REPORT_SPEC.loader.exec_module(AIPERF_REPORT)
+TRANSFER_SPEC = importlib.util.spec_from_file_location("campaign_transfer", Path(__file__).with_name("transfer.py"))
+if TRANSFER_SPEC is None or TRANSFER_SPEC.loader is None:
+    raise RuntimeError("Could not load campaign artifact transfer")
+TRANSFER = importlib.util.module_from_spec(TRANSFER_SPEC)
+TRANSFER_SPEC.loader.exec_module(TRANSFER)
 NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 DIMENSION_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 JOB_LINE = re.compile(r"^Job queued: ([a-z0-9-]+) ", re.MULTILINE)
@@ -1570,7 +1576,7 @@ def run_local(config: dict[str, Any], output: Path) -> int:
                 for profile in profiles:
                     copy_aiperf_sample(namespace, pod_name, Path(profile), destination)
             else:
-                kube(namespace, "cp", f"{pod_name}:{artifact}", str(destination))
+                TRANSFER.download_tree(namespace, pod_name, str(artifact), destination)
             return destination
 
         return run(config, output, artifact_fetcher=fetch)
@@ -1592,20 +1598,41 @@ def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination
                      "serving-pods.yaml", "aiperf-job.yaml", "llm-d-deployment.yaml", "dashboard.html"):
         required = filename in {"profile_export_aiperf.json", "benchmark-metadata.json"}
         target = sample / filename
-        for attempt in range(3):
-            result = kube(namespace, "cp", f"{pod_name}:{profile.parent / filename}",
-                          str(target), check=False)
-            if result.returncode == 0:
-                break
-            target.unlink(missing_ok=True)
-            if not required:
-                break
-            if attempt < 2:
-                time.sleep(1)
-        else:
+        try:
+            TRANSFER.download_file(namespace, pod_name, str(profile.parent / filename), target)
+        except RuntimeError:
             if required:
-                raise RuntimeError(f"Could not copy {profile.parent / filename}: {result.stderr.strip()}")
+                raise
     return sample
+
+
+def download_pvc_artifacts(config: dict[str, Any], remote: str, output: Path) -> Path:
+    """Resume a named artifact directory after a run-local process has exited."""
+    root = Path("/workload")
+    path = Path(remote)
+    if not path.is_absolute() or ".." in path.parts or path == root or root not in path.parents:
+        raise ValueError("--remote must be an artifact directory below /workload")
+    destination = output.resolve() / path.relative_to(root)
+    pod_name = "campaign-download-" + secrets.token_hex(8)
+    namespace = config["namespace"]
+    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": pod_name, "namespace": namespace},
+           "spec": {"restartPolicy": "Never", "containers": [{"name": "artifacts",
+           "image": "docker.io/library/alpine:3.20", "command": ["sleep", "86400"],
+           "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                         "limits": {"cpu": "500m", "memory": "256Mi"}},
+           "volumeMounts": [{"name": "results", "mountPath": "/workload"}]}],
+           "volumes": [{"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}
+    kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
+    try:
+        kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
+        TRANSFER.download_tree(namespace, pod_name, str(path), destination)
+    finally:
+        deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
+                       f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
+        if deleted.returncode:
+            raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
+    print(f"Downloaded artifacts: {destination}", flush=True)
+    return destination
 
 
 def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[str, Any],
@@ -1713,8 +1740,12 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
     groups: dict[str, list[Path]] = {}
     with tempfile.TemporaryDirectory(prefix="campaign-preview-", dir=preview) as temporary:
         for path in sorted(paths):
-            sample = copy_aiperf_sample(namespace, pod_name, path,
-                                        Path(temporary) / path.parent.parent.name)
+            try:
+                sample = copy_aiperf_sample(namespace, pod_name, path,
+                                            Path(temporary) / path.parent.parent.name)
+            except RuntimeError as exc:
+                print(f"Skipping unfinished or unavailable preview sample {path.parent}: {exc}", flush=True)
+                continue
             data = AIPERF_REPORT.run_data(sample)
             if data is None or not data["profile"]:
                 continue  # The writer may still be finishing this sample.
@@ -1931,7 +1962,7 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "test-local",
-                                           "preview-local", "download-latest", "report-local"])
+                                           "preview-local", "download-latest", "download-artifacts", "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
@@ -1939,6 +1970,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, help="new artifact directory for test-local")
     parser.add_argument("--watch", action="store_true", help="refresh preview-local until the campaign finishes")
     parser.add_argument("--dest", type=Path, help="HTML destination for download-latest (default: Downloads/<campaign-id>-latest.html)")
+    parser.add_argument("--remote", help="PVC artifact directory below /workload for download-artifacts")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
@@ -1968,6 +2000,11 @@ def main() -> int:
             if args.watch:
                 raise ValueError("--watch is only supported with preview-local")
             download_latest_local(config, args.output, args.dest)
+            return 0
+        if args.action == "download-artifacts":
+            if args.output is None or args.remote is None:
+                raise ValueError("--output and --remote are required for download-artifacts")
+            download_pvc_artifacts(config, args.remote, args.output)
             return 0
         if args.watch:
             raise ValueError("--watch is only supported with preview-local")
