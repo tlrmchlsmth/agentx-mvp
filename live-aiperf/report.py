@@ -444,6 +444,8 @@ def nyann_setup(config: dict[str, Any], campaign_dir: Path | None = None) -> str
             f'<table><tbody>{rows}</tbody></table>'
             '<p>TPOT is calculated per completed request from Nyann JSONL as '
             '(end-to-end latency − TTFT) / (output tokens − 1); one-token requests are excluded.</p>'
+            '<p>Interactivity uses output tokens/s divided by configured concurrency; '
+            'the adjacent TPOT chart shows per-request generation latency.</p>'
             '<p>Prompt-token counts use Nyann response usage. A reported zero can mean the server '
             'did not supply prompt-token usage; check the configured ISL.</p>'
             f'<p>Configured JSON</p><pre>{exact}</pre>'
@@ -509,6 +511,11 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
             if isinstance(value, dict) and any(isinstance(item, (int, float)) for item in value.values())
         }
         profile.setdefault("concurrency", {"avg": concurrency, "unit": "requests"})
+        output_rate = profile.get("output_token_throughput", {}).get("avg")
+        if ("output_token_throughput_per_user" not in profile and concurrency > 0
+                and isinstance(output_rate, (int, float))):
+            profile["output_token_throughput_per_user"] = {
+                "avg": output_rate / concurrency, "unit": "tokens/s/user"}
         config["runs"][concurrency] = profile
         if data["dashboard"] is not None:
             config.setdefault("dashboards", {})[f"c{concurrency}"] = base64.b64encode(data["dashboard"]).decode("ascii")
@@ -531,7 +538,8 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
         ("request_throughput", "avg"),
     )
     chart_defaults = {
-        "throughput": {"xMetric": "concurrency", "yMetric": "output_token_throughput", "yNorm": "none"},
+        "throughput": {"xMetric": "output_token_throughput_per_user",
+                       "yMetric": "output_token_throughput", "yNorm": "none"},
         "latency": {"xMetric": "output_token_throughput", "yMetric": latency_metric,
                     "yStat": latency_stat, "yNorm": "none"},
     }
@@ -585,13 +593,19 @@ def pareto_section_html() -> str:
     """Return the built-in rerun-reduced concurrency Pareto view."""
     return r'''
 <section id="pareto-front-section" style="margin:24px 0">
-<h2 style="font-size:18px;font-weight:500;margin:16px 0 4px">Reduced concurrency sequence</h2>
-<p class="subtitle">Select the best rerun at each concurrency over the two displayed metrics. The highlighted sequence keeps every selected concurrency, even when one concurrency dominates another.</p>
+<h2 style="font-size:18px;font-weight:500;margin:16px 0 4px">Interactivity vs throughput: Pareto frontier</h2>
+<p class="subtitle">Blue points form the Pareto frontier across all configurations and concurrencies. Yellow points select one rerun at each concurrency; a yellow point may be dominated.</p>
 <div id="pareto-controls" class="axis-controls" style="display:flex;flex-wrap:wrap;gap:8px;align-items:end"></div>
 <div id="pareto-range-controls" style="display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin:4px 0 8px"></div>
 <p id="pareto-summary" class="subtitle" aria-live="polite"></p>
-<div id="pareto-plot" class="plot" style="height:580px;cursor:pointer" role="img" aria-label="Reduced concurrency sequence"></div>
+<div id="pareto-plot" class="plot" style="height:580px;cursor:pointer" role="img" aria-label="Interactivity versus throughput Pareto frontier"></div>
 <div class="summary" style="overflow-x:auto">
+<h3>Pareto frontier</h3>
+<table id="pareto-front-table">
+<thead><tr><th>Configuration</th><th>Concurrency</th><th>X value</th><th>Y value</th></tr></thead>
+<tbody></tbody>
+</table>
+<h3>Best rerun per concurrency</h3>
 <table id="pareto-table">
 <thead><tr><th>Concurrency</th><th>Selected rerun</th><th>X value</th><th>Y value</th></tr></thead>
 <tbody></tbody>
@@ -606,12 +620,13 @@ def pareto_section_html() -> str:
   const summary = document.getElementById('pareto-summary');
   const plot = document.getElementById('pareto-plot');
   const table = document.getElementById('pareto-table');
-  if (!section || !controls || !rangeControls || !summary || !plot || !table) return;
+  const frontTable = document.getElementById('pareto-front-table');
+  if (!section || !controls || !rangeControls || !summary || !plot || !table || !frontTable) return;
 
   const palette = ['#facc15'];
   const metricState = {
-    xMetric: 'e2e_output_token_throughput', xStat: 'avg', xNorm: 'none', xGoal: 'max',
-    yMetric: 'output_token_throughput', yStat: 'avg', yNorm: 'decode', yGoal: 'max'
+    xMetric: 'output_token_throughput_per_user', xStat: 'avg', xNorm: 'none', xGoal: 'max',
+    yMetric: 'output_token_throughput', yStat: 'avg', yNorm: 'none', yGoal: 'max'
   };
   const fields = {};
 
@@ -707,6 +722,20 @@ def pareto_section_html() -> str:
       return scoreB - scoreA || orientedX(b) - orientedX(a) || orientedY(b) - orientedY(a) || a.label.localeCompare(b.label);
     })[0];
   }
+  function paretoFront(points, state) {
+    const orientedX = point => state.xGoal === 'max' ? point.x : -point.x;
+    const orientedY = point => state.yGoal === 'max' ? point.y : -point.y;
+    const ordered = [...points].sort((a, b) =>
+      orientedX(b) - orientedX(a) || orientedY(b) - orientedY(a) ||
+      a.label.localeCompare(b.label) || a.n - b.n);
+    let bestY = -Infinity;
+    return ordered.filter(point => {
+      const y = orientedY(point);
+      if (y <= bestY) return false;
+      bestY = y;
+      return true;
+    }).sort((a, b) => a.x - b.x);
+  }
   function format(value) {
     return Number(value).toLocaleString(undefined, {maximumFractionDigits: 3});
   }
@@ -716,6 +745,19 @@ def pareto_section_html() -> str:
     selected.forEach(point => {
       const row = document.createElement('tr');
       [point.concurrency, point.label, format(point.x), format(point.y)].forEach(value => {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        row.appendChild(cell);
+      });
+      body.appendChild(row);
+    });
+  }
+  function drawFrontTable(front) {
+    const body = frontTable.querySelector('tbody');
+    body.replaceChildren();
+    front.forEach(point => {
+      const row = document.createElement('tr');
+      [point.label, point.concurrency, format(point.x), format(point.y)].forEach(value => {
         const cell = document.createElement('td');
         cell.textContent = value;
         row.appendChild(cell);
@@ -750,6 +792,7 @@ def pareto_section_html() -> str:
     }));
     const selected = selectedConcurrencies.map(concurrency => chooseBest(points.filter(point => point.concurrency === concurrency), state)).filter(Boolean);
     selected.sort((a, b) => a.n - b.n);
+    const front = paretoFront(points, state);
     const xTitle = metricLabel(state.xMetric) + (state.xNorm !== 'none' ? ' ' + normSuffix(state.xNorm) : '');
     const yTitle = metricLabel(state.yMetric) + (state.yNorm !== 'none' ? ' ' + normSuffix(state.yNorm) : '');
     const traces = [{
@@ -762,12 +805,21 @@ def pareto_section_html() -> str:
       x:selected.map(point => point.x), y:selected.map(point => point.y), text:selected.map(point => point.concurrency),
       customdata:selected.map(point => [point.cfg, point.concurrency, point.label]),
       mode:selected.length >= 2 ? 'lines+markers+text' : 'markers+text', textposition:'top center',
-      name:selected.length >= 2 ? 'Selected front sequence' : 'Selected concurrency point',
+      name:selected.length >= 2 ? 'Best per concurrency' : 'Selected concurrency point',
       hovertemplate:'%{text}<br>%{customdata[2]}<br>%{x:.4g}<br>%{y:.4g}<extra></extra>',
       line:{color:palette[0], width:4}, marker:{color:palette[0], size:13, symbol:'diamond'}
     });
+    if (front.length) traces.push({
+      x:front.map(point => point.x), y:front.map(point => point.y),
+      text:front.map(point => point.concurrency),
+      customdata:front.map(point => [point.cfg, point.concurrency, point.label]),
+      mode:front.length >= 2 ? 'lines+markers+text' : 'markers+text', textposition:'bottom center',
+      name:'Pareto frontier',
+      hovertemplate:'%{text}<br>%{customdata[2]}<br>%{x:.4g}<br>%{y:.4g}<extra></extra>',
+      line:{color:'#58a6ff', width:4}, marker:{color:'#58a6ff', size:12, symbol:'circle'}
+    });
     const layout = {
-      ...LAYOUT_DEFAULTS, title:{text:'Reduced concurrency sequence', font:{size:18}},
+      ...LAYOUT_DEFAULTS, title:{text:'Pareto frontier', font:{size:18}},
       xaxis:{...LAYOUT_DEFAULTS.xaxis, ...fixedAxis(points.map(point => point.x)), title:{text:xTitle}},
       yaxis:{...LAYOUT_DEFAULTS.yaxis, ...fixedAxis(points.map(point => point.y)), title:{text:yTitle}},
       showlegend:true, legend:{orientation:'h', y:1.08, x:0}, hovermode:'closest',
@@ -776,8 +828,9 @@ def pareto_section_html() -> str:
     const rendered = plot.data ? Plotly.react(plot, traces, layout, {responsive:true, displaylogo:false}) : Plotly.newPlot(plot, traces, layout, {responsive:true, displaylogo:false});
     Promise.resolve(rendered).then(attachDashboardClick);
     drawTable(selected, state);
+    drawFrontTable(front);
     const first = selectedConcurrencies[0], last = selectedConcurrencies[selectedConcurrencies.length - 1];
-    summary.textContent = 'Range ' + first + '–' + last + ': ' + points.length + ' usable rerun/concurrency points reduced to ' + selected.length + ' selected concurrency point' + (selected.length === 1 ? '' : 's') + '. Each selected point may come from a different rerun.';
+    summary.textContent = 'Range ' + first + '–' + last + ': ' + points.length + ' usable points, ' + front.length + ' on the Pareto frontier, and ' + selected.length + ' best-per-concurrency points.';
   }
   fields.xMetric.addEventListener('change', () => {
     metricState.xMetric = fields.xMetric.value;

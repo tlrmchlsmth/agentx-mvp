@@ -642,8 +642,10 @@ class CampaignTests(unittest.TestCase):
             }]}
             runner.write_final_report(root, summary)
             page = (root / "index.html").read_text()
-            self.assertIn('createChart(chartCol1, {"xMetric": "concurrency", "yMetric": "output_token_throughput"', page)
+            self.assertIn('createChart(chartCol1, {"xMetric": "output_token_throughput_per_user", "yMetric": "output_token_throughput"', page)
             self.assertIn('createChart(chartCol2, {"xMetric": "output_token_throughput", "yMetric": "time_per_output_token", "yStat": "p90"', page)
+            self.assertIn('xMetric: \'output_token_throughput_per_user\'', page)
+            self.assertIn('name:\'Pareto frontier\'', page)
             self.assertIn("TPOT p50 (ms)", page)
             self.assertIn("E2E p90 (ms)", page)
             self.assertIn("Time per output token (TPOT)", page)
