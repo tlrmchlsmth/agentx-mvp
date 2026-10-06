@@ -861,7 +861,8 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
     except Exception as failure:
         diagnostics_path = campaign_dir / f"{tool}-job-failure.txt"
         diagnostics = []
-        for label, args in (("Job", ("describe", "job", job_name)),
+        for label, args in (("Logs", ("logs", f"job/{job_name}", "--all-containers=true")),
+                            ("Job", ("describe", "job", job_name)),
                             ("Pods", ("describe", "pods", "-l", f"job-name={job_name}"))):
             try:
                 result = kube(config["namespace"], *args, check=False)

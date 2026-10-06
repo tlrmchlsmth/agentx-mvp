@@ -156,7 +156,7 @@ local checkout without publishing a runner image:
 ```bash
 export KUBECONFIG=~/.kube/config.kermit
 just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
-open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-004/index.html
+open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-005/index.html
 ```
 
 The orchestrator applies one serving overlay at a time and submits the AIPerf
