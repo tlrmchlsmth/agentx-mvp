@@ -513,10 +513,18 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
   .summary th {{ text-align: left; padding: 6px 8px; color: #8e8e8e; border-bottom: 1px solid #2a2a2e; font-weight: 500;
                  cursor: pointer; user-select: none; white-space: nowrap; }}
   .summary th:hover {{ color: #d8d9da; }}
-  .chart-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }}
-  @media (max-width: 1200px) {{ .chart-row {{ grid-template-columns: 1fr; }} }}
-  .chart-col {{ display: flex; flex-direction: column; gap: 4px; }}
-  .chart-col .panel {{ min-width: 0; }}
+  .chart-row {{ display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px;
+                overflow-x: auto; padding-bottom: 12px; margin-bottom: 8px; }}
+  .chart-col {{ position: relative; flex: 0 0 auto; display: flex; flex-direction: column;
+                gap: 4px; width: calc(50% - 6px); min-width: 360px; padding-right: 10px; }}
+  @media (max-width: 1200px) {{ .chart-col {{ width: 100%; }} }}
+  .chart-col .panel {{ width: 100%; max-width: none; min-width: 0; resize: vertical; }}
+  .chart-width-handle {{ position: absolute; top: 0; right: 0; bottom: 0; width: 10px;
+                         cursor: col-resize; border-right: 2px solid #3a3a3e; touch-action: none; }}
+  .chart-width-handle:hover,.chart-width-handle.dragging {{ border-right-color: #58a6ff; }}
+  .panel-actions input[data-action="width"] {{ width: 78px; background: #111217; color: #d8d9da;
+                                               border: 1px solid #3a3a3e; border-radius: 4px;
+                                               padding: 3px 5px; font: inherit; }}
   .chart-move-handle {{ color: #8e8e8e; cursor: grab; font-size: 11px; padding: 3px 4px; user-select: none; }}
   .chart-col.dragging {{ opacity: .45; }}
   .axis-controls {{ display: flex; gap: 10px; align-items: center; padding: 6px 4px; flex-wrap: wrap; }}
@@ -723,9 +731,31 @@ function makePanel(parent, title, cls) {{
 }}
 
 function makePanelResizable(panel, plot) {{
+  const chartColumn = panel.closest('.chart-col');
+  const widthInput = panel.querySelector('[data-action="width"]');
+  if (chartColumn && widthInput) {{
+    const setWidth = value => {{
+      if (Number.isFinite(value)) chartColumn.style.width = Math.max(360, value) + 'px';
+    }};
+    widthInput.value = Math.round(chartColumn.getBoundingClientRect().width);
+    widthInput.addEventListener('change', () => setWidth(Number(widthInput.value)));
+    new ResizeObserver(() => {{
+      if (document.activeElement !== widthInput) widthInput.value = Math.round(chartColumn.getBoundingClientRect().width);
+    }}).observe(chartColumn);
+  }}
   panel.querySelector('[data-action="shorter"]')?.addEventListener('click', () => {{ panel.style.height = Math.max(300, panel.offsetHeight - 120) + 'px'; }});
   panel.querySelector('[data-action="taller"]')?.addEventListener('click', () => {{ panel.style.height = Math.min(1200, panel.offsetHeight + 160) + 'px'; }});
-  panel.querySelector('[data-action="wide"]')?.addEventListener('click', () => panel.classList.toggle('wide'));
+  panel.querySelector('[data-action="wide"]')?.addEventListener('click', () => {{
+    if (!chartColumn) {{ panel.classList.toggle('wide'); return; }}
+    const previous = chartColumn.dataset.previousWidth;
+    if (previous) {{
+      chartColumn.style.width = previous;
+      delete chartColumn.dataset.previousWidth;
+    }} else {{
+      chartColumn.dataset.previousWidth = chartColumn.style.width || Math.round(chartColumn.getBoundingClientRect().width) + 'px';
+      chartColumn.style.width = Math.max(360, window.innerWidth - 32) + 'px';
+    }}
+  }});
   new ResizeObserver(() => {{ if (plot.data) Plotly.Plots.resize(plot); }}).observe(panel);
 }}
 
@@ -858,6 +888,36 @@ function makeChartColumnMovable(container) {{
     container.parentElement.insertBefore(draggedChartColumn, event.clientX < container.getBoundingClientRect().left + container.offsetWidth / 2 ? container : container.nextSibling);
   }});
   container.appendChild(handle);
+  const widthHandle = document.createElement('div');
+  widthHandle.className = 'chart-width-handle';
+  widthHandle.title = 'Drag to resize chart width';
+  widthHandle.setAttribute('role', 'separator');
+  widthHandle.setAttribute('aria-label', 'Resize chart width');
+  widthHandle.setAttribute('aria-orientation', 'vertical');
+  widthHandle.tabIndex = 0;
+  let startX = 0;
+  let startWidth = 0;
+  widthHandle.addEventListener('pointerdown', event => {{
+    event.preventDefault();
+    startX = event.clientX;
+    startWidth = container.getBoundingClientRect().width;
+    widthHandle.setPointerCapture(event.pointerId);
+    widthHandle.classList.add('dragging');
+  }});
+  widthHandle.addEventListener('pointermove', event => {{
+    if (!widthHandle.hasPointerCapture(event.pointerId)) return;
+    container.style.width = Math.max(360, startWidth + event.clientX - startX) + 'px';
+  }});
+  for (const name of ['pointerup', 'pointercancel']) {{
+    widthHandle.addEventListener(name, () => widthHandle.classList.remove('dragging'));
+  }}
+  widthHandle.addEventListener('keydown', event => {{
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowRight' ? 100 : -100;
+    container.style.width = Math.max(360, container.getBoundingClientRect().width + delta) + 'px';
+  }});
+  container.appendChild(widthHandle);
 }}
 
 function createChart(container, defaults) {{
@@ -955,7 +1015,7 @@ function createChart(container, defaults) {{
   container.appendChild(panel);
   const panelHeader = document.createElement('div');
   panelHeader.className = 'panel-title';
-  panelHeader.innerHTML = '<span>Chart size</span><span class="panel-actions"><button data-action="shorter">−</button><button data-action="taller">+</button><button data-action="wide">↔</button></span>';
+  panelHeader.innerHTML = '<span>Chart size</span><span class="panel-actions"><label>Width <input data-action="width" type="number" min="360" step="100" aria-label="Chart width in pixels"></label><button data-action="shorter">−</button><button data-action="taller">+</button><button data-action="wide" title="Toggle viewport width">↔</button></span>';
   panel.insertBefore(panelHeader, plot);
   makePanelResizable(panel, plot);
   state.el = plot;
@@ -1068,7 +1128,7 @@ topBar.appendChild(concurrencyFilters);
 
 root.appendChild(topBar);
 
-// ── Charts: two side by side ──
+// ── Charts: independently sized columns ──
 const chartRow = document.createElement('div');
 chartRow.className = 'chart-row';
 root.appendChild(chartRow);

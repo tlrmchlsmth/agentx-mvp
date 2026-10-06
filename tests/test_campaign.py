@@ -658,6 +658,8 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("TPOT p50 (ms)", page)
             self.assertIn("E2E p90 (ms)", page)
             self.assertIn("Time per output token (TPOT)", page)
+            self.assertIn('aria-label="Chart width in pixels"', page)
+            self.assertIn("Drag to resize chart width", page)
             configs = json.loads(re.search(r'const CONFIGS = (\{.*?\});', page).group(1))
             config = next(iter(configs.values()))
             self.assertEqual((config["prefillGPUs"], config["decodeGPUs"], config["totalGPUs"]),
