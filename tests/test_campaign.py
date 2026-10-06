@@ -21,6 +21,11 @@ spec.loader.exec_module(runner)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_kubectl_logs_replace_invalid_utf8(self):
+        with patch.object(runner, "call", return_value=SimpleNamespace(stdout="")) as command:
+            runner.kube("vllm", "logs", "job/example")
+        self.assertEqual(command.call_args.kwargs["errors"], "replace")
+
     def config(self, root: Path):
         for name in ("baseline", "candidate"):
             (root / name).mkdir()
@@ -406,7 +411,9 @@ class CampaignTests(unittest.TestCase):
 
             def fake_kube(namespace, *args, **kwargs):
                 if args[0] == "exec":
-                    return SimpleNamespace(stdout=str(remote / "profile_export_aiperf.json") + "\n")
+                    listing = (str(remote / "profile_export_aiperf.json") if "-type" in args and
+                               args[args.index("-type") + 1] == "f" else str(remote))
+                    return SimpleNamespace(stdout=listing + "\n")
                 if args[0] == "cp":
                     filename = Path(args[2]).name
                     if filename == "profile_export_aiperf.json":
@@ -427,6 +434,33 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("baseline", page)
             self.assertIn(config["vllm_image"], page)
             self.assertIn('id="root"', page)
+            self.assertIn('id="campaign-progress"', page)
+            self.assertIn("<td>baseline</td><td>aiperf</td><td>c1</td><td>completed</td>", page)
+            self.assertIn("<td>baseline</td><td>aiperf</td><td>c4</td><td>pending</td>", page)
+
+    def test_preview_local_shows_running_sample_before_first_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["benchmarks"].append({"tool": "nyann", "concurrencies": [1, 4],
+                                          "duration_seconds": 600, "isl": 1024, "osl": 512,
+                                          "warmup_seconds": 60})
+            campaign = root / "campaigns" / config["id"]
+            campaign.mkdir(parents=True)
+            (campaign / "campaign.json").write_text(json.dumps(config))
+            (campaign / "summary.json").write_text(json.dumps({"status": "running"}))
+            remote = f"/workload/aiperf-agentx/{config['id']}-baseline-aiperf/c1"
+
+            def fake_kube(namespace, *args, **kwargs):
+                return SimpleNamespace(stdout="" if "-name" in args else remote + "\n")
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                self.assertEqual(runner.preview_local(config, root, auto_refresh=True), 0)
+            page = (campaign / "preview/index.html").read_text()
+            self.assertIn("<td>baseline</td><td>aiperf</td><td>c1</td><td>running</td>", page)
+            self.assertIn("<td>candidate</td><td>aiperf</td><td>c1</td><td>pending</td>", page)
+            self.assertIn("<td>baseline</td><td>nyann</td><td>c1, c4</td><td>pending</td>", page)
+            self.assertIn("location.reload()", page)
 
     def test_monitoring_overlay_excludes_samples_without_scraped_metrics(self):
         with tempfile.TemporaryDirectory() as directory:

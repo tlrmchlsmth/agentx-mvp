@@ -47,8 +47,10 @@ class CleanupError(RuntimeError):
 
 
 def call(args: list[str], *, input_text: str | None = None, env: dict[str, str] | None = None,
-         check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, input=input_text, text=True, capture_output=True, env=env, timeout=timeout)
+         check: bool = True, timeout: int | None = None,
+         errors: str = "strict") -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(args, input=input_text, text=True, encoding="utf-8", errors=errors,
+                            capture_output=True, env=env, timeout=timeout)
     if check and result.returncode:
         raise RuntimeError(f"{' '.join(args)} failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}")
     return result
@@ -370,6 +372,10 @@ def validate_manifest(rendered: str, namespace: str) -> None:
 
 
 def kube(namespace: str, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    if args and args[0] == "logs":
+        # Workload progress output can contain arbitrary bytes from a model
+        # response; decoding must not abort campaign monitoring or previews.
+        kwargs.setdefault("errors", "replace")
     return call(["kubectl", "-n", namespace, *args], **kwargs)
 
 
@@ -1602,8 +1608,60 @@ def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination
     return sample
 
 
-def preview_local(config: dict[str, Any], output: Path) -> int:
-    """Render completed AIPerf samples from an active run-local campaign."""
+def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[str, Any],
+                     completed: set[tuple[str, str]], started: set[tuple[str, str]]) -> str:
+    """Show every planned benchmark in the same HTML as completed results."""
+    records = {record["name"]: record for record in summary.get("overlays", [])}
+    rows = []
+    for variant in config.get("builds", [None]):
+        for overlay in config["overlays"]:
+            name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
+            record = records.get(name, {})
+            benchmarks = {bench["tool"]: bench for bench in record.get("benchmarks", [])}
+            for bench in config["benchmarks"]:
+                tool = bench["tool"]
+                result = benchmarks.get(tool, {})
+                run_id = f"{config['id']}-{name}-{tool}"
+                if tool == "nyann":
+                    if result.get("status") in {"completed", "failed", "skipped"}:
+                        status = result["status"]
+                    elif record.get("status") in {"failed", "skipped"}:
+                        status = record["status"]
+                    elif (campaign_dir / name / "nyann-submit.log").is_file():
+                        status = "running"
+                    else:
+                        status = "pending"
+                    samples = ", ".join(f"c{value}" for value in bench["concurrencies"])
+                    rows.append("<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in
+                                                  (name, tool, samples, status)) + "</tr>")
+                    continue
+                counts = Counter(bench["concurrencies"])
+                seen: Counter[int] = Counter()
+                for concurrency in bench["concurrencies"]:
+                    seen[concurrency] += 1
+                    sample = (f"c{concurrency}" if counts[concurrency] == 1 else
+                              f"c{concurrency}-r{seen[concurrency]}")
+                    if tool == "aiperf" and (run_id, sample) in completed:
+                        status = "completed"
+                    elif result.get("status") in {"failed", "skipped"}:
+                        status = result["status"]
+                    elif record.get("status") in {"failed", "skipped"}:
+                        status = record["status"]
+                    elif tool == "aiperf" and (run_id, sample) in started:
+                        status = "running"
+                    else:
+                        status = "pending"
+                    cells = (name, tool, sample, status)
+                    rows.append("<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in cells) + "</tr>")
+    updated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return (f"<section id=\"campaign-progress\"><h2>Campaign progress</h2>"
+            f"<p>Updated {updated}. Running samples appear here before their final metrics are available.</p>"
+            "<table><thead><tr><th>Overlay</th><th>Tool</th><th>Sample</th><th>Status</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table></section>")
+
+
+def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = False) -> int:
+    """Render active and completed work into one portable campaign HTML file."""
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     saved_config = campaign_dir / "campaign.json"
     if not saved_config.is_file():
@@ -1622,6 +1680,8 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
     listing = kube(namespace, "exec", pod_name, "--", "find", remote_root,
                    "-mindepth", "3", "-maxdepth", "3", "-type", "f",
                    "-name", "profile_export_aiperf.json").stdout
+    directories = kube(namespace, "exec", pod_name, "--", "find", remote_root,
+                       "-mindepth", "2", "-maxdepth", "2", "-type", "d").stdout
     labels = {}
     for variant in config.get("builds", [None]):
         for overlay in config["overlays"]:
@@ -1633,14 +1693,11 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
         path = Path(line)
         if path.parent.parent.name in labels and path.name == "profile_export_aiperf.json":
             paths.append(path)
-    if not paths:
-        print("No completed AIPerf samples yet; preview HTML was not created")
-        return 0
     preview = campaign_dir / "preview"
     preview.mkdir(exist_ok=True)
     runs = []
     groups: dict[str, list[Path]] = {}
-    with tempfile.TemporaryDirectory(prefix="campaign-preview-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="campaign-preview-", dir=preview) as temporary:
         for path in sorted(paths):
             sample = copy_aiperf_sample(namespace, pod_name, path,
                                         Path(temporary) / path.parent.parent.name)
@@ -1651,9 +1708,6 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
             data["metadata"].update({"campaign_label": labels[path.parent.parent.name],
                                      "vllm_image": config["vllm_image"]})
             runs.append(data)
-        if not runs:
-            print("No complete AIPerf profiles yet; preview HTML was not created")
-            return 0
         monitoring = config.get("monitoring")
         missing_monitoring = []
         if monitoring:
@@ -1698,17 +1752,58 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
                     else:
                         data["dashboard"] = None
                         missing_monitoring.append(data["directory"].name)
+        completed = {(path.parent.parent.name, path.parent.name) for path in paths}
+        started = {(path.parent.name, path.name) for line in directories.splitlines()
+                   if (path := Path(line)).parent.name in labels}
+        progress = preview_progress(config, campaign_dir, summary, completed, started)
         notice = (f"<p>In-progress preview: {len(runs)} completed AIPerf samples. "
-                  "Unfinished samples and nyann results are not included.</p>")
+                  "Running samples are listed below; final metrics appear when each finishes.</p>" + progress)
         if missing_monitoring:
             samples = ", ".join(html.escape(name) for name in missing_monitoring)
             notice += (f"<p>No vLLM Grafana samples were recorded during {samples}; "
                        "those empty dashboards are omitted. Scraping may have begun after these runs.</p>")
-        AIPERF_REPORT.write_index_from_runs(preview, runs, extra_html=notice,
-                                            model_label=f"Campaign {config['id']} preview",
-                                            save_monitoring_overlay=False)
+        render = Path(temporary) / "render"
+        render.mkdir()
+        if runs:
+            AIPERF_REPORT.write_index_from_runs(render, runs, extra_html=notice,
+                                                model_label=f"Campaign {config['id']} preview",
+                                                save_monitoring_overlay=False)
+            page = (render / "index.html").read_text()
+        else:
+            page = AIPERF_REPORT.document(f"Campaign {config['id']} preview", notice)
+        if auto_refresh:
+            page = page.replace("</body>", "<script>setTimeout(() => location.reload(), 90000);</script></body>", 1)
+        staged = render / "index.html"
+        staged.write_text(page)
+        staged.replace(preview / "index.html")
     print(f"Preview: {preview / 'index.html'} ({len(runs)} completed AIPerf samples)")
     return 0
+
+
+def watch_preview_local(config: dict[str, Any], output: Path) -> int:
+    """Keep one preview file current until the final campaign report exists."""
+    campaign_dir = output.resolve() / "campaigns" / config["id"]
+    while True:
+        summary = json.loads((campaign_dir / "summary.json").read_text())
+        if summary["status"] != "running":
+            final = campaign_dir / "index.html"
+            if final.is_file():
+                preview = campaign_dir / "preview"
+                preview.mkdir(exist_ok=True)
+                staged = preview / "index.html.tmp"
+                shutil.copyfile(final, staged)
+                staged.replace(preview / "index.html")
+                print(f"Final report: {preview / 'index.html'}")
+                return 0
+            if summary["status"] == "failed":
+                print(f"Campaign failed before a final report was written: {campaign_dir}", file=sys.stderr)
+                return 1
+        else:
+            try:
+                preview_local(config, output, auto_refresh=True)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+                print(f"Preview refresh failed; retrying: {exc}", file=sys.stderr, flush=True)
+        time.sleep(60)
 
 
 def report_local(config: dict[str, Any], output: Path) -> int:
@@ -1788,6 +1883,7 @@ def main() -> int:
     parser.add_argument("--service-account", default="benchmark-campaign")
     parser.add_argument("--source-dir", type=Path, help="local llm-d checkout for test-local; otherwise fetch source.repo/ref")
     parser.add_argument("--output", type=Path, help="new artifact directory for test-local")
+    parser.add_argument("--watch", action="store_true", help="refresh preview-local until the campaign finishes")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
@@ -1810,7 +1906,9 @@ def main() -> int:
         if args.action == "preview-local":
             if args.output is None:
                 raise ValueError("--output is required for preview-local")
-            return preview_local(config, args.output)
+            return watch_preview_local(config, args.output) if args.watch else preview_local(config, args.output)
+        if args.watch:
+            raise ValueError("--watch is only supported with preview-local")
         if args.action == "report-local":
             if args.output is None:
                 raise ValueError("--output is required for report-local")
