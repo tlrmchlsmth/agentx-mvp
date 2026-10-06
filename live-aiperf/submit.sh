@@ -336,7 +336,17 @@ spec:
                 sed -i 's/^    hostname: str | None$/    hostname: str | None = None/' "\$schema"
               fi
               export HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0
-              model=\$("\$aiperf_python" -c 'import json,sys,urllib.request; payload=json.load(urllib.request.urlopen(sys.argv[1], timeout=30)); models=payload.get("data", []); assert len(models) == 1, f"expected exactly one served model, got {models!r}"; print(models[0]["id"])' "${BASE_URL}/models")
+              model_deadline=\$(( \$(date +%s) + 300 ))
+              while :; do
+                if model=\$("\$aiperf_python" -c 'import json,sys,urllib.request; payload=json.load(urllib.request.urlopen(sys.argv[1], timeout=30)); models=payload.get("data", []); assert len(models) == 1, f"expected exactly one served model, got {models!r}"; print(models[0]["id"])' "${BASE_URL}/models" 2>&1); then
+                  break
+                fi
+                if (( \$(date +%s) >= model_deadline )); then
+                  echo "Model discovery failed after 300 seconds: \$model" >&2
+                  exit 1
+                fi
+                sleep 5
+              done
               "\$aiperf_python" -c 'from transformers import AutoTokenizer; import sys; AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)' "\$model"
               overall_status=0
               for run_spec in ${RUN_SPECS_ARGS}; do

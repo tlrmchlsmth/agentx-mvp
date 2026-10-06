@@ -117,7 +117,9 @@ both role images without a source build or DeepEP override. Its explicit
 `vllm_cli_args` disables CUDA graph capture on the prefill role because the
 2026-10-06 nightly failed during DeepEP graph capture on the H200 cluster.
 The report labels this setting as `prefill_cuda_graphs=off`; it affects benchmark
-performance. For other campaigns,
+performance. The standalone router's InferencePool must select
+`llm-d.ai/inference-serving=true` and `llm-d.ai/model=GLM-5.2-FP8` so cache
+evictor Pods are not treated as model endpoints. For other campaigns,
 the generic source script uses
 precompiled native libraries from the pinned first source commit; branch sets
 that change native C++/CUDA code need an overlay-specific full build recipe.
@@ -156,7 +158,7 @@ local checkout without publishing a runner image:
 ```bash
 export KUBECONFIG=~/.kube/config.kermit
 just campaign-run-local examples/campaign.glm52-h200-kermit.json /tmp/glm52-campaign-live
-open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-005/index.html
+open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-006/index.html
 ```
 
 The orchestrator applies one serving overlay at a time and submits the AIPerf
