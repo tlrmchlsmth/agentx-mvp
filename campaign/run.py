@@ -843,6 +843,15 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
     stages = summary["stages"]
     if [stage.get("concurrency") for stage in stages] != concurrencies:
         raise RuntimeError("Nyann stage concurrencies differ from the requested sweep")
+
+    def latency_stats(values: dict[str, Any]) -> dict[str, Any]:
+        result = {key: value for key, value in values.items()
+                  if key in {"avg", "min", "p10", "p50", "p90", "p95", "p99", "max"}}
+        if "avg" not in result and "mean" in values:
+            result["avg"] = values["mean"]
+        result["unit"] = "ms"
+        return result
+
     measurements = []
     for index, stage in enumerate(stages, 1):
         successes = stage["successful_requests"]
@@ -854,12 +863,8 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
                              "successful_requests": successes, "error_requests": errors,
                              "metrics": {"request_throughput": {"avg": successes / duration, "unit": "req/s"},
                                          "output_token_throughput": {"avg": stage["output_tokens_per_second"], "unit": "tokens/s"},
-                                         "time_to_first_token": {**{key: value for key, value in stage["ttft_ms"].items()
-                                                                    if key in {"avg", "p10", "p50", "p90", "p95", "p99"}},
-                                                                 "unit": "ms"},
-                                         "inter_token_latency": {**{key: value for key, value in stage["itl_ms"].items()
-                                                                    if key in {"avg", "p10", "p50", "p90", "p95", "p99"}},
-                                                                  "unit": "ms"}}})
+                                         "time_to_first_token": latency_stats(stage["ttft_ms"]),
+                                         "inter_token_latency": latency_stats(stage["itl_ms"])}})
     return measurements
 
 

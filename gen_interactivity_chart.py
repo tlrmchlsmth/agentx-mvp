@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 GPUS_PER_NODE = 8
-STAT_KEYS = ['avg', 'min', 'p50', 'p90', 'p95', 'p99', 'max']
+STAT_KEYS = ['avg', 'min', 'p10', 'p50', 'p90', 'p95', 'p99', 'max']
 
 COLORS = [
     '#f97316', '#22d3ee', '#a78bfa', '#34d399', '#f472b6',
@@ -369,43 +369,7 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
     c_labels_js = {f'c{c}': c for c in sorted_conc}
 
     metrics_js = {k: {'unit': v} for k, v in sorted(metric_units.items())}
-    x_axis_metrics = [
-        'output_token_throughput_per_user',
-        'e2e_output_token_throughput',
-        'inter_token_latency',
-        'time_to_first_token',
-        'time_to_second_token',
-        'request_latency',
-        'effective_latency',
-        'credit_to_start_latency',
-        'input_sequence_length',
-        'output_sequence_length',
-        'tokens_in_flight',
-        'effective_concurrency',
-        'effective_decode_concurrency',
-        'effective_prefill_concurrency',
-        'request_throughput',
-        'theoretical_prefix_cache_hit',
-    ]
-    y_axis_metrics = [
-        'output_token_throughput',
-        'output_token_throughput_per_user',
-        'e2e_output_token_throughput',
-        'input_token_throughput',
-        'total_token_throughput',
-        'effective_decode_throughput',
-        'effective_prefill_throughput',
-        'effective_total_throughput',
-        'active_decode_throughput',
-        'active_prefill_throughput',
-        'active_total_throughput',
-        'request_throughput',
-        'request_count',
-        'total_output_tokens',
-        'total_usage_prompt_tokens',
-        'total_usage_completion_tokens',
-        'total_usage_total_tokens',
-    ]
+    axis_metrics = sorted(metric_units)
     decode_normalized_metrics = [
         'output_token_throughput',
         'e2e_output_token_throughput',
@@ -617,8 +581,7 @@ const C_LABELS = {json.dumps(c_labels_js)};
 const DATA = {json.dumps(data_js)};
 const DASHBOARDS = {json.dumps(embedded_dashboards)};
 const METRICS = {json.dumps(metrics_js)};
-const X_AXIS_METRICS = {json.dumps(x_axis_metrics)};
-const Y_AXIS_METRICS = {json.dumps(y_axis_metrics)};
+const AXIS_METRICS = {json.dumps(axis_metrics)};
 const DECODE_NORMALIZED_METRICS = new Set({json.dumps(decode_normalized_metrics)});
 const PREFILL_NORMALIZED_METRICS = new Set({json.dumps(prefill_normalized_metrics)});
 const TOTAL_NORMALIZED_METRICS = new Set({json.dumps(total_normalized_metrics)});
@@ -800,19 +763,20 @@ function metricOptions(keys) {{
   }}));
 }}
 
-function metricSample(metric) {{
+function metricStats(metric) {{
+  const available = new Set();
   for (const cfg of CONFIG_KEYS) {{
     for (const c of CONCURRENCIES) {{
       const sample = DATA[cfg]?.[c]?.[metric];
-      if (sample) return sample;
+      if (sample) Object.keys(sample).forEach(key => available.add(key));
     }}
   }}
-  return null;
+  return available;
 }}
 
 function statOptionsForMetric(metric) {{
-  const sample = metricSample(metric);
-  const keys = sample ? STAT_KEYS.filter(s => Object.prototype.hasOwnProperty.call(sample, s)) : ['avg'];
+  const available = metricStats(metric);
+  const keys = STAT_KEYS.filter(s => available.has(s));
   return (keys.length ? keys : ['avg']).map(s => ({{ value: s, text: s }}));
 }}
 
@@ -913,8 +877,7 @@ function createChart(container, defaults) {{
     return sel;
   }}
 
-  const xMetricOpts = metricOptions(X_AXIS_METRICS);
-  const yMetricOpts = metricOptions(Y_AXIS_METRICS);
+  const axisMetricOpts = metricOptions(AXIS_METRICS);
 
   // X row
   const xDiv = document.createElement('div');
@@ -937,7 +900,7 @@ function createChart(container, defaults) {{
     return sel;
   }}
 
-  const xMetricSel = mkSelIn(xDiv, 'X:', xMetricOpts, state.xMetric, v => {{
+  const xMetricSel = mkSelIn(xDiv, 'X:', axisMetricOpts, state.xMetric, v => {{
     state.xMetric = v;
     state.xStat = setSelectOptions(xStatSel, statOptionsForMetric(v), state.xStat);
     state.xNorm = setSelectOptions(xNormSel, normOptionsForMetric(v, 'x'), state.xNorm);
@@ -953,7 +916,7 @@ function createChart(container, defaults) {{
   // Y row
   const yDiv = document.createElement('div');
   yDiv.className = 'axis-controls';
-  const yMetricSel = mkSelIn(yDiv, 'Y:', yMetricOpts, state.yMetric, v => {{
+  const yMetricSel = mkSelIn(yDiv, 'Y:', axisMetricOpts, state.yMetric, v => {{
     state.yMetric = v;
     state.yStat = setSelectOptions(yStatSel, statOptionsForMetric(v), state.yStat);
     state.yNorm = setSelectOptions(yNormSel, normOptionsForMetric(v, 'y'), state.yNorm);

@@ -552,11 +552,14 @@ class CampaignTests(unittest.TestCase):
         stages = [{"concurrency": concurrency, "successful_requests": 10,
                    "error_requests": 1, "duration_seconds": 5,
                    "output_tokens_per_second": concurrency * 20,
-                   "ttft_ms": {"p90": 30}, "itl_ms": {"p90": 4}}
+                   "ttft_ms": {"mean": 20, "p10": 10, "p90": 30},
+                   "itl_ms": {"mean": 3, "p10": 2, "p90": 4}}
                   for concurrency in (1, 4)]
         log = "stage output\n" + json.dumps({"total_requests": 22, "stages": stages}, indent=2) + "\n"
         measurements = runner.nyann_measurements(log, [1, 4])
         self.assertEqual([item["metrics"]["request_throughput"]["avg"] for item in measurements], [2, 2])
+        self.assertEqual(measurements[0]["metrics"]["time_to_first_token"]["avg"], 20)
+        self.assertEqual(measurements[0]["metrics"]["inter_token_latency"]["p10"], 2)
         with tempfile.TemporaryDirectory() as directory:
             runner.write_summary(Path(directory), {"id": "example", "status": "completed", "overlays": [
                 {"name": "build-pd", "build": "build", "overlay": "pd", "status": "completed",
@@ -849,6 +852,12 @@ class CampaignTests(unittest.TestCase):
             runs = next(iter(json.loads(data.group(1)).values()))
             self.assertEqual(set(runs), {"c1", "c8"})
             self.assertEqual(runs["c8"]["output_token_throughput"]["avg"], 204.4)
+            metrics = json.loads(re.search(r"const METRICS = (\{.*?\});", page).group(1))
+            axes = json.loads(re.search(r"const AXIS_METRICS = (\[.*?\]);", page).group(1))
+            self.assertEqual(set(axes), set(metrics))
+            self.assertIn("output_token_throughput", axes)
+            self.assertIn("time_to_first_token", axes)
+            self.assertIn("p10", json.loads(re.search(r"const STAT_KEYS = (\[.*?\]);", page).group(1)))
             self.assertIn("stage-3 (c32)</td><td>running", page)
             self.assertIn("ISL 1024 · OSL 512", page)
             self.assertIn("600 s/stage · warmup 60 s at c32", page)
