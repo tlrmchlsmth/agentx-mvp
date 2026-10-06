@@ -185,6 +185,37 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(summary["builds"][0]["prebuilds"], [])
             self.assertFalse(failed or stopped)
 
+    def test_local_test_renders_plan_without_kubernetes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["builds"] = [{"name": "nightly", "steps": []}]
+            manifest = yaml.safe_dump({
+                "apiVersion": "leaderworkerset.x-k8s.io/v1", "kind": "LeaderWorkerSet",
+                "metadata": {"name": "serving", "namespace": "vllm"},
+                "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": {"containers": [
+                    {"name": "vllm", "image": "old/image:tag"}]}}}},
+            })
+            output = root / "local-test"
+            with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
+                 patch.object(runner, "render_overlay", return_value=manifest), \
+                 patch.object(runner, "kube", side_effect=AssertionError("Kubernetes must not be contacted")):
+                self.assertEqual(runner.test_local(config, output, root), 0)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["status"], "validated")
+            self.assertEqual(len(summary["overlays"]), 2)
+            self.assertEqual(summary["overlays"][0]["benchmarks"][0]["status"], "planned")
+            self.assertIn("Local validation only", (output / "index.html").read_text())
+            self.assertIn(config["vllm_image"], (output / "nightly-baseline/manifest.yaml").read_text())
+            self.assertFalse((output / "nightly-baseline/prebuild-job.yaml").exists())
+            with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
+                 patch.object(runner, "render_overlay", return_value="kind: ConfigMap\nmetadata:\n  name: marker\n"), \
+                 patch.object(runner, "kube", side_effect=AssertionError("Kubernetes must not be contacted")):
+                self.assertEqual(runner.test_local(config, root / "invalid-test", root), 1)
+            failed = json.loads((root / "invalid-test/summary.json").read_text())
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("no LeaderWorkerSet vllm container", failed["overlays"][0]["error"])
+
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -505,6 +536,10 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(rendered_docs[1]["data"]["VLLM_BUILD_COMMIT"], "b" * 40)
             self.assertEqual(rendered_docs[1]["data"]["DEEPEP_BUILD_COMMIT"], "d" * 40)
             self.assertEqual(rendered_docs[1]["data"]["DEEPEP_BUILD_ENABLED"], "1")
+            with patch.object(runner, "kube", side_effect=AssertionError("Kubernetes must not be contacted")):
+                self.assertEqual(runner.vllm_prebuild(rendered, config, config["overlays"][0], root,
+                                                       preview_only=True), "b" * 40)
+            self.assertEqual(yaml.safe_load((root / "prebuild-job.yaml").read_text())["kind"], "Job")
             with patch.object(runner, "kube", side_effect=fake_kube):
                 commit = runner.vllm_prebuild(rendered, config, config["overlays"][0], root)
             self.assertEqual(commit, "b" * 40)

@@ -78,6 +78,10 @@ campaign-setup namespace:
 campaign-validate config:
     python3 "{{repo_root}}/campaign/run.py" validate "{{config}}"
 
+# Render every build/overlay case and preview build Jobs without contacting Kubernetes.
+campaign-test-local config source_dir output:
+    python3 "{{repo_root}}/campaign/run.py" test-local "{{config}}" --source-dir "{{source_dir}}" --output "{{output}}"
+
 campaign-submit config:
     python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}"
 

@@ -87,6 +87,29 @@ wheel. The saved `serving-pods.json` records the image ID used by each deploymen
 `examples/campaign.kimi-nightly.example.json` shows a concrete Kimi aggregate
 overlay using `vllm/vllm-openai:nightly`; set its llm-d fork/ref and cluster
 PVC and queues before submitting.
+
+## Test locally without a cluster
+
+Use a local llm-d checkout and an output directory that does not yet exist:
+
+```bash
+just campaign-test-local examples/campaign.kimi-nightly.example.json \
+  ../llm-d /tmp/kimi-nightly-local-test
+open /tmp/kimi-nightly-local-test/index.html
+```
+
+This renders every build and overlay combination with `kubectl kustomize`,
+applies `vllm_image` and the build script, validates the manifests, and saves
+their YAML plus any planned `prebuild-job.yaml`. The HTML and CSV list each
+requested benchmark concurrency as **planned**. No serving Pod or benchmark
+runs locally, so throughput and latency fields remain empty. The command uses
+the local checkout instead of fetching `source.repo/ref`; source build branches
+and optional DeepEP branches are still resolved from their Git remotes. The
+local test needs Python dependencies, `git`, and `kubectl` for its offline
+Kustomize renderer, but never contacts a Kubernetes API server. To test the
+configured source repo/ref instead, run `python3 campaign/run.py test-local
+<config> --output <new-directory>` without `--source-dir`.
+
 For a legacy single-overlay campaign without top-level
 `builds`, an overlay may still have its own `build` field:
 

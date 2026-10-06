@@ -451,8 +451,9 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None)
     return yaml.safe_dump_all(documents, sort_keys=False)
 
 
-def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any], folder: Path) -> str | None:
-    """Warm the exact serving wheel cache before starting an LWS, if present."""
+def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any], folder: Path,
+                  *, preview_only: bool = False) -> str | None:
+    """Build or preview the exact cache-warming Job for a serving LWS."""
     documents = [item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)]
     maps = {item.get("metadata", {}).get("name"): item for item in documents if item.get("kind") == "ConfigMap"}
     script_map = maps.get("vllm-build")
@@ -511,6 +512,9 @@ def vllm_prebuild(rendered: str, config: dict[str, Any], overlay: dict[str, Any]
     for field in ("nodeSelector", "tolerations", "imagePullSecrets", "runtimeClassName", "priorityClassName"):
         if field in pod:
             job["spec"]["template"]["spec"][field] = copy.deepcopy(pod[field])
+    if preview_only:
+        (folder / "prebuild-job.yaml").write_text(yaml.safe_dump(job, sort_keys=False))
+        return ref_map["data"]["VLLM_BUILD_COMMIT"] if mode == "source" else "nightly"
     # These are owned by the saved overlay manifest and deleted with it on failure.
     service_account = next((item for item in documents if item.get("kind") == "ServiceAccount" and
                             item.get("metadata", {}).get("name") == pod.get("serviceAccountName")), None)
@@ -762,7 +766,8 @@ def write_summary(destination: Path, summary: dict[str, Any], *, embedded_report
         return f"<td>{html.escape(value)}</td>"
 
     body = "".join("<tr>" + "".join(html_cell(row, field) for field in fields) + "</tr>" for row in rows)
-    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + \
+    local_note = "<p>Local validation only: no deployment or benchmark was run.</p>" if summary.get("mode") == "local-test" else ""
+    fragment = f"<h1>Campaign {html.escape(summary['id'])}</h1><p>Status: {html.escape(summary['status'])}</p>" + local_note + \
         "<h2>Builds</h2><table><tr><th>Build</th><th>Status</th><th>Resolved inputs</th><th>Error</th></tr>" + \
         "".join(build_rows) + "</table>" + \
         "<h2>All configurations</h2><table><tr>" + header + "</tr>" + body + "</table>"
@@ -863,6 +868,103 @@ def prepare_matrix_builds(config: dict[str, Any], overlay_root: Path, destinatio
             stopped = True
             break
     return resolved, base_manifests, failed, stopped
+
+
+def test_local(config: dict[str, Any], destination: Path, source_dir: Path | None = None) -> int:
+    """Render and validate every campaign case without contacting Kubernetes."""
+    destination.mkdir(parents=True, exist_ok=False)
+    (destination / "campaign.json").write_text(json.dumps(config, indent=2) + "\n")
+    summary: dict[str, Any] = {
+        "id": config["id"], "mode": "local-test", "status": "validating",
+        "started_at": datetime.now(timezone.utc).isoformat(), "overlays": [], "builds": [],
+        "vllm_image": config["vllm_image"],
+    }
+    temporary_source = source_dir is None
+    try:
+        if temporary_source:
+            overlay_root, source_commit = fetch_source(config["source"])
+        else:
+            overlay_root = source_dir.resolve(strict=True)
+            if not overlay_root.is_dir():
+                raise ValueError("--source-dir must be an llm-d checkout directory")
+            source_commit = call(["git", "-C", str(overlay_root), "rev-parse", "HEAD"], timeout=60).stdout.strip()
+            if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+                raise ValueError("--source-dir has no valid Git HEAD")
+            summary["source_dir"] = str(overlay_root)
+        summary["source_commit"] = source_commit
+        (destination / "source-commit.txt").write_text(source_commit + "\n")
+        pins: dict[tuple[str, str], str] = {}
+        resolved: dict[str, dict[str, Any]] = {}
+        if "builds" in config:
+            for variant in config["builds"]:
+                record: dict[str, Any] = {"name": variant["name"], "status": "validated"}
+                summary["builds"].append(record)
+                try:
+                    recipe = {"steps": variant.get("steps", [])}
+                    if "build_repo" in config:
+                        recipe["repo"] = config["build_repo"]
+                    if "deepep" in variant:
+                        recipe["deepep"] = variant["deepep"]
+                    build = resolve_build(recipe, pins)
+                    record["inputs"] = build
+                    resolved[variant["name"]] = build
+                except Exception as exc:
+                    record["status"] = "failed"
+                    record["error"] = str(exc)
+        cases = ([(variant, overlay) for variant in config["builds"] for overlay in config["overlays"]]
+                 if "builds" in config else [(None, overlay) for overlay in config["overlays"]])
+        for variant, overlay in cases:
+            name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
+            record = {"name": name, "overlay": overlay["name"], "dimensions": overlay.get("dimensions", {}),
+                      "status": "validated", "benchmarks": []}
+            if variant:
+                record["build"] = variant["name"]
+            summary["overlays"].append(record)
+            if variant and variant["name"] not in resolved:
+                record["status"] = "skipped"
+                record["error"] = "build branch resolution failed"
+                continue
+            folder = destination / name
+            folder.mkdir()
+            try:
+                build = (resolved[variant["name"]] if variant else
+                         resolve_build(overlay["build"], pins) if "build" in overlay else
+                         {"mode": "nightly", "steps": []})
+                record["vllm_build_inputs"] = build
+                rendered = render_overlay(overlay_root, overlay)
+                rendered = apply_vllm_image(rendered, config["vllm_image"])
+                rendered = inject_vllm_build_script(rendered, build)
+                validate_manifest(rendered, config["namespace"])
+                (folder / "manifest.yaml").write_text(rendered)
+                record["manifest_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
+                if build["mode"] == "source" or "deepep" in build:
+                    commit = vllm_prebuild(rendered, config, overlay, folder, preview_only=True)
+                    if not commit:
+                        raise ValueError("overlay has no compatible vLLM prebuild script")
+                    record["prebuild_job"] = str(folder / "prebuild-job.yaml")
+                for bench in config["benchmarks"]:
+                    record["benchmarks"].append({"tool": bench["tool"], "status": "planned", "measurements": [
+                        {"sample": f"c{concurrency}", "concurrency": concurrency}
+                        for concurrency in bench["concurrencies"]]})
+            except Exception as exc:
+                record["status"] = "failed"
+                record["error"] = str(exc)
+        summary["status"] = "failed" if any(item["status"] == "failed" for item in
+                                             [*summary["builds"], *summary["overlays"]]) else "validated"
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_summary(destination, summary)
+        print(f"Local campaign test {summary['status']}; artifacts: {destination}", flush=True)
+        return 0 if summary["status"] == "validated" else 1
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["error"] = str(exc)
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_summary(destination, summary)
+        print(f"Local campaign test failed: {exc}; artifacts: {destination}", file=sys.stderr)
+        return 1
+    finally:
+        if temporary_source and "overlay_root" in locals():
+            shutil.rmtree(overlay_root)
 
 
 def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
@@ -1058,10 +1160,12 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "submit", "run"])
+    parser.add_argument("action", choices=["validate", "submit", "run", "test-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
+    parser.add_argument("--source-dir", type=Path, help="local llm-d checkout for test-local; otherwise fetch source.repo/ref")
+    parser.add_argument("--output", type=Path, help="new artifact directory for test-local")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
@@ -1073,6 +1177,10 @@ def main() -> int:
                 raise ValueError("--image is required for submit")
             submit(config, args.image, args.service_account)
             return 0
+        if args.action == "test-local":
+            if args.output is None:
+                raise ValueError("--output is required for test-local")
+            return test_local(config, args.output, args.source_dir)
         return run(config)
     except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         print(f"campaign: {exc}", file=sys.stderr)
