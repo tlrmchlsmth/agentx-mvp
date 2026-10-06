@@ -35,6 +35,12 @@ METRIC_SELECTOR_RE = re.compile(
     r'(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
     r'(?P<selector>\{[^{}]*\})'
 )
+BARE_SCOPED_METRIC_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])(?:" + "|".join(re.escape(prefix) for prefix in SCOPED_METRIC_PREFIXES) +
+    r")[A-Za-z0-9_:]*"
+)
+INFERENCE_POOL_SELECTOR_RE = re.compile(r"(?<![A-Za-z0-9_:])(inference_pool_[A-Za-z0-9_:]+)(\{[^{}]*\})")
+BARE_INFERENCE_POOL_RE = re.compile(r"(?<![A-Za-z0-9_:])inference_pool_[A-Za-z0-9_:]+")
 
 
 def parse_relative_time(s):
@@ -230,21 +236,22 @@ def should_scope_metric(metric):
     return metric.startswith(SCOPED_METRIC_PREFIXES)
 
 
-def scope_promql_expr(expr, pod_regex):
-    if not pod_regex:
+def scope_promql_expr(expr, pod_regex, metrics_namespace=None):
+    if not pod_regex and not metrics_namespace:
         return expr
 
-    matcher = f'pod=~"{prom_regex_escape(pod_regex)}"'
+    matcher = f'pod=~"{prom_regex_escape(pod_regex)}"' if pod_regex else ""
 
     def replace_existing_pod_matcher(match):
         return matcher
 
-    expr = POD_MATCHER_RE.sub(replace_existing_pod_matcher, expr)
+    if pod_regex:
+        expr = POD_MATCHER_RE.sub(replace_existing_pod_matcher, expr)
 
     def add_pod_matcher(match):
         metric = match.group("metric")
         selector = match.group("selector")
-        if "pod=" in selector or "pod=~" in selector or not should_scope_metric(metric):
+        if not pod_regex or "pod=" in selector or "pod=~" in selector or not should_scope_metric(metric):
             return match.group(0)
 
         inner = selector[1:-1].strip()
@@ -253,7 +260,56 @@ def scope_promql_expr(expr, pod_regex):
         inner += matcher
         return f"{metric}" + "{" + inner + "}"
 
-    return METRIC_SELECTOR_RE.sub(add_pod_matcher, expr)
+    expr = METRIC_SELECTOR_RE.sub(add_pod_matcher, expr)
+    namespace_matcher = f'namespace="{metrics_namespace}"' if metrics_namespace else ""
+    if metrics_namespace:
+        def scope_inference_pool(match):
+            selector = match.group(2)[1:-1]
+            if re.search(r"\bnamespace\s*(?:=~|!~|=|!=)", selector):
+                selector = re.sub(r'\bnamespace\s*(?:=~|!~|=|!=)\s*"(?:[^"\\]|\\.)*"',
+                                  namespace_matcher, selector)
+            else:
+                selector = (selector + ", " if selector.strip() else "") + namespace_matcher
+            return match.group(1) + "{" + selector + "}"
+        expr = INFERENCE_POOL_SELECTOR_RE.sub(scope_inference_pool, expr)
+
+    # Dashboard queries also use bare names such as rate(vllm:foo_total[1m]).
+    # Scope those names without changing quoted strings or existing selectors.
+    result = []
+    index = 0
+    quote = None
+    selector_depth = 0
+    while index < len(expr):
+        char = expr[index]
+        if quote:
+            result.append(char)
+            if char == "\\" and index + 1 < len(expr):
+                index += 1
+                result.append(expr[index])
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ('"', "'", "`"):
+            quote = char
+        elif char == "{":
+            selector_depth += 1
+        elif char == "}" and selector_depth:
+            selector_depth -= 1
+        if not selector_depth and quote is None:
+            metric = BARE_SCOPED_METRIC_RE.match(expr, index) if pod_regex else None
+            namespace_metric = BARE_INFERENCE_POOL_RE.match(expr, index) if metrics_namespace else None
+            metric = metric or namespace_metric
+            if metric:
+                name = metric.group(0)
+                result.append(name)
+                index = metric.end()
+                if not expr[index:].lstrip().startswith("{"):
+                    result.append("{" + (namespace_matcher if namespace_metric else matcher) + "}")
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
 
 
 def infer_unit(title, unit):
@@ -342,7 +398,7 @@ def export(args):
             if not expr:
                 continue
             expr = substitute_vars(expr, args.deployment)
-            expr = scope_promql_expr(expr, panel_pod_regex)
+            expr = scope_promql_expr(expr, panel_pod_regex, args.metrics_namespace)
             legend = target.get("legendFormat", "")
             result = query_prometheus(args.grafana_url, args.auth, ds_uid, expr, start, end, step)
             if result.get("status") != "success":
@@ -709,7 +765,7 @@ def export_results(args):
                 pod_regex = f.read().strip()
         tasks.append((name, start, end, args.pad, argparse.Namespace(
             start=str(start), end=str(end),
-            deployment=deployment, pod_regex=pod_regex, step=args.step,
+            deployment=deployment, pod_regex=pod_regex, metrics_namespace=args.metrics_namespace, step=args.step,
             grafana_url=args.grafana_url, auth=args.auth,
             output=out_path, dashboard=args.dashboard,
             plotly_bundle=args.plotly_bundle, aiperf_log=args.aiperf_log,
@@ -735,6 +791,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export Grafana dashboard to a self-contained HTML file")
     parser.add_argument("--deployment", default=".*", help="Deployment filter (default: .* for all)")
     parser.add_argument("--pod-regex", default="", help="Pod regex used to scope dashboard metrics")
+    parser.add_argument("--metrics-namespace", help="namespace for inference pool dashboard metrics")
     parser.add_argument("--step", type=int, help="Query step in seconds (auto if omitted)")
     parser.add_argument("--grafana-url", default="http://localhost:3001")
     parser.add_argument("--auth", help="user:password")

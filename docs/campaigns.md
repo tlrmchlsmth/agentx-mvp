@@ -193,7 +193,9 @@ from the results PVC, then regenerates `preview/index.html` with the existing
 AIPerf chart renderer. With `monitoring` configured it also runs the existing
 Grafana exporter for those samples. Run it again to refresh the preview. It leaves the live
 campaign and its final `index.html` untouched. Before the first sample finishes,
-it reports that no preview is available.
+it reports that no preview is available. A sample with no scraped vLLM metrics
+keeps its AIPerf charts and displays a missing-monitoring notice instead of an
+empty Grafana dashboard.
 
 If monitoring was added to the JSON after a `run-local` campaign started,
 regenerate its final HTML after the campaign finishes:

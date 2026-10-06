@@ -904,6 +904,7 @@ def export_campaign_monitoring(config: dict[str, Any], artifact: Path, job_name:
                    "--dashboard", monitoring["dashboard_uid"],
                    "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
                    "--aiperf-log", str(log_path), "--pod-regex", "|".join(re.escape(name) for name in names),
+                   "--metrics-namespace", config["namespace"],
                    "results", *(str(directory) for directory in directories), "--pad", "0"]
         output = call(command, env=env).stdout
     (artifact / "grafana-export.log").write_text(output)
@@ -1619,6 +1620,7 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
             print("No complete AIPerf profiles yet; preview HTML was not created")
             return 0
         monitoring = config.get("monitoring")
+        missing_monitoring = []
         if monitoring:
             with grafana_connection(monitoring) as (url, auth):
                 for run_id, samples in groups.items():
@@ -1640,14 +1642,33 @@ def preview_local(config: dict[str, Any], output: Path) -> int:
                           "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
                           "--aiperf-log", str(log_path),
                           "--pod-regex", "|".join(re.escape(name) for name in names),
+                          "--metrics-namespace", namespace,
                           "results", *(str(sample) for sample in samples), "--pad", "0"], env=env)
                 for data in runs:
                     dashboard = data["directory"] / "dashboard.html"
                     if not dashboard.is_file():
                         raise RuntimeError(f"Grafana export did not create {dashboard}")
-                    data["dashboard"] = dashboard.read_bytes()
+                    page = dashboard.read_text()
+                    panels_match = re.search(r"const panels = ({.*?});\s*\n\s*const rows", page, re.DOTALL)
+                    if panels_match is None:
+                        raise RuntimeError(f"Grafana export has no panel data: {dashboard}")
+                    panels = json.loads(panels_match.group(1))
+                    has_vllm_data = any(
+                        "vllm:" in query.get("expr", "") and
+                        any(series.get("values") for series in query.get("series", []))
+                        for panel in panels.values() for query in panel.get("queries", [])
+                    )
+                    if has_vllm_data:
+                        data["dashboard"] = page.encode()
+                    else:
+                        data["dashboard"] = None
+                        missing_monitoring.append(data["directory"].name)
         notice = (f"<p>In-progress preview: {len(runs)} completed AIPerf samples. "
                   "Unfinished samples and nyann results are not included.</p>")
+        if missing_monitoring:
+            samples = ", ".join(html.escape(name) for name in missing_monitoring)
+            notice += (f"<p>No vLLM Grafana samples were recorded during {samples}; "
+                       "those empty dashboards are omitted. Scraping may have begun after these runs.</p>")
         AIPERF_REPORT.write_index_from_runs(preview, runs, extra_html=notice,
                                             model_label=f"Campaign {config['id']} preview",
                                             save_monitoring_overlay=False)
