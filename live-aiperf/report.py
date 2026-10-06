@@ -467,11 +467,14 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
 
     first_metadata = runs[0]["metadata"]
     output = root / "index.html"
+    nyann_runs = [data for data in runs if data["metadata"].get("benchmark_tool") == "nyann"]
+    nyann_latency_stat = ("p90" if all("p90" in data["profile"].get("time_to_first_token", {})
+                                      for data in nyann_runs) else "p95")
     chart_defaults = ({
         "throughput": {"xMetric": "request_throughput", "yMetric": "output_token_throughput", "yNorm": "none"},
-        "latency": {"xMetric": "time_to_first_token", "xStat": "p90",
+        "latency": {"xMetric": "time_to_first_token", "xStat": nyann_latency_stat,
                     "yMetric": "output_token_throughput", "yNorm": "none"},
-    } if any(data["metadata"].get("benchmark_tool") == "nyann" for data in runs) else {
+    } if nyann_runs else {
         "throughput": {"xMetric": "e2e_output_token_throughput", "yMetric": "output_token_throughput", "yNorm": "decode"},
         "latency": {"xMetric": "e2e_output_token_throughput", "yMetric": "input_token_throughput", "yNorm": "prefill"},
     })

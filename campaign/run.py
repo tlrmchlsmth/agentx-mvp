@@ -856,9 +856,61 @@ def nyann_measurements(log: str, concurrencies: list[int]) -> list[dict[str, Any
                              "successful_requests": successes, "error_requests": errors,
                              "metrics": {"request_throughput": {"avg": successes / duration, "unit": "req/s"},
                                          "output_token_throughput": {"avg": stage["output_tokens_per_second"], "unit": "tokens/s"},
-                                         "time_to_first_token": {"p90": stage["ttft_ms"]["p90"], "unit": "ms"},
-                                         "inter_token_latency": {"p90": stage["itl_ms"]["p90"], "unit": "ms"}}})
+                                         "time_to_first_token": {**{key: value for key, value in stage["ttft_ms"].items()
+                                                                    if key in {"avg", "p10", "p50", "p90", "p95", "p99"}},
+                                                                 "unit": "ms"},
+                                         "inter_token_latency": {**{key: value for key, value in stage["itl_ms"].items()
+                                                                    if key in {"avg", "p10", "p50", "p90", "p95", "p99"}},
+                                                                  "unit": "ms"}}})
     return measurements
+
+
+def nyann_live_measurements(log: str, concurrencies: list[int], duration_seconds: int) -> list[dict[str, Any]]:
+    """Read completed Nyann stage rows while its final JSON is still unavailable."""
+    try:
+        return nyann_measurements(log, concurrencies)
+    except RuntimeError as exc:
+        if "without a machine-readable stage summary" not in str(exc):
+            raise
+    stages: dict[int, dict[str, Any]] = {}
+    current_stage = None
+
+    def milliseconds(value: str) -> float:
+        match = re.fullmatch(r"([\d.]+)(ms|s)", value)
+        if match is None:
+            raise ValueError(value)
+        return float(match.group(1)) * (1000 if match.group(2) == "s" else 1)
+
+    for line in log.splitlines():
+        started = re.search(r'Stage started" stage=(\d+)/\d+ concurrency=(\d+)', line)
+        if started:
+            index, concurrency = map(int, started.groups())
+            current_stage = index if 1 <= index <= len(concurrencies) and concurrencies[index - 1] == concurrency else None
+            continue
+        columns = line.split()
+        if current_stage is None or len(columns) != 14 or not all(value.isdigit() for value in columns[:4]):
+            continue
+        try:
+            concurrency, successes, errors, _ = map(int, columns[:4])
+            if concurrency != concurrencies[current_stage - 1] or successes <= 0 or duration_seconds <= 0:
+                continue
+            throughput = float(columns[4])
+            ttft = [milliseconds(value) for value in columns[5:10]]
+            itl = [milliseconds(value) for value in columns[10:14]]
+        except ValueError:
+            continue
+        stages[current_stage] = {
+            "concurrency": concurrency, "sample": f"stage-{current_stage}",
+            "successful_requests": successes, "error_requests": errors,
+            "metrics": {
+                "request_throughput": {"avg": successes / duration_seconds, "unit": "req/s"},
+                "output_token_throughput": {"avg": throughput, "unit": "tokens/s"},
+                "time_to_first_token": {**dict(zip(("avg", "p10", "p50", "p95", "p99"), ttft)), "unit": "ms"},
+                "inter_token_latency": {**dict(zip(("p10", "p50", "p95", "p99"), itl)), "unit": "ms"},
+            },
+        }
+        current_stage = None
+    return [stages[index] for index in sorted(stages)]
 
 
 @contextmanager
@@ -1073,6 +1125,43 @@ def write_summary(destination: Path, summary: dict[str, Any]) -> None:
         writer.writerows(rows)
 
 
+def nyann_chart_runs(destination: Path, summary: dict[str, Any], record: dict[str, Any],
+                     bench: dict[str, Any], gpu_metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Shape Nyann measurements for the shared interactive chart renderer."""
+    build = record.get("vllm_build_inputs", {})
+    steps = build.get("steps", [])
+    identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
+    dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
+    label = f"{record.get('build', 'nightly')} / {record.get('overlay', record['name'])}"
+    label += f" — vLLM {identity or summary.get('vllm_image', 'nightly image')}"
+    if dimensions:
+        label += f" ({dimensions})"
+    repeats = Counter(item["concurrency"] for item in bench["measurements"])
+    seen: Counter[int] = Counter()
+    runs = []
+    for measurement in bench["measurements"]:
+        concurrency = measurement["concurrency"]
+        seen[concurrency] += 1
+        runs.append({
+            "directory": destination / record["name"] / "nyann" / measurement["sample"],
+            "profile": measurement["metrics"],
+            "metadata": {
+                "run_id": f"{bench.get('run_id', summary['id'] + '-' + record['name'] + '-nyann')}-c{concurrency}",
+                "concurrency": concurrency,
+                "repeat_count": repeats[concurrency], "repeat_index": seen[concurrency],
+                "campaign_label": f"{label} / Nyann",
+                "benchmark_tool": "nyann", "model_label": summary["id"],
+                "source_kind": "llm-d", "source_ref": summary.get("source_ref", "unknown"),
+                "source_commit": summary.get("source_commit", ""),
+                "vllm_image": summary.get("vllm_image", ""),
+                "vllm_build_steps": steps, "deepep_build": build.get("deepep"),
+                **(gpu_metadata or {}),
+            },
+            "yaml": "", "aiperf_job_yaml": "", "llmd_yaml": "", "dashboard": None,
+        })
+    return runs
+
+
 def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
     """Pass campaign samples to the existing interactive report renderer."""
     runs = []
@@ -1115,28 +1204,7 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
         for bench in record.get("benchmarks", []):
             if bench.get("tool") != "nyann" or not bench.get("measurements"):
                 continue
-            repeats = Counter(item["concurrency"] for item in bench["measurements"])
-            seen: Counter[int] = Counter()
-            for measurement in bench["measurements"]:
-                concurrency = measurement["concurrency"]
-                seen[concurrency] += 1
-                runs.append({
-                    "directory": destination / record["name"] / "nyann" / measurement["sample"],
-                    "profile": measurement["metrics"],
-                    "metadata": {
-                        "run_id": f"{bench.get('run_id', summary['id'] + '-' + record['name'] + '-nyann')}-c{concurrency}",
-                        "concurrency": concurrency,
-                        "repeat_count": repeats[concurrency], "repeat_index": seen[concurrency],
-                        "campaign_label": f"{label} / Nyann",
-                        "benchmark_tool": "nyann", "model_label": summary["id"],
-                        "source_kind": "llm-d", "source_ref": summary.get("source_ref", "unknown"),
-                        "source_commit": summary.get("source_commit", ""),
-                        "vllm_image": summary.get("vllm_image", ""),
-                        "vllm_build_steps": steps, "deepep_build": build.get("deepep"),
-                        **gpu_metadata,
-                    },
-                    "yaml": "", "aiperf_job_yaml": "", "llmd_yaml": "", "dashboard": None,
-                })
+            runs.extend(nyann_chart_runs(destination, summary, record, bench, gpu_metadata))
     write_summary(destination, summary)
     AIPERF_REPORT.write_index_from_runs(destination, runs, model_label=f"Campaign {summary['id']}",
                                         save_monitoring_overlay=False, compact_header=True,
@@ -2003,7 +2071,7 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         match = JOB_LINE.search(submission.read_text())
         if match is None:
             continue
-        logs = kube(namespace, "logs", f"job/{match.group(1)}", "--tail=200", check=False)
+        logs = kube(namespace, "logs", f"job/{match.group(1)}", check=False)
         if logs.returncode == 0:
             (folder / "nyann-live.log").write_text(logs.stdout)
     preview = campaign_dir / "preview"
@@ -2069,6 +2137,22 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
                     else:
                         data["dashboard"] = None
                         missing_monitoring.append(data["directory"].name)
+        nyann_specs = [bench for bench in config["benchmarks"] if bench["tool"] == "nyann"]
+        if nyann_specs:
+            spec = nyann_specs[0]
+            for record in summary.get("overlays", []):
+                nyann_result = next((bench for bench in record.get("benchmarks", [])
+                                     if bench.get("tool") == "nyann" and bench.get("measurements")), None)
+                if nyann_result is None:
+                    live_log = campaign_dir / record["name"] / "nyann-live.log"
+                    if not live_log.is_file():
+                        continue
+                    measurements = nyann_live_measurements(live_log.read_text(errors="replace"),
+                                                            spec["concurrencies"], spec["duration_seconds"])
+                    if not measurements:
+                        continue
+                    nyann_result = {"tool": "nyann", "measurements": measurements}
+                runs.extend(nyann_chart_runs(campaign_dir, summary, record, nyann_result))
         completed = {(path.parent.parent.name, path.parent.name) for path in paths}
         started = {(path.parent.name, path.name) for line in directories.splitlines()
                    if (path := Path(line)).parent.name in labels}
@@ -2095,7 +2179,7 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         staged = render / "index.html"
         staged.write_text(page)
         staged.replace(preview / "index.html")
-    print(f"Preview: {preview / 'index.html'} ({len(runs)} completed AIPerf samples)")
+    print(f"Preview: {preview / 'index.html'} ({len(runs)} completed samples)")
     return 0
 
 

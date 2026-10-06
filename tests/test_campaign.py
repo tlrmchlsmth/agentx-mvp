@@ -746,6 +746,49 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("<td>stage-3 (c32)</td><td>running</td>", page)
             self.assertIn("<td>stage-4 (c64)</td><td>pending</td>", page)
 
+    def test_nyann_live_preview_charts_completed_stages(self):
+        log = ('msg="Stage started" stage=1/3 concurrency=1 duration=10m0s\n'
+               '  1  109  0  17918  30.3  462.0ms  344.4ms  408.2ms  822.9ms  880.1ms  29.1ms  30.4ms  32.5ms  35.2ms\n'
+               'msg="Stage started" stage=2/3 concurrency=8 duration=10m0s\n'
+               '  8  756  0  122230  204.4  535.4ms  433.5ms  518.6ms  639.0ms  1.07s  32.4ms  36.3ms  38.0ms  40.7ms\n'
+               'msg="Stage started" stage=3/3 concurrency=32 duration=10m0s\n')
+        measurements = runner.nyann_live_measurements(log, [1, 8, 32], 600)
+        self.assertEqual([item["concurrency"] for item in measurements], [1, 8])
+        self.assertEqual(measurements[1]["metrics"]["time_to_first_token"]["p99"], 1070)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["benchmarks"] = [{"tool": "nyann", "concurrencies": [1, 8, 32], "duration_seconds": 600}]
+            campaign = root / "campaigns" / config["id"]
+            folder = campaign / "baseline"
+            folder.mkdir(parents=True)
+            (campaign / "campaign.json").write_text(json.dumps(config))
+            (campaign / "summary.json").write_text(json.dumps({
+                "id": config["id"], "status": "running", "vllm_image": config["vllm_image"],
+                "overlays": [{"name": "baseline", "status": "running", "benchmarks": []}]}))
+            (folder / "nyann-submit.log").write_text("Job queued: nyann-example in test namespace\n")
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "exec":
+                    return SimpleNamespace(returncode=1, stdout="")
+                if args[0] == "logs":
+                    return SimpleNamespace(returncode=0, stdout=log)
+                raise AssertionError(args)
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                self.assertEqual(runner.preview_local(config, root), 0)
+            page = (campaign / "preview/index.html").read_text()
+            chart = re.search(r"const CONFIGS = (\{.*?\});", page)
+            self.assertIsNotNone(chart)
+            plotted = next(iter(json.loads(chart.group(1)).values()))
+            self.assertIn("/ Nyann", plotted["label"])
+            data = re.search(r"const DATA = (\{.*?\});", page)
+            self.assertIsNotNone(data)
+            runs = next(iter(json.loads(data.group(1)).values()))
+            self.assertEqual(set(runs), {"c1", "c8"})
+            self.assertEqual(runs["c8"]["output_token_throughput"]["avg"], 204.4)
+            self.assertIn("stage-3 (c32)</td><td>running", page)
+
     def test_failed_campaign_keeps_last_partial_preview(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
