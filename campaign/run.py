@@ -1590,7 +1590,8 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
     AIPERF_REPORT.write_index_from_runs(destination, runs, model_label=f"Campaign {summary['id']}",
                                         save_monitoring_overlay=False, compact_header=True,
                                         campaign=summary,
-                                        extra_html=AIPERF_REPORT.nyann_setup(campaign_config, destination)
+                                        extra_html=AIPERF_REPORT.aiperf_setup(campaign_config, destination)
+                                        + AIPERF_REPORT.nyann_setup(campaign_config, destination)
                                         + nyann_source_results(destination, summary["overlays"]))
 
 
@@ -2647,7 +2648,8 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
         started = {(path.parent.name, path.name) for line in directories.splitlines()
                    if (path := Path(line)).parent.name in labels}
         progress = preview_progress(config, campaign_dir, summary, completed, started)
-        notice = (progress + AIPERF_REPORT.nyann_setup(config, campaign_dir)
+        notice = (progress + AIPERF_REPORT.aiperf_setup(config, campaign_dir)
+                  + AIPERF_REPORT.nyann_setup(config, campaign_dir)
                   + nyann_source_results(campaign_dir, summary.get("overlays", [])))
         if missing_nyann_metrics:
             notice += ('<p class="campaign-note">' + html.escape("; ".join(missing_nyann_metrics)) + '</p>')

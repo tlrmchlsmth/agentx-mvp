@@ -409,6 +409,7 @@ kubectl apply -f "$JOB_MANIFEST"
 
 echo "Job queued: ${JOB_NAME} (Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE})"
 echo "Benchmark source: ${SOURCE_KIND} ${SOURCE_REF} (${SOURCE_COMMIT})"
+echo "aiperf image: ${AIPERF_IMAGE}"
 echo "Logs: kubectl logs -n ${NAMESPACE} -f job/${JOB_NAME}"
 for run_spec in "${RUN_SPECS[@]}"; do
   IFS=: read -r reported_concurrency reported_repeat reported_count reported_output_name <<< "$run_spec"

@@ -78,10 +78,9 @@
     {
       "tool": "aiperf",
       "concurrencies": [
-        1,
+        4,
         8,
-        32,
-        64
+        16
       ],
       "duration_seconds": 900,
       "max_context_length": 131072
@@ -89,12 +88,11 @@
     {
       "tool": "nyann",
       "concurrencies": [
-        1,
+        4,
         8,
-        32,
-        64
+        16
       ],
-      "duration_seconds": 600,
+      "duration_seconds": 300,
       "isl": 1024,
       "osl": 512,
       "warmup_seconds": 60

@@ -1114,11 +1114,23 @@ class CampaignTests(unittest.TestCase):
             (destination / "campaign.json").write_text(json.dumps({
                 "namespace": "benchmark", "base_url": "http://benchmark.example/v1",
                 "overlays": [{"name": "pd", "model_label": "GLM"}],
-                "benchmarks": [{"tool": "nyann", "concurrencies": [1, 4],
+                "benchmarks": [{"tool": "aiperf", "concurrencies": [2, 8],
+                                "duration_seconds": 900, "max_context_length": 131072},
+                               {"tool": "nyann", "concurrencies": [1, 4],
                                 "duration_seconds": 600, "isl": 1024, "osl": 512,
                                 "warmup_seconds": 60}]}))
+            submit_log = destination / "branch2-pd"
+            submit_log.mkdir()
+            (submit_log / "aiperf-submit.log").write_text(
+                "Job queued: campaign-branch2-pd-aiperf in test namespace\n"
+                "aiperf image: quay.io/rh-ee-robshaw/aiperf@sha256:deadbeef\n")
             runner.write_final_report(destination, summary)
             page = (destination / "index.html").read_text()
+            self.assertIn("AIPerf trace workload · c2, c8 · 900 s/stage · max context 131072 tokens", page)
+            self.assertIn("Full AIPerf benchmark configuration", page)
+            self.assertIn("semianalysis_cc_traces_weka_062126", page)
+            self.assertIn("quay.io/rh-ee-robshaw/aiperf@sha256:deadbeef", page)
+            self.assertIn("&quot;max_context_length&quot;: 131072", page)
             self.assertIn("ISL 1024 · OSL 512", page)
             self.assertIn("Full Nyann benchmark configuration", page)
             self.assertIn("http://benchmark.example/v1", page)
@@ -1152,6 +1164,31 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(metadata["source_commit"], "a" * 40)
                 self.assertIn(commit, (root / "aiperf-agentx" / f"campaign-{build}-pd-aiperf" /
                                        "index.html").read_text())
+
+    def test_aiperf_setup_shows_sweep_and_fixed_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(runner.AIPERF_REPORT.aiperf_setup({"benchmarks": []}), "")
+            config = {"namespace": "vllm",
+                      "overlays": [{"name": "baseline", "model_label": "test-model"}],
+                      "benchmarks": [{"tool": "aiperf", "concurrencies": [4, 4, 16],
+                                      "duration_seconds": 1200, "max_context_length": 65536}]}
+            campaign = root / "campaigns" / "campaign"
+            (campaign / "baseline").mkdir(parents=True)
+            (campaign / "baseline" / "aiperf-submit.log").write_text(
+                "Job queued: campaign-baseline-aiperf in test namespace\n"
+                "aiperf image: quay.io/rh-ee-robshaw/aiperf:test\n")
+            section = runner.AIPERF_REPORT.aiperf_setup(config, campaign)
+            self.assertIn("AIPerf trace workload · c4, c4, c16 · 1200 s/stage · max context 65536 tokens",
+                          section)
+            self.assertIn("Full AIPerf benchmark configuration", section)
+            self.assertIn("inferencex-agentx-mvp", section)
+            self.assertIn("semianalysis_cc_traces_weka_062126", section)
+            self.assertIn("quay.io/rh-ee-robshaw/aiperf:test", section)
+            self.assertIn("&quot;max_context_length&quot;: 65536", section)
+            self.assertIn("repeats are labeled cN-rM", section)
+            self.assertIn("http://llm-d-inference-gateway-istio.vllm.svc.cluster.local/v1", section)
+            self.assertNotIn("campaign-baseline-aiperf in test namespace", section)
 
     def test_preview_local_renders_only_completed_samples(self):
         with tempfile.TemporaryDirectory() as directory:

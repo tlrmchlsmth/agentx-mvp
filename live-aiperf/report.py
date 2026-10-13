@@ -481,6 +481,61 @@ def nyann_setup(config: dict[str, Any], campaign_dir: Path | None = None) -> str
     return "".join(sections)
 
 
+def aiperf_setup(config: dict[str, Any], campaign_dir: Path | None = None) -> str:
+    """Show the configured AIPerf sweep and the fixed profile used by submit.sh."""
+    benchmarks = [bench for bench in config.get("benchmarks", []) if bench.get("tool") == "aiperf"]
+    if not benchmarks:
+        return ""
+    sections = []
+    models = ", ".join(sorted({str(overlay["model_label"]) for overlay in config.get("overlays", [])
+                               if overlay.get("model_label")}))
+    target = config.get("base_url") or f"http://llm-d-inference-gateway-istio.{config['namespace']}.svc.cluster.local/v1"
+    images = set()
+    if campaign_dir is not None:
+        for log in campaign_dir.glob("*/aiperf-submit.log"):
+            match = re.search(r"(?m)^aiperf image: (.+)$", log.read_text(errors="replace"))
+            if match:
+                images.add(match.group(1).strip())
+    for bench in benchmarks:
+        concurrencies = bench["concurrencies"]
+        stages = ", ".join(f"c{value}" for value in concurrencies)
+        headline = (f"AIPerf trace workload · {stages} · {bench['duration_seconds']} s/stage · "
+                    f"max context {bench['max_context_length']} tokens")
+        settings = [
+            ("Tool", bench["tool"]), ("Workload", "trace replay"),
+            ("Scenario", "inferencex-agentx-mvp"),
+            ("Dataset", "semianalysis_cc_traces_weka_062126"),
+            ("Sampling", "sequential"), ("Endpoint", "chat (streaming)"),
+            ("Concurrency stages", stages), ("Duration per stage", f"{bench['duration_seconds']} s"),
+            ("Max context length", f"{bench['max_context_length']} tokens"),
+            ("Random seed", "42"), ("Server token counts", "enabled"),
+            ("Prefix cache reset", "before every stage"),
+            ("Target", str(target)), ("Model", models or "unspecified"),
+        ]
+        if images:
+            settings.append(("AIPerf image", ", ".join(sorted(images))))
+        rows = "".join(f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
+                       for key, value in settings)
+        exact = html.escape(json.dumps(bench, indent=2))
+        sections.append(
+            '<div class="campaign-benchmark">'
+            f'<p class="campaign-benchmark-summary">{html.escape(headline)}</p>'
+            '<details class="campaign-detail"><summary>Full AIPerf benchmark configuration</summary>'
+            f'<table><tbody>{rows}</tbody></table>'
+            '<p>Requests replay the semianalysis_cc_traces_weka_062126 public trace '
+            'dataset sequentially with random seed 42 over the streaming chat endpoint; '
+            'the configured max context length bounds each request.</p>'
+            '<p>Every prefill and decode vLLM prefix cache is reset before each '
+            'concurrency stage, so every stage starts cold.</p>'
+            '<p>A concurrency value listed more than once reruns that stage; '
+            'repeats are labeled cN-rM in the artifacts.</p>'
+            '<p>Token counts come from the server (--use-server-token-count), '
+            'not client-side retokenization.</p>'
+            f'<p>Configured JSON</p><pre>{exact}</pre>'
+            '</details></div>')
+    return "".join(sections)
+
+
 def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html: str = "",
                           model_label: str | None = None, save_monitoring_overlay: bool = True,
                           compact_header: bool = False,
