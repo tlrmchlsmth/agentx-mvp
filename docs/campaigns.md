@@ -153,7 +153,7 @@ with a `vllm_images` list:
 ```json
 "vllm_images": [
   {"name": "nightly", "image": "docker.io/vllm/vllm-openai:nightly"},
-  {"name": "0-11-0", "image": "docker.io/vllm/vllm-openai:0.11.0"}
+  {"name": "0-11-0", "image": "docker.io/vllm/vllm-openai:v0.11.0"}
 ]
 ```
 

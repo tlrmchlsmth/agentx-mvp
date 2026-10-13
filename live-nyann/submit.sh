@@ -4,6 +4,9 @@ set -euo pipefail
 # Submit one nyann-bench Job containing one synthetic stage per concurrency.
 # Usage: ./submit.sh <concurrency|comma-separated-sweep> [isl] [osl] [duration_seconds] [warmup_seconds]
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../live-lib.sh"
+
 CONCURRENCY="${1:-}"
 ISL="${2:-${NYANN_ISL:-1024}}"
 OSL="${3:-${NYANN_OSL:-512}}"
@@ -36,30 +39,9 @@ if [[ ! "$WARMUP" =~ ^[0-9][0-9]*$ ]] || (( WARMUP > 3600 )); then
   exit 2
 fi
 
-NAMESPACE="${LIVE_NYANN_NAMESPACE:-}"
-if [[ -z "$NAMESPACE" ]]; then
-  echo "Discovering the deployed vLLM namespace..."
-  DEPLOYMENT_NAMESPACES=()
-  while IFS=$'\t' read -r namespace commit; do
-    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] && DEPLOYMENT_NAMESPACES+=("$namespace")
-  done < <(kubectl get configmaps --all-namespaces -o go-template='{{range .items}}{{if eq .metadata.name "vllm-build-ref"}}{{.metadata.namespace}}{{"\t"}}{{index .data "VLLM_BUILD_COMMIT"}}{{"\n"}}{{end}}{{end}}')
-  if (( ${#DEPLOYMENT_NAMESPACES[@]} != 1 )); then
-    echo "Could not identify exactly one deployed vLLM namespace (found: ${DEPLOYMENT_NAMESPACES[*]:-none})" >&2
-    echo "Set LIVE_NYANN_NAMESPACE when choosing intentionally among multiple deployments." >&2
-    exit 1
-  fi
-  NAMESPACE="${DEPLOYMENT_NAMESPACES[0]}"
-fi
+NAMESPACE="$(discover_live_namespace LIVE_NYANN_NAMESPACE)" || exit 1
 echo "Using namespace: ${NAMESPACE}"
-BENCHMARK_QUEUE="${LIVE_BENCHMARK_QUEUE:-live-benchmark-client}"
-if [[ ! "$BENCHMARK_QUEUE" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || (( ${#BENCHMARK_QUEUE} > 63 )); then
-  echo "invalid LIVE_BENCHMARK_QUEUE: ${BENCHMARK_QUEUE}" >&2
-  exit 2
-fi
-kubectl get localqueue "$BENCHMARK_QUEUE" -n "$NAMESPACE" -o name >/dev/null || {
-  echo "Missing Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE}; run just live-benchmark-kueue-setup ${NAMESPACE}" >&2
-  exit 1
-}
+BENCHMARK_QUEUE="$(require_live_benchmark_queue "$NAMESPACE")" || exit 1
 
 BASE_URL="${BASE_URL:-http://llm-d-inference-gateway-istio.${NAMESPACE}.svc.cluster.local/v1}"
 NYANN_IMAGE="${NYANN_IMAGE:-ghcr.io/neuralmagic/nyann-bench:latest}"
@@ -67,45 +49,9 @@ RESULTS_PVC="${RESULTS_PVC:-kimi-k3-build-cache}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-nyann-agentx}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800s}"
 
-if [[ -n "${LIVE_BENCHMARK_SOURCE_COMMIT:-}" ]]; then
-  SOURCE_REF="${LIVE_BENCHMARK_SOURCE_REF:-}"
-  SOURCE_COMMIT="$LIVE_BENCHMARK_SOURCE_COMMIT"
-  SOURCE_KIND="${LIVE_BENCHMARK_SOURCE_KIND:-llm-d}"
-else
-  echo "Reading deployed vLLM build metadata..."
-  SOURCE_REF="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
-  SOURCE_COMMIT="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
-  SOURCE_KIND=vllm
-fi
-if [[ ! "$SOURCE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
-   ! [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
-   ! [[ "$SOURCE_KIND" == vllm || "$SOURCE_KIND" == llm-d ]]; then
-  echo "Benchmark source ref/commit is missing or malformed" >&2
-  exit 1
-fi
-SOURCE_SHORT="${SOURCE_COMMIT:0:12}"
+resolve_live_benchmark_source "$NAMESPACE"
 
-DISCOVERED_MODELS=()
-echo "Discovering the serving model..."
-while IFS= read -r discovered_model; do
-  [[ -n "$discovered_model" ]] && DISCOVERED_MODELS+=("$discovered_model")
-done < <(
-  kubectl get pods -n "$NAMESPACE" -l llm-d.ai/inference-serving=true \
-    -o go-template='{{range .items}}{{index .metadata.labels "llm-d.ai/model"}}{{"\n"}}{{end}}' \
-    | awk 'NF' | sort -u
-)
-if [[ -z "${MODEL_LABEL:-}" ]]; then
-  if (( ${#DISCOVERED_MODELS[@]} == 0 )); then
-    echo "No inference-serving pods with llm-d.ai/model found in ${NAMESPACE}" >&2
-    exit 1
-  fi
-  if (( ${#DISCOVERED_MODELS[@]} != 1 )); then
-    echo "More than one serving model was found: ${DISCOVERED_MODELS[*]}" >&2
-    echo "Set MODEL_LABEL only when selecting one intentionally." >&2
-    exit 1
-  fi
-  MODEL_LABEL="${DISCOVERED_MODELS[0]}"
-fi
+discover_live_serving_model "$NAMESPACE"
 
 BASE_SELECTOR="llm-d.ai/model=${MODEL_LABEL},llm-d.ai/inference-serving=true"
 echo "Waiting up to ${READY_TIMEOUT} for serving pods matching ${BASE_SELECTOR}..."

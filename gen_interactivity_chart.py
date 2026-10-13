@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-Scan results/ for pN_dM deployment configs, extract aiperf metrics,
-and generate an interactive interactivity-vs-throughput HTML chart.
+Render the interactive interactivity-vs-throughput HTML chart for a set of
+benchmark runs.
 
-Usage:
-    python3 gen_interactivity_chart.py [results_dir]
-
-Defaults to ./results if no argument is given. Output:
-<results_dir>/interactivity_vs_throughput.html.
+This module is a pure renderer: live-aiperf/report.py discovers runs, loads
+their metrics and saved Grafana dashboards, and passes everything in through
+generate_html(), which writes the page to output_path (conventionally
+index.html).
 """
 
-import base64
-import csv
 import json
-import os
 import re
-import sys
-from pathlib import Path
 
 GPUS_PER_NODE = 8
 STAT_KEYS = ['avg', 'min', 'p10', 'p50', 'p90', 'p95', 'p99', 'max']
@@ -25,282 +19,6 @@ COLORS = [
     '#6ea8e8', '#f0a35e', '#58c0a8', '#e07a9a', '#a793ea',
     '#d9c25f', '#98c37e', '#e88f7a', '#7fd4f0', '#b3b9c4',
 ]
-
-
-def read_model_label(results_dir):
-    candidates = [Path(results_dir) / 'model_label.txt']
-    candidates.extend(sorted(Path(results_dir).glob('results_*/model_label.txt')))
-    for path in candidates:
-        if path.is_file():
-            label = path.read_text().strip()
-            if label:
-                return label
-    return os.environ.get('MODEL_LABEL', 'DeepSeek-V4-Pro')
-
-
-def read_text_file(path, default=''):
-    try:
-        text = Path(path).read_text().strip()
-    except OSError:
-        return default
-    return text or default
-
-
-def read_int_file(path, default):
-    try:
-        return int(read_text_file(path, str(default)))
-    except ValueError:
-        return default
-
-
-def parse_int(value):
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, str):
-        value = value.strip().replace(',', '')
-        if value.isdigit():
-            return int(value)
-    return None
-
-
-def tokens_from_cache_config_labels(labels):
-    if not isinstance(labels, dict):
-        return None
-    kv_cache_size_tokens = parse_int(labels.get('kv_cache_size_tokens'))
-    if kv_cache_size_tokens is not None:
-        return kv_cache_size_tokens
-    num_gpu_blocks = parse_int(labels.get('num_gpu_blocks'))
-    block_size = parse_int(labels.get('block_size'))
-    if num_gpu_blocks is None or block_size is None:
-        return None
-    return num_gpu_blocks * block_size
-
-
-def classify_kv_role(labels, token_value=None):
-    label_text = ' '.join(str(v).lower() for v in labels.values())
-    if 'prefill' in label_text:
-        return 'prefill'
-    if 'decode' in label_text:
-        return 'decode'
-    # Older AIPerf server-metrics exports collapse endpoint labels to the
-    # gateway. For our WideEP runs the prefill ranks are the smaller cache
-    # entries and decode ranks are the larger cache entries.
-    if token_value is not None:
-        return '_by_size'
-    return None
-
-
-def kv_cache_tokens_from_series(series):
-    by_role = {'prefill': [], 'decode': []}
-    by_size = []
-    for item in series:
-        labels = item.get('labels', {}) if isinstance(item, dict) else {}
-        token_value = tokens_from_cache_config_labels(labels)
-        if token_value is None:
-            continue
-        role = classify_kv_role(labels, token_value)
-        if role in by_role:
-            by_role[role].append(token_value)
-        elif role == '_by_size':
-            by_size.append(token_value)
-
-    if not by_role['prefill'] and not by_role['decode'] and by_size:
-        sizes = sorted(set(by_size))
-        if len(sizes) >= 2:
-            by_role['prefill'] = [v for v in by_size if v == sizes[0]]
-            by_role['decode'] = [v for v in by_size if v == sizes[-1]]
-        else:
-            by_role['decode'] = by_size
-
-    return {
-        'prefill': sum(by_role['prefill']) or None,
-        'decode': sum(by_role['decode']) or None,
-    }
-
-
-def find_kv_cache_tokens_in_json(value):
-    if isinstance(value, dict):
-        metric = value.get('vllm:cache_config_info')
-        if isinstance(metric, dict) and isinstance(metric.get('series'), list):
-            tokens = kv_cache_tokens_from_series(metric['series'])
-            if tokens['prefill'] is not None or tokens['decode'] is not None:
-                return tokens
-
-        if isinstance(value.get('series'), list):
-            tokens = kv_cache_tokens_from_series(value['series'])
-            if tokens['prefill'] is not None or tokens['decode'] is not None:
-                return tokens
-
-        totals = {'prefill': 0, 'decode': 0}
-        found = False
-        for child in value.values():
-            child_value = find_kv_cache_tokens_in_json(child)
-            if child_value is None:
-                continue
-            found = True
-            for role in totals:
-                totals[role] += child_value.get(role) or 0
-        if found:
-            return {role: (total or None) for role, total in totals.items()}
-    elif isinstance(value, list):
-        totals = {'prefill': 0, 'decode': 0}
-        found = False
-        for child in value:
-            child_value = find_kv_cache_tokens_in_json(child)
-            if child_value is None:
-                continue
-            found = True
-            for role in totals:
-                totals[role] += child_value.get(role) or 0
-        if found:
-            return {role: (total or None) for role, total in totals.items()}
-    return None
-
-
-def read_kv_cache_tokens_from_cache_config(run_dir):
-    json_path = os.path.join(run_dir, 'server_metrics_export.json')
-    if os.path.isfile(json_path):
-        try:
-            with open(json_path) as f:
-                payload = json.load(f)
-                token_values = find_kv_cache_tokens_in_json(payload.get('metrics', payload))
-            if token_values is not None:
-                return token_values
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    csv_path = os.path.join(run_dir, 'server_metrics_export.csv')
-    if os.path.isfile(csv_path):
-        by_role = {'prefill': [], 'decode': []}
-        by_size = []
-        try:
-            with open(csv_path, newline='') as f:
-                reader = csv.reader(row for row in f if not row.startswith('#'))
-                current = {}
-                for row in reader:
-                    if len(row) < 4:
-                        continue
-                    if row[1] == 'vllm:cache_config_info':
-                        label_name = row[2]
-                        label_value = row[3]
-                    elif len(row) >= 5 and row[2] == 'vllm:cache_config_info':
-                        label_name = row[3]
-                        label_value = row[4]
-                    else:
-                        continue
-                    current[label_name] = label_value
-                    token_value = tokens_from_cache_config_labels(current)
-                    if token_value is not None:
-                        role = classify_kv_role(current, token_value)
-                        if role in by_role:
-                            by_role[role].append(token_value)
-                        else:
-                            by_size.append(token_value)
-                        current = {}
-            if not by_role['prefill'] and not by_role['decode'] and by_size:
-                sizes = sorted(set(by_size))
-                if len(sizes) >= 2:
-                    by_role['prefill'] = [v for v in by_size if v == sizes[0]]
-                    by_role['decode'] = [v for v in by_size if v == sizes[-1]]
-                else:
-                    by_role['decode'] = by_size
-            if by_role['prefill'] or by_role['decode']:
-                return {
-                    'prefill': sum(by_role['prefill']) or None,
-                    'decode': sum(by_role['decode']) or None,
-                }
-        except OSError:
-            pass
-    return None
-
-
-def read_kv_cache_tokens(run_dir):
-    return read_kv_cache_tokens_from_cache_config(run_dir)
-
-
-def discover_configs(results_dir):
-    """Auto-discover deployment configs and concurrency levels from folder structure.
-
-    Expected layout:
-        results_dir/
-            results_<user>-wide-ep/
-                results_<user>-wide-ep_c64/profile_export_aiperf.json
-                results_<user>-wide-ep_c256/...
-    """
-    configs = {}
-    metric_units = {}
-
-    for entry in sorted(os.listdir(results_dir)):
-        if not entry.startswith('results_'):
-            continue
-        config_dir = os.path.join(results_dir, entry)
-        if not os.path.isdir(config_dir):
-            continue
-
-        config_name = entry[len('results_'):]
-        decode_gpus = read_int_file(os.path.join(config_dir, 'decode_gpus.txt'), GPUS_PER_NODE)
-        prefill_gpus = read_int_file(os.path.join(config_dir, 'prefill_gpus.txt'), GPUS_PER_NODE)
-        default_label = config_name
-        default_pods = read_text_file(os.path.join(config_dir, 'pods.txt'), config_name)
-
-        conc_pattern = re.compile(rf'^results_{re.escape(config_name)}_c(\d+)$')
-        runs = {}
-        for sub in sorted(os.listdir(config_dir)):
-            cm = conc_pattern.match(sub)
-            if not cm:
-                continue
-            c_val = int(cm.group(1))
-            json_path = os.path.join(config_dir, sub, 'profile_export_aiperf.json')
-            if not os.path.isfile(json_path):
-                continue
-            with open(json_path) as f:
-                d = json.load(f)
-
-            run_data = {}
-            for key, val in d.items():
-                if isinstance(val, dict) and 'avg' in val:
-                    run_data[key] = {s: val[s] for s in STAT_KEYS if s in val}
-                    if key not in metric_units:
-                        metric_units[key] = val.get('unit', '')
-
-            kv_cache_tokens = read_kv_cache_tokens(os.path.join(config_dir, sub))
-            if kv_cache_tokens is not None:
-                run_data['_kv_cache_tokens'] = kv_cache_tokens
-
-            runs[c_val] = run_data
-
-        if not runs:
-            continue
-
-        version = ''
-        ver_path = os.path.join(config_dir, 'vllm_version.txt')
-        if os.path.isfile(ver_path):
-            with open(ver_path) as vf:
-                version = vf.read().strip()
-
-        yamls = {}
-        for yname in sorted(os.listdir(config_dir)):
-            if yname.endswith('.yaml') or yname.endswith('.yml'):
-                ypath = os.path.join(config_dir, yname)
-                if os.path.isfile(ypath):
-                    with open(ypath) as yf:
-                        yamls[yname] = yf.read()
-
-        label = read_text_file(os.path.join(config_dir, 'config_label.txt'), default_label)
-        pods = read_text_file(os.path.join(config_dir, 'pods.txt'), default_pods)
-        configs[config_name] = {
-            'label': label,
-            'decode_gpus': decode_gpus,
-            'prefill_gpus': prefill_gpus,
-            'pods': pods,
-            'runs': dict(sorted(runs.items())),
-            'version': version,
-            'yamls': yamls,
-        }
-
-    return configs, metric_units
 
 
 def highlight_yaml(text):
@@ -338,8 +56,8 @@ def highlight_yaml(text):
     return '\n'.join(out)
 
 
-def generate_html(configs, output_path, results_dir, metric_units, model_label=None, chart_defaults=None):
-    model_label = model_label or read_model_label(results_dir)
+def generate_html(configs, output_path, results_dir, metric_units, model_label=None, chart_defaults=None, plotly_tag=None):
+    model_label = model_label or 'Live llm-d'
     chart_defaults = chart_defaults or {
         'throughput': {'xMetric': 'output_token_throughput_per_user', 'yMetric': 'output_token_throughput', 'yNorm': 'decode'},
         'latency': {'xMetric': 'inter_token_latency', 'xStat': 'p99', 'yMetric': 'output_token_throughput', 'yNorm': 'decode'},
@@ -440,7 +158,7 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
     versions = set(meta['version'] for meta in configs.values() if meta['version'])
     version_str = ', '.join(sorted(versions)) if versions else 'unknown'
 
-    results_dir = os.path.abspath(results_dir)
+    # Dashboards arrive already base64-encoded by the caller (report.py).
     embedded_dashboards = {}
     for cfg in configs:
         for c_val in configs[cfg]['runs']:
@@ -448,11 +166,6 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
             saved_dashboard = configs[cfg].get('dashboards', {}).get(key)
             if saved_dashboard:
                 embedded_dashboards[f'{cfg}_{key}'] = saved_dashboard
-                continue
-            dash_path = os.path.join(results_dir, f'results_{cfg}', f'results_{cfg}_{key}', 'dashboard.html')
-            if os.path.isfile(dash_path):
-                with open(dash_path, 'rb') as df:
-                    embedded_dashboards[f'{cfg}_{key}'] = base64.b64encode(df.read()).decode('ascii')
 
     yaml_parts = []
     configs_with_yamls = {cfg: meta for cfg, meta in sorted(configs.items()) if meta.get('yamls')}
@@ -478,12 +191,16 @@ def generate_html(configs, output_path, results_dir, metric_units, model_label=N
         yaml_parts.append('</div>')
     yaml_sections_html = '\n'.join(yaml_parts)
 
+    # The caller (report.py) inlines the vendored bundle so the page works
+    # offline; standalone use falls back to the CDN.
+    plotly_tag = plotly_tag or '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>{model_label} — Interactivity vs Throughput — vLLM {version_str}</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+{plotly_tag}
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: #111217; color: #d8d9da; font-family: Inter, -apple-system, sans-serif; padding: 16px; }}
@@ -698,38 +415,6 @@ function attachClickHandler(plotEl) {{
     const conc = validConcs[pt.pointIndex];
     if (cfg && conc) openDashboard(cfg, conc);
   }});
-}}
-
-function makeSection(title, id) {{
-  const hdr = document.createElement('div');
-  hdr.className = 'row-header';
-  hdr.innerHTML = `<span class="arrow">&#9660;</span> ${{title}}`;
-  const wrap = document.createElement('div');
-  wrap.className = 'grid';
-  wrap.id = id;
-  hdr.addEventListener('click', () => {{
-    hdr.classList.toggle('collapsed');
-    wrap.classList.toggle('hidden');
-  }});
-  root.appendChild(hdr);
-  root.appendChild(wrap);
-  return wrap;
-}}
-
-function makePanel(parent, title, cls) {{
-  const panel = document.createElement('div');
-  panel.className = 'panel' + (cls ? ' ' + cls : '');
-  panel.style.height = '500px';
-  const t = document.createElement('div');
-  t.className = 'panel-title';
-  t.innerHTML = `<span>${{title}}</span><span class="panel-actions"><button data-action="shorter">−</button><button data-action="taller">+</button><button data-action="wide">↔</button></span>`;
-  const plot = document.createElement('div');
-  plot.className = 'plot';
-  panel.appendChild(t);
-  panel.appendChild(plot);
-  parent.appendChild(panel);
-  makePanelResizable(panel, plot);
-  return plot;
 }}
 
 function makePanelResizable(panel, plot) {{
@@ -1026,26 +711,6 @@ function createChart(container, defaults) {{
   }};
 
   // Controls
-  const ctrl = document.createElement('div');
-  ctrl.className = 'axis-controls';
-
-  function mkSelect(label, options, value, onChange) {{
-    const lbl = document.createElement('label');
-    lbl.textContent = label;
-    const sel = document.createElement('select');
-    options.forEach(o => {{
-      const opt = document.createElement('option');
-      opt.value = o.value;
-      opt.textContent = o.text;
-      sel.appendChild(opt);
-    }});
-    sel.value = value;
-    sel.addEventListener('change', () => onChange(sel.value));
-    lbl.appendChild(sel);
-    ctrl.appendChild(lbl);
-    return sel;
-  }}
-
   const axisMetricOpts = metricOptions(AXIS_METRICS);
 
   // X row
@@ -1409,34 +1074,3 @@ root.appendChild(sec2Wrap);
     with open(output_path, 'w') as f:
         f.write(html)
     return output_path
-
-
-def main():
-    if len(sys.argv) > 1:
-        results_dir = sys.argv[1]
-    else:
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
-
-    if not os.path.isdir(results_dir):
-        print(f"Error: {results_dir} not found", file=sys.stderr)
-        sys.exit(1)
-
-    configs, metric_units = discover_configs(results_dir)
-    if not configs:
-        print(f"Error: no results_<config>/ directories found in {results_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    output_dir = os.path.abspath(results_dir)
-    output_path = os.path.join(output_dir, 'interactivity_vs_throughput.html')
-
-    generate_html(configs, output_path, results_dir, metric_units)
-
-    print(f"Discovered {len(configs)} configs:")
-    for cfg, meta in sorted(configs.items()):
-        concs = sorted(meta['runs'].keys())
-        print(f"  {cfg}: {meta['label']} ({meta['decode_gpus']} decode GPUs) — c{',c'.join(str(c) for c in concs)}")
-    print(f"\nGenerated: {output_path}")
-
-
-if __name__ == '__main__':
-    main()

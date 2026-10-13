@@ -659,7 +659,6 @@ report outdir:
             echo "=== Prometheus TSDB snapshot disabled (PROMETHEUS_SNAPSHOT=false) ==="
         fi
     done
-    python3 gen_interactivity_chart.py "{{outdir}}" 2>/dev/null || true
 
 
 # Deploy the typed service against operator-provisioned Kueue objects.
@@ -791,8 +790,6 @@ _smoke-interactivity dest concurrency:
     printf '%s\n' "$DECODE_GPUS" > "$WORK/results_${CONFIG_NAME}/decode_gpus.txt"
     printf '%s\n' "$PREFILL_GPUS" > "$WORK/results_${CONFIG_NAME}/prefill_gpus.txt"
     printf '%s\n' "$PODS" > "$WORK/results_${CONFIG_NAME}/pods.txt"
-    python3 gen_interactivity_chart.py "$WORK"
-    mv "$WORK/interactivity_vs_throughput.html" "$DEST/interactivity_vs_throughput.html"
 
 start-model:
     #!/usr/bin/env bash
@@ -1059,7 +1056,6 @@ orchestrator-results outdir:
         kubectl cp "$NS/${POD}:${f}" "$LOCAL" 2>/dev/null || true
     done
     echo "Results copied to {{outdir}}/"
-    python3 gen_interactivity_chart.py "{{outdir}}" 2>/dev/null || true
 
 orchestrator-stop:
     #!/usr/bin/env bash

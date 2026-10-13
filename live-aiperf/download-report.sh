@@ -2,24 +2,13 @@
 set -euo pipefail
 
 # Download the self-contained report from the newest submitted AIPerf Job.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../live-lib.sh"
 # Do not inherit the repository's legacy NAMESPACE setting. The live workflow
 # targets the namespace currently carrying one valid deployed vLLM build.
-NAMESPACE="${LIVE_AIPERF_NAMESPACE:-}"
-if [[ -z "$NAMESPACE" ]]; then
-  DEPLOYMENT_NAMESPACES=()
-  while IFS=$'\t' read -r namespace commit; do
-    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] && DEPLOYMENT_NAMESPACES+=("$namespace")
-  done < <(kubectl get configmaps --all-namespaces -o go-template='{{range .items}}{{if eq .metadata.name "vllm-build-ref"}}{{.metadata.namespace}}{{"\t"}}{{index .data "VLLM_BUILD_COMMIT"}}{{"\n"}}{{end}}{{end}}')
-  if (( ${#DEPLOYMENT_NAMESPACES[@]} != 1 )); then
-    echo "Could not identify exactly one deployed vLLM namespace (found: ${DEPLOYMENT_NAMESPACES[*]:-none})" >&2
-    echo "Set LIVE_AIPERF_NAMESPACE only when choosing intentionally among multiple deployments." >&2
-    exit 1
-  fi
-  NAMESPACE="${DEPLOYMENT_NAMESPACES[0]}"
-fi
+NAMESPACE="$(discover_live_namespace LIVE_AIPERF_NAMESPACE)" || exit 1
 DESTINATION="${DESTINATION:-${HOME}/Downloads/aiperf-history.html}"
 RESULTS_PVC="${RESULTS_PVC:-kimi-k3-build-cache}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONITORING="${LIVE_AIPERF_MONITORING:-false}"
 case "$MONITORING" in true|false) ;; *) echo "LIVE_AIPERF_MONITORING must be true or false" >&2; exit 2 ;; esac
 decode_base64() { base64 --decode 2>/dev/null || base64 -D; }
@@ -221,6 +210,7 @@ REPORTER_FILES=(
   --from-file=gen_interactivity_chart.py="${SCRIPT_DIR}/../gen_interactivity_chart.py"
   --from-file=overlay_dashboards.py="${SCRIPT_DIR}/../overlay_dashboards.py"
   --from-file=export_dashboard.py="${SCRIPT_DIR}/../export_dashboard.py"
+  --from-file=dashboard_common.py="${SCRIPT_DIR}/../dashboard_common.py"
   --from-file=plotly-basic-2.35.2.min.js.gz="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
 )
 kubectl create configmap "$REPORTER_CONFIGMAP" -n "$NAMESPACE" "${REPORTER_FILES[@]}"

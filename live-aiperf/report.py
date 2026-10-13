@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import html
 import base64
-import gzip
 import importlib.util
 import json
 import re
@@ -31,6 +30,19 @@ def support_file(name: str) -> Path:
     """Find helpers next to the copied Job script or in the source checkout."""
     adjacent = Path(__file__).with_name(name)
     return adjacent if adjacent.is_file() else adjacent.parent.parent / name
+
+
+def _load_dashboard_common():
+    path = support_file("dashboard_common.py")
+    module_spec = importlib.util.spec_from_file_location("agentx_dashboard_common", path)
+    if module_spec is None or module_spec.loader is None:
+        raise SystemExit(f"Missing shared dashboard plumbing: {path}")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
+
+
+COMMON = _load_dashboard_common()
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -214,12 +226,7 @@ def write_run(directory: Path) -> None:
 
 def embedded_plotly() -> str:
     """Read the pinned local bundle, avoiding a network dependency in the HTML."""
-    bundle = Path(__file__).with_name("plotly-basic-2.35.2.min.js.gz")
-    try:
-        source = gzip.decompress(bundle.read_bytes()).decode("utf-8")
-    except (OSError, EOFError, UnicodeDecodeError) as exc:
-        raise SystemExit(f"Missing Plotly bundle: {bundle}") from exc
-    return source.replace("</script", "<\\/script")
+    return COMMON.read_plotly_bundle(support_file("plotly-basic-2.35.2.min.js.gz"))
 
 
 def snapshot_gpu_counts(snapshot: str) -> dict[str, float]:
@@ -540,7 +547,12 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
                 "avg": output_rate / concurrency, "unit": "tokens/s/user"}
         config["runs"][concurrency] = profile
         if data["dashboard"] is not None:
-            config.setdefault("dashboards", {})[f"c{concurrency}"] = base64.b64encode(data["dashboard"]).decode("ascii")
+            # Strip the per-run Plotly copy before embedding: the page loads
+            # the single bundled copy, and each dashboard iframe borrows it
+            # through the parent-Plotly shim.
+            stripped = COMMON.strip_plotly(data["dashboard"].decode("utf-8"))
+            config.setdefault("dashboards", {})[f"c{concurrency}"] = base64.b64encode(
+                stripped.encode("utf-8")).decode("ascii")
         for key, value in profile.items():
             metric_units.setdefault(key, str(value.get("unit", "")))
 
@@ -569,13 +581,9 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
         configs, str(output), str(root), metric_units,
         model_label=model_label or str(first_metadata.get("model_label", "Live llm-d")),
         chart_defaults=chart_defaults,
+        plotly_tag="<script>" + embedded_plotly() + "</script>",
     )
     page = output.read_text(encoding="utf-8")
-    page = page.replace(
-        '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>',
-        "<script>" + embedded_plotly() + "</script>",
-        1,
-    )
     source_rows = "".join(
         source_row(data)
         for data in sorted({sweep_key(data): data for data in runs}.values(), key=sweep_key)
@@ -584,14 +592,20 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
               if compact_header else '<div class="subtitle">' + source_rows + '</div>')
     overlay_control = ""
     if overlay_html:
-        encoded_overlay = base64.b64encode(overlay_html).decode("ascii")
+        # The embedded copy is stripped of its own Plotly bundle and borrows
+        # the page's copy through the parent shim; the copy saved next to the
+        # report (monitoring-overlay.html) stays self-contained.
+        stripped_overlay = COMMON.strip_plotly(overlay_html.decode("utf-8"))
+        encoded_overlay = base64.b64encode(stripped_overlay.encode("utf-8")).decode("ascii")
         overlay_control = (
             ('<button id="monitoring-overlay">Overlay monitoring across concurrencies</button>' if compact_header
              else '<p><button id="monitoring-overlay">Overlay monitoring across concurrencies</button></p>') +
             '<script>document.getElementById("monitoring-overlay").addEventListener("click",()=>{'
             f'const b=atob("{encoded_overlay}");const a=new Uint8Array(b.length);'
             'for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);'
-            'window.open(URL.createObjectURL(new Blob([a],{type:"text/html"})),"_blank");});</script>'
+            'sidePanelTitle.textContent="Overlay monitoring across concurrencies";'
+            'sidePanelFrame.src=URL.createObjectURL(new Blob([a],{type:"text/html"}));'
+            'sidePanel.classList.add("open");overlay.classList.add("open");});</script>'
         )
     if compact_header:
         title = html.escape(model_label or str(first_metadata.get("model_label", "Live llm-d")))

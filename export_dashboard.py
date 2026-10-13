@@ -2,7 +2,7 @@
 import argparse
 import base64
 import concurrent.futures
-import gzip
+import importlib.util
 import json
 import os
 import re
@@ -12,6 +12,20 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _load_common():
+    path = Path(__file__).with_name("dashboard_common.py")
+    spec = importlib.util.spec_from_file_location("agentx_dashboard_common", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Missing shared dashboard plumbing: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+COMMON = _load_common()
 
 _http_semaphore = threading.Semaphore(32)
 
@@ -444,6 +458,12 @@ def export(args):
     with open(out_path, "w") as f:
         f.write(html)
 
+    # Machine-readable copy of the panel data next to the page, so
+    # overlay_dashboards reads it instead of scraping the HTML.
+    sidecar = os.path.splitext(out_path)[0] + ".json"
+    with open(sidecar, "w") as f:
+        json.dump({"panels": panel_data, "rows": row_order}, f)
+
     print(f"\nExported to {out_path}")
 
 
@@ -454,10 +474,7 @@ def generate_html(panel_data, row_order, start, end, dashboard_name, plotly_bund
     panels_json = json.dumps(panel_data)
     rows_json = json.dumps(row_order)
 
-    plotly_tag = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
-    if plotly_bundle:
-        with gzip.open(plotly_bundle, "rt", encoding="utf-8") as f:
-            plotly_tag = "<script>" + f.read() + "</script>"
+    plotly_tag = COMMON.plotly_tag(plotly_bundle)
 
     return f"""<!DOCTYPE html>
 <html>
@@ -466,53 +483,15 @@ def generate_html(panel_data, row_order, start, end, dashboard_name, plotly_bund
 <title>{dashboard_name} — {start_str} to {end_str}</title>
 {plotly_tag}
 <style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #111217; color: #d8d9da; font-family: Inter, -apple-system, sans-serif; padding: 16px; }}
-  h1 {{ font-size: 20px; font-weight: 500; margin-bottom: 4px; }}
-  .subtitle {{ font-size: 13px; color: #8e8e8e; margin-bottom: 20px; }}
-  .row-header {{ font-size: 15px; font-weight: 500; color: #d8d9da; padding: 10px 0 6px 4px;
-                 border-bottom: 1px solid #2a2a2e; margin: 16px 0 8px 0; cursor: pointer; user-select: none; }}
-  .row-header:hover {{ color: #fff; }}
-  .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
-  .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
-  .grid {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
-  .panel {{ position: relative; isolation: isolate; z-index: 0; flex: 0 0 auto; width: calc(50% - 4px); max-width: 100%;
-            min-width: min(420px, 100%); min-height: 300px; height: 380px; background: #181b1f;
-            border: 1px solid #2a2a2e; border-radius: 4px; padding: 0; overflow: hidden; resize: both; }}
-  .panel.wide {{ width: 100% !important; }}
-  @media (max-width: 1000px) {{ .panel {{ width: 100%; }} }}
-  .panel-title {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 36px;
-                  font-size: 13px; font-weight: 500; padding: 5px 8px 5px 12px; color: #d8d9da; cursor: grab; user-select: none; }}
-  .panel-actions {{ display: flex; gap: 4px; flex: 0 0 auto; }}
-  .panel-actions button {{ border: 1px solid #3a3a3e; border-radius: 4px; background: #1e2127; color: #aaa; padding: 2px 7px; cursor: pointer; font-size: 11px; }}
-  .panel-actions button:hover {{ color: #fff; border-color: #666; }}
-  .panel.dragging {{ opacity: .45; }}
-  .panel .plot {{ position: relative; z-index: 0; width: 100%; height: calc(100% - 36px); min-width: 0; min-height: 260px; }}
-  .empty {{ color: #555; font-size: 12px; padding: 60px 12px; text-align: center; }}
-  .hidden {{ display: none; }}
-</style>
+{COMMON.BASE_CSS}</style>
 </head>
 <body>
 <h1>{dashboard_name}</h1>
 <div class="subtitle">{start_str} — {end_str}</div>
 <div id="root"></div>
 <script>
-if (!window.Plotly && window.parent && window.parent.Plotly) {{
-  window.Plotly = window.parent.Plotly;
-}}
-const panels = {panels_json};
+{COMMON.PARENT_PLOTLY_SHIM}const panels = {panels_json};
 const rows = {rows_json};
-
-const UNIT_FMT = {{
-  tps: v => v.toFixed(1) + ' tok/s',
-  percentunit: v => (v * 100).toFixed(1) + '%',
-  s: v => v < 0.001 ? (v*1e6).toFixed(0)+'µs' : v < 1 ? (v*1000).toFixed(1)+'ms' : v.toFixed(2)+'s',
-  bytes: v => v > 1e9 ? (v/1e9).toFixed(1)+'GB' : v > 1e6 ? (v/1e6).toFixed(1)+'MB' : v > 1e3 ? (v/1e3).toFixed(1)+'KB' : v+'B',
-  Bps: v => v > 1e9 ? (v/1e9).toFixed(1)+' GB/s' : v > 1e6 ? (v/1e6).toFixed(1)+' MB/s' : v > 1e3 ? (v/1e3).toFixed(1)+' KB/s' : v+' B/s',
-  watt: v => v.toFixed(0) + ' W',
-  percent: v => v.toFixed(1) + '%',
-  short: v => v > 1e6 ? (v/1e6).toFixed(1)+'M' : v > 1e3 ? (v/1e3).toFixed(1)+'K' : Number(v.toPrecision(4)).toString(),
-}};
 
 const UNIT_LABEL = {{
   tps: 'tokens/s',
@@ -541,26 +520,7 @@ function seriesLabel(q, s) {{
 }}
 
 const root = document.getElementById('root');
-let currentGrid = null;
-let draggedPanel = null;
-function makePanelInteractive(panel, plot) {{
-  const title = panel.querySelector('.panel-title');
-  title.draggable = true;
-  title.addEventListener('dragstart', () => {{ draggedPanel = panel; panel.classList.add('dragging'); }});
-  title.addEventListener('dragend', () => {{ draggedPanel = null; panel.classList.remove('dragging'); }});
-  panel.addEventListener('dragover', event => {{
-    event.preventDefault();
-    if (!draggedPanel || draggedPanel === panel || draggedPanel.parentElement !== panel.parentElement) return;
-    panel.parentElement.insertBefore(draggedPanel, event.clientY < panel.getBoundingClientRect().top + panel.offsetHeight / 2 ? panel : panel.nextSibling);
-  }});
-  title.addEventListener('dblclick', event => {{ if (!event.target.closest('button')) panel.classList.toggle('wide'); }});
-  panel.querySelector('[data-action="shorter"]').addEventListener('click', () => {{ panel.style.height = Math.max(300, panel.offsetHeight - 120) + 'px'; }});
-  panel.querySelector('[data-action="taller"]').addEventListener('click', () => {{ panel.style.height = Math.min(1200, panel.offsetHeight + 160) + 'px'; }});
-  panel.querySelector('[data-action="wide"]').addEventListener('click', () => {{ panel.classList.toggle('wide'); }});
-  panel.querySelector('[data-action="legend"]').addEventListener('click', () => {{ if (plot.layout) Plotly.relayout(plot, {{ showlegend: !plot.layout.showlegend }}); }});
-  new ResizeObserver(() => {{ if (window.Plotly && plot.data) Plotly.Plots.resize(plot); }}).observe(panel);
-}}
-
+{COMMON.PANEL_JS}
 const lazyObserver = new IntersectionObserver((entries) => {{
   entries.forEach(entry => {{
     if (entry.isIntersecting) {{
@@ -578,16 +538,11 @@ const lazyObserver = new IntersectionObserver((entries) => {{
         line: {{ width: 1.5, color: COLORS[i % COLORS.length] }},
         hovertemplate: '%{{y}}<extra>%{{fullData.name}}</extra>',
       }}));
-      const fmt = UNIT_FMT[p.unit];
       const yTitle = UNIT_LABEL[p.unit] || p.unit || '';
       const allY = traces.flatMap(trace => trace.y).filter(Number.isFinite);
       const largestY = allY.reduce((largest, value) => Math.max(largest, value), -Infinity);
       const smallestY = allY.reduce((smallest, value) => Math.min(smallest, value), Infinity);
-      const spanY = largestY - smallestY;
-      const magnitude = Math.max(Math.abs(largestY), Math.abs(smallestY));
-      const magnitudeDecimals = magnitude >= 100 ? 0 : magnitude >= 1 ? 2 : magnitude >= 0.01 ? 4 : 6;
-      const rangeDecimals = spanY > 0 ? Math.max(0, Math.ceil(-Math.log10(spanY / 6)) + 1) : magnitudeDecimals;
-      const decimals = Math.min(8, Math.max(magnitudeDecimals, rangeDecimals));
+      const decimals = yTickDecimals(largestY, smallestY);
       const yFormat = `,.${{decimals}}f`;
       const widestLabel = Math.max(
         largestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}}).length,
@@ -616,12 +571,10 @@ const lazyObserver = new IntersectionObserver((entries) => {{
   }});
 }}, {{ rootMargin: '200px' }});
 
-function renderPanel(container, p) {{
+function renderPanel(container, pid, p) {{
   const div = document.createElement('div');
   div.className = 'panel';
-  div.innerHTML = '<div class="panel-title"><span>' + p.title + '</span><span class="panel-actions">' +
-    '<button data-action="shorter" title="Shorter">−</button><button data-action="taller" title="Taller">+</button>' +
-    '<button data-action="wide" title="Toggle full width">↔</button><button data-action="legend" title="Toggle legend">Legend</button></span></div>';
+  div.innerHTML = panelHeaderHtml(p.title);
 
   const allSeries = p.queries.flatMap(q => q.series.map(s => ({{q, s}})));
   const hasData = allSeries.some(x => x.s.values.length > 0 && x.s.values.some(v => !isNaN(parseFloat(v[1]))));
@@ -641,35 +594,7 @@ function renderPanel(container, p) {{
   lazyObserver.observe(div);
 }}
 
-if (rows.length === 0) {{
-  currentGrid = document.createElement('div');
-  currentGrid.className = 'grid';
-  root.appendChild(currentGrid);
-  for (const p of Object.values(panels)) renderPanel(currentGrid, p);
-}} else {{
-  for (const item of rows) {{
-    if (item.type === 'row') {{
-      const h = document.createElement('div');
-      h.className = 'row-header';
-      h.innerHTML = '<span class="arrow">▾</span> ' + item.title;
-      currentGrid = document.createElement('div');
-      currentGrid.className = 'grid';
-      h.addEventListener('click', () => {{
-        h.classList.toggle('collapsed');
-        currentGrid.classList.toggle('hidden');
-      }});
-      root.appendChild(h);
-      root.appendChild(currentGrid);
-    }} else if (item.type === 'panel' && panels[item.id]) {{
-      if (!currentGrid) {{
-        currentGrid = document.createElement('div');
-        currentGrid.className = 'grid';
-        root.appendChild(currentGrid);
-      }}
-      renderPanel(currentGrid, panels[item.id]);
-    }}
-  }}
-}}
+scaffoldRows(rows, panels, renderPanel);
 </script>
 </body>
 </html>"""

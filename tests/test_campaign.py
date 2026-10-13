@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -21,6 +21,61 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "campaign" / "run.py"
 spec = importlib.util.spec_from_file_location("campaign_runner", MODULE_PATH)
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+
+MARKER_MANIFEST = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+LWS_MANIFEST = yaml.safe_dump({
+    "apiVersion": "leaderworkerset.x-k8s.io/v1", "kind": "LeaderWorkerSet",
+    "metadata": {"name": "serving", "namespace": "vllm"},
+    "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": {"containers": [
+        {"name": "vllm", "image": "old/image:tag"}]}}}},
+})
+ROUTER_MANIFEST = ("apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: wide-ep-epp\n"
+                   "---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: wide-ep-epp\n"
+                   "  namespace: vllm\nspec:\n  replicas: 1\n")
+
+
+def local_campaign(root: Path, config: dict, summary: dict, *, saved: bool = True) -> Path:
+    """Create the campaign tree under an output root with a config and summary."""
+    campaign = root / "campaigns" / config["id"]
+    campaign.mkdir(parents=True)
+    if saved:
+        (campaign / "campaign.json").write_text(json.dumps(config))
+    (campaign / "summary.json").write_text(json.dumps(summary))
+    return campaign
+
+
+def capturing_kube(created, *, namespace=None):
+    """kubectl double that records created objects and succeeds at everything."""
+    def fake_kube(actual_namespace, *args, **kwargs):
+        if namespace is not None:
+            assert actual_namespace == namespace
+        if args[0] == "create":
+            created.append(json.loads(kwargs["input_text"]))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+    return fake_kube
+
+
+@contextmanager
+def run_harness(root, *, call, kube, submit, extra=()):
+    """Patch the runner's cluster interactions for one full run() call."""
+    patches = [
+        patch.object(runner, "fetch_source", return_value=(root, "a" * 40)),
+        patch.object(runner.shutil, "rmtree"),
+        patch.object(runner, "call", side_effect=call),
+        patch.object(runner, "kube", side_effect=kube),
+        patch.object(runner, "snapshot", return_value=[]),
+        patch.object(runner, "wait_ready", return_value=["pod:uid"]),
+        patch.object(runner, "build_commit", return_value="a" * 40),
+        patch.object(runner, "submit_benchmark", side_effect=submit),
+        patch.object(runner, "write_final_report",
+                     side_effect=lambda destination, summary: runner.write_summary(destination, summary)),
+        patch.object(runner, "wait_gone"),
+        *extra,
+    ]
+    with ExitStack() as stack:
+        for item in patches:
+            stack.enter_context(item)
+        yield
 
 
 class CampaignTests(unittest.TestCase):
@@ -49,12 +104,9 @@ class CampaignTests(unittest.TestCase):
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
             output = root / "output"
-            campaign = output / "campaigns" / config["id"]
-            campaign.mkdir(parents=True)
-            (campaign / "campaign.json").write_text(json.dumps(config))
-            runner.write_summary(campaign, {"id": config["id"], "status": "running",
-                                            "overlays": [{"name": "baseline", "status": "running",
-                                                          "benchmarks": []}]})
+            campaign = local_campaign(output, config, {"id": config["id"], "status": "running",
+                                                       "overlays": [{"name": "baseline", "status": "running",
+                                                                     "benchmarks": []}]})
             process = (f"1234 python3 {MODULE_PATH} run-local {config_path} --output {output}\n"
                        f"5678 python3 {MODULE_PATH} run-local {config_path} --output /tmp/other\n")
             with patch.object(runner, "call", return_value=SimpleNamespace(stdout=process)):
@@ -75,10 +127,8 @@ class CampaignTests(unittest.TestCase):
             config = self.config(root)
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
-            campaign = root / "output/campaigns" / config["id"]
-            campaign.mkdir(parents=True)
-            (campaign / "campaign.json").write_text(json.dumps(config))
-            runner.write_summary(campaign, {"id": config["id"], "status": "running", "overlays": []})
+            campaign = local_campaign(root / "output", config,
+                                      {"id": config["id"], "status": "running", "overlays": []})
             actions = []
             with patch.object(runner, "local_runner_pids", return_value=[]), \
                  patch.object(runner.os, "kill", side_effect=AssertionError("must not signal another process")), \
@@ -117,9 +167,7 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
-            campaign = root / "campaigns" / config["id"]
-            campaign.mkdir(parents=True)
-            (campaign / "summary.json").write_text(json.dumps({"status": "cancelled"}))
+            local_campaign(root, config, {"status": "cancelled"}, saved=False)
             self.assertEqual(runner.watch_preview_local(config, root), 1)
 
     def test_kubectl_logs_replace_invalid_utf8(self):
@@ -159,12 +207,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(loaded["monitoring"], config["monitoring"])
             created = []
 
-            def fake_kube(namespace, *args, **kwargs):
-                if args[0] == "create":
-                    created.append(json.loads(kwargs["input_text"]))
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-            with patch.object(runner, "kube", side_effect=fake_kube):
+            with patch.object(runner, "kube", side_effect=capturing_kube(created)):
                 runner.submit(loaded, "runner:test", "benchmark-campaign")
             self.assertNotIn("monitoring", json.loads(created[0]["data"]["campaign.json"]))
             self.assertNotIn("env", created[1]["spec"]["template"]["spec"]["containers"][0])
@@ -204,7 +247,7 @@ class CampaignTests(unittest.TestCase):
             root = Path(directory)
             config = self.config(root)
             actions = []
-            manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+            manifest = MARKER_MANIFEST
 
             def fake_call(args, **kwargs):
                 self.assertEqual(args[:2], ["kubectl", "kustomize"])
@@ -224,17 +267,9 @@ class CampaignTests(unittest.TestCase):
                 return {"tool": "aiperf", "status": "completed", "job": "job-" + overlay["name"],
                         "artifacts": "/workload/aiperf-agentx/example", "measurements": []}
 
-            with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
-                 patch.object(runner.shutil, "rmtree"), \
-                 patch.object(runner, "call", side_effect=fake_call), \
-                 patch.object(runner, "apply_vllm_image", side_effect=lambda rendered, image: rendered), \
-                 patch.object(runner, "kube", side_effect=fake_kube), \
-                 patch.object(runner, "snapshot", return_value=[]), \
-                 patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
-                 patch.object(runner, "build_commit", return_value="a" * 40), \
-                 patch.object(runner, "submit_benchmark", side_effect=fake_submit), \
-                 patch.object(runner, "write_final_report", side_effect=lambda destination, summary: runner.write_summary(destination, summary)), \
-                 patch.object(runner, "wait_gone"):
+            with run_harness(root, call=fake_call, kube=fake_kube, submit=fake_submit,
+                             extra=(patch.object(runner, "apply_vllm_image",
+                                                 side_effect=lambda rendered, image: rendered),)):
                 self.assertEqual(runner.run(config, root), 0, (root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(actions, ["render:baseline", "check", "apply", "get", "benchmark:baseline", "delete",
                                        "render:candidate", "check", "apply", "get", "benchmark:candidate", "delete"])
@@ -263,7 +298,7 @@ class CampaignTests(unittest.TestCase):
             path.write_text(json.dumps(config))
             runner.load_config(path)
             events = []
-            manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+            manifest = MARKER_MANIFEST
 
             def fake_resolve(build, pins=None):
                 name = build["steps"][-1]["ref"]
@@ -387,7 +422,7 @@ class CampaignTests(unittest.TestCase):
                                      {"name": "v0-11-0", "image": "vllm/example:v0.11.0"}]
             actions = []
             applied = []
-            manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+            manifest = MARKER_MANIFEST
 
             def fake_call(args, **kwargs):
                 self.assertEqual(args[:2], ["kubectl", "kustomize"])
@@ -406,18 +441,11 @@ class CampaignTests(unittest.TestCase):
                 return {"tool": "aiperf", "status": "completed", "job": "job-" + overlay["name"],
                         "artifacts": "/workload/aiperf-agentx/example", "measurements": []}
 
-            with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
-                 patch.object(runner.shutil, "rmtree"), \
-                 patch.object(runner, "call", side_effect=fake_call), \
-                 patch.object(runner, "apply_vllm_image", side_effect=lambda rendered, image: (applied.append(image), rendered)[1]), \
-                 patch.object(runner, "vllm_prebuild", side_effect=AssertionError("image sweeps must not compile vLLM")), \
-                 patch.object(runner, "kube", side_effect=fake_kube), \
-                 patch.object(runner, "snapshot", return_value=[]), \
-                 patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
-                 patch.object(runner, "build_commit", return_value="a" * 40), \
-                 patch.object(runner, "submit_benchmark", side_effect=fake_submit), \
-                 patch.object(runner, "write_final_report", side_effect=lambda destination, summary: runner.write_summary(destination, summary)), \
-                 patch.object(runner, "wait_gone"):
+            with run_harness(root, call=fake_call, kube=fake_kube, submit=fake_submit,
+                             extra=(patch.object(runner, "apply_vllm_image",
+                                                 side_effect=lambda rendered, image: (applied.append(image), rendered)[1]),
+                                    patch.object(runner, "vllm_prebuild",
+                                                 side_effect=AssertionError("image sweeps must not compile vLLM")))):
                 self.assertEqual(runner.run(config, root), 0)
             self.assertEqual(applied, ["vllm/example:nightly", "vllm/example:nightly",
                                        "vllm/example:v0.11.0", "vllm/example:v0.11.0"])
@@ -449,12 +477,7 @@ class CampaignTests(unittest.TestCase):
             del config["vllm_image"]
             config["vllm_images"] = [{"name": "nightly", "image": "vllm/example:nightly"},
                                      {"name": "v0-11-0", "image": "vllm/example:v0.11.0"}]
-            manifest = yaml.safe_dump({
-                "apiVersion": "leaderworkerset.x-k8s.io/v1", "kind": "LeaderWorkerSet",
-                "metadata": {"name": "serving", "namespace": "vllm"},
-                "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": {"containers": [
-                    {"name": "vllm", "image": "old/image:tag"}]}}}},
-            })
+            manifest = LWS_MANIFEST
             output = root / "local-test"
             with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
                  patch.object(runner, "render_overlay", return_value=manifest), \
@@ -485,7 +508,7 @@ class CampaignTests(unittest.TestCase):
             root = Path(directory)
             config = self.config(root)
             config["builds"] = [{"name": "nightly"}]
-            manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+            manifest = MARKER_MANIFEST
             destination = root / "results"
             destination.mkdir()
             summary = {"id": config["id"], "status": "running", "overlays": []}
@@ -504,12 +527,7 @@ class CampaignTests(unittest.TestCase):
             root = Path(directory)
             config = self.config(root)
             config["builds"] = [{"name": "nightly", "steps": []}]
-            manifest = yaml.safe_dump({
-                "apiVersion": "leaderworkerset.x-k8s.io/v1", "kind": "LeaderWorkerSet",
-                "metadata": {"name": "serving", "namespace": "vllm"},
-                "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": {"containers": [
-                    {"name": "vllm", "image": "old/image:tag"}]}}}},
-            })
+            manifest = LWS_MANIFEST
             output = root / "local-test"
             with patch.object(runner, "call", return_value=SimpleNamespace(stdout="a" * 40 + "\n")), \
                  patch.object(runner, "render_overlay", return_value=manifest), \
@@ -605,15 +623,8 @@ class CampaignTests(unittest.TestCase):
             config = self.config(root)
             config["router"] = {"values": ["router/values.yaml"]}
             actions = []
-            router_manifest = ("apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: wide-ep-epp\n"
-                               "---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: wide-ep-epp\n"
-                               "  namespace: vllm\nspec:\n  replicas: 1\n")
-            overlay_manifest = yaml.safe_dump({
-                "apiVersion": "leaderworkerset.x-k8s.io/v1", "kind": "LeaderWorkerSet",
-                "metadata": {"name": "serving", "namespace": "vllm"},
-                "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": {"containers": [
-                    {"name": "vllm", "image": "old/image:tag"}]}}}},
-            })
+            router_manifest = ROUTER_MANIFEST
+            overlay_manifest = LWS_MANIFEST
 
             def fake_call(args, **kwargs):
                 if args[0] == "helm":
@@ -636,16 +647,7 @@ class CampaignTests(unittest.TestCase):
                 return {"tool": "aiperf", "status": "completed", "job": "job-" + overlay["name"],
                         "artifacts": "/workload/aiperf-agentx/example", "measurements": []}
 
-            with patch.object(runner, "fetch_source", return_value=(root, "a" * 40)), \
-                 patch.object(runner.shutil, "rmtree"), \
-                 patch.object(runner, "call", side_effect=fake_call), \
-                 patch.object(runner, "kube", side_effect=fake_kube), \
-                 patch.object(runner, "snapshot", return_value=[]), \
-                 patch.object(runner, "wait_ready", return_value=["pod:uid"]), \
-                 patch.object(runner, "build_commit", return_value="a" * 40), \
-                 patch.object(runner, "submit_benchmark", side_effect=fake_submit), \
-                 patch.object(runner, "write_final_report", side_effect=lambda destination, summary: runner.write_summary(destination, summary)), \
-                 patch.object(runner, "wait_gone"):
+            with run_harness(root, call=fake_call, kube=fake_kube, submit=fake_submit):
                 self.assertEqual(runner.run(config, root), 0)
             self.assertEqual(actions, ["render:router",
                                        "render:baseline", "apply", "wait:wide-ep-epp", "benchmark:baseline", "delete",
@@ -661,15 +663,8 @@ class CampaignTests(unittest.TestCase):
             root = Path(directory)
             config = self.config(root)
             config["router"] = {"values": ["router/values.yaml"]}
-            router_manifest = ("apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: wide-ep-epp\n"
-                               "---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: wide-ep-epp\n"
-                               "  namespace: vllm\nspec:\n  replicas: 1\n")
-            overlay_manifest = yaml.safe_dump({
-                "apiVersion": "leaderworkerset.x-k8s.io/v1", "kind": "LeaderWorkerSet",
-                "metadata": {"name": "serving", "namespace": "vllm"},
-                "spec": {"leaderWorkerTemplate": {"workerTemplate": {"spec": {"containers": [
-                    {"name": "vllm", "image": "old/image:tag"}]}}}},
-            })
+            router_manifest = ROUTER_MANIFEST
+            overlay_manifest = LWS_MANIFEST
 
             def fake_call(args, **kwargs):
                 if args[0] == "helm":
@@ -739,10 +734,8 @@ class CampaignTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stderr="", stdout="")
 
             def fake_run(value, results_root, artifact_fetcher=None):
-                campaign = results_root / "campaigns" / config["id"]
-                campaign.mkdir(parents=True)
-                runner.write_summary(campaign, {"id": config["id"], "status": "running",
-                                                "overlays": []})
+                local_campaign(results_root, config, {"id": config["id"], "status": "running",
+                                                      "overlays": []}, saved=False)
                 raise KeyboardInterrupt
 
             with patch.object(runner, "kube", side_effect=fake_kube), \
@@ -1002,24 +995,6 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("TPOT p50 (ms)", page)
             self.assertIn("E2E p90 (ms)", page)
             self.assertIn("Time per output token (TPOT)", page)
-            self.assertIn('aria-label="Chart width in pixels"', page)
-            self.assertIn("Drag to resize chart width", page)
-            # Chart columns must drag in every browser (Safari requires
-            # dataTransfer.setData) and remember their arrangement.
-            self.assertIn('Drag chart to rearrange', page)
-            self.assertIn('dataTransfer.setData', page)
-            self.assertIn("chartCol1.dataset.chartColumnId = 'throughput'", page)
-            self.assertIn('restoreChartLayout();', page)
-            # Drops place charts arbitrarily: lower half stacks, beside sits
-            # side by side, and the row itself accepts end-of-row drops.
-            self.assertIn("'100%' : ''", page)
-            self.assertIn('makeChartRowDroppable(chartRow);', page)
-            # Width changes route through split-pane resizing so a chart can
-            # grow against a side-by-side neighbor without wrapping it.
-            self.assertIn('function setChartColumnWidth', page)
-            self.assertIn('setChartColumnWidth(container, startWidth + event.clientX - startX)', page)
-            self.assertIn('setChartColumnWidth(chartColumn, Number(widthInput.value))', page)
-            self.assertIn('sameLineSiblingAfter', page)
             configs = json.loads(re.search(r'const CONFIGS = (\{.*?\});', page).group(1))
             config = next(iter(configs.values()))
             self.assertEqual((config["prefillGPUs"], config["decodeGPUs"], config["totalGPUs"]),
@@ -1182,10 +1157,7 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
-            campaign = root / "campaigns" / config["id"]
-            campaign.mkdir(parents=True)
-            (campaign / "campaign.json").write_text(json.dumps(config))
-            (campaign / "summary.json").write_text(json.dumps({"status": "running"}))
+            campaign = local_campaign(root, config, {"status": "running"})
             run_id = f"{config['id']}-baseline-aiperf"
             remote = Path(f"/workload/aiperf-agentx/{run_id}/c1")
             source = root / "completed-sample"
@@ -1241,10 +1213,7 @@ class CampaignTests(unittest.TestCase):
             config["benchmarks"].append({"tool": "nyann", "concurrencies": [1, 4],
                                           "duration_seconds": 600, "isl": 1024, "osl": 512,
                                           "warmup_seconds": 60})
-            campaign = root / "campaigns" / config["id"]
-            campaign.mkdir(parents=True)
-            (campaign / "campaign.json").write_text(json.dumps(config))
-            (campaign / "summary.json").write_text(json.dumps({"status": "running"}))
+            campaign = local_campaign(root, config, {"status": "running"})
             remote = f"/workload/aiperf-agentx/{config['id']}-baseline-aiperf/c1"
 
             def fake_kube(namespace, *args, **kwargs):
@@ -1861,13 +1830,7 @@ class CampaignTests(unittest.TestCase):
             config = self.config(Path(directory))
             created = []
 
-            def fake_kube(namespace, *args, **kwargs):
-                self.assertEqual(namespace, "vllm")
-                if args[0] == "create":
-                    created.append(json.loads(kwargs["input_text"]))
-                return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-            with patch.object(runner, "kube", side_effect=fake_kube):
+            with patch.object(runner, "kube", side_effect=capturing_kube(created, namespace="vllm")):
                 runner.submit(config, "registry.example/campaign:sha", "benchmark-campaign")
             self.assertEqual([item["kind"] for item in created], ["ConfigMap", "Job"])
             job = created[1]
@@ -1887,7 +1850,7 @@ class CampaignTests(unittest.TestCase):
             config["monitoring"] = {"grafana_url": "http://llmd-grafana.vllm.svc.cluster.local",
                                     "auth_secret": "llmd-grafana", "dashboard_uid": "wideep-overview"}
             created.clear()
-            with patch.object(runner, "kube", side_effect=fake_kube):
+            with patch.object(runner, "kube", side_effect=capturing_kube(created, namespace="vllm")):
                 runner.submit(config, "registry.example/campaign:sha", "benchmark-campaign")
             environment = created[1]["spec"]["template"]["spec"]["containers"][0]["env"]
             self.assertEqual(environment[0]["valueFrom"]["secretKeyRef"],
@@ -1901,12 +1864,7 @@ class CampaignTests(unittest.TestCase):
                                     "auth_secret": "llmd-grafana", "dashboard_uid": "wideep-overview"}
             created = []
 
-            def fake_kube(namespace, *args, **kwargs):
-                if args[0] == "create":
-                    created.append(json.loads(kwargs["input_text"]))
-                return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-            with patch.object(runner, "kube", side_effect=fake_kube):
+            with patch.object(runner, "kube", side_effect=capturing_kube(created)):
                 runner.submit(config, "registry.example/campaign:sha", "benchmark-campaign")
             pod = created[1]["spec"]["template"]["spec"]
             self.assertEqual([container["name"] for container in pod["initContainers"]],
@@ -1930,7 +1888,7 @@ class CampaignTests(unittest.TestCase):
             config = self.config(root)
             config["continue_on_failure"] = True
             actions = []
-            manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: marker\n  namespace: vllm\n"
+            manifest = MARKER_MANIFEST
 
             def fake_kube(namespace, *args, **kwargs):
                 actions.append(args[0])

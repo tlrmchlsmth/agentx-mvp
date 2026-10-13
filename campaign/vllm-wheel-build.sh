@@ -3,9 +3,9 @@
 # Source in the pinned vLLM runtime image; both paths use the same script and
 # shared RWX cache. The build ref and full commit come from the overlay.
 set -Eeuo pipefail
-set -x
 
 BUILD_REPO=${VLLM_BUILD_REPO:-https://github.com/elvircrn/vllm.git}
+source "$(dirname "${BASH_SOURCE[0]}")/build-lib.sh"
 
 # Run this file directly on the laptop to turn the ordered, moving branch set
 # into one durable benchmark integration branch. The `checkout` action below
@@ -14,8 +14,6 @@ BUILD_REPO=${VLLM_BUILD_REPO:-https://github.com/elvircrn/vllm.git}
 # experiment cannot overwrite this benchmark's source history.
 publish_build_ref() {
   local ref_file target_branch work_dir merged_head remote_head fetch_depth
-  local i action branch
-  local -a source_branches source_actions
 
   if [ "$#" -ne 0 ]; then
     echo "Usage: $0"
@@ -26,18 +24,13 @@ publish_build_ref() {
   # ordered lists; `checkout` establishes the local merge base and the pushed
   # benchmark branch is always the final consolidated HEAD.
   # PR #58372: populate completion_tokens_details.reasoning_tokens for Kimi K3.
-  read -r -a source_actions <<< "${VLLM_BUILD_ACTIONS:-checkout cherry-pick-m2 cherry-pick cherry-pick-m2 cherry-pick-m2 cherry-pick cherry-pick cherry-pick cherry-pick}"
-  read -r -a source_branches <<< "${VLLM_BUILD_REFS:-deepep-triton-epilogue fused-globalize-align-cuda kimi-k3-shard-sp-deepep-v2 humming-0.1.13-no-tuning-hacks fix/flashinfer-h200-backend vllm-profiling-qol dcp_fusion_triton nccl_cg codex/kimi-k3-reasoning-token-count}"
-  if [ "${#source_branches[@]}" -eq 0 ] || [ "${#source_actions[@]}" -ne "${#source_branches[@]}" ] || \
-     [ "${source_actions[0]}" != "checkout" ]; then
-    echo "FATAL: BUILD_BRANCHES and BUILD_BRANCH_ACTIONS must have matching lengths and begin with checkout."
-    return 1
-  fi
+  read -r -a RECIPE_ACTIONS <<< "${VLLM_BUILD_ACTIONS:-checkout cherry-pick-m2 cherry-pick cherry-pick-m2 cherry-pick-m2 cherry-pick cherry-pick cherry-pick cherry-pick}"
+  read -r -a RECIPE_BRANCHES <<< "${VLLM_BUILD_REFS:-deepep-triton-epilogue fused-globalize-align-cuda kimi-k3-shard-sp-deepep-v2 humming-0.1.13-no-tuning-hacks fix/flashinfer-h200-backend vllm-profiling-qol dcp_fusion_triton nccl_cg codex/kimi-k3-reasoning-token-count}"
+  RECIPE_SHAS=()
+  validate_recipe_inputs || return 1
+  recipe_fetch_branch_refs
   fetch_depth=${VLLM_BUILD_FETCH_DEPTH:-256}
-  if ! [[ "$fetch_depth" =~ ^[1-9][0-9]*$ ]]; then
-    echo "FATAL: VLLM_BUILD_FETCH_DEPTH must be a positive integer."
-    return 1
-  fi
+  validate_fetch_depth "$fetch_depth" || return 1
 
   target_branch="benchmark/kimi-k3-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   if git ls-remote --exit-code --heads "$BUILD_REPO" "refs/heads/${target_branch}" >/dev/null 2>&1; then
@@ -46,61 +39,24 @@ publish_build_ref() {
   fi
 
   work_dir=$(mktemp -d "${TMPDIR:-/tmp}/kimi-k3-consolidate.XXXXXX") || return 1
+  # A RETURN trap set inside a function also fires on the caller's return
+  # unless cleared, and `work_dir` is gone by then; clear it as it fires.
   trap 'rm -rf -- "$work_dir"; trap - RETURN' RETURN
   # This temporary repository only creates and pushes an integration commit.
   # Keep it sparse (root files only), shallow, and blob-filtered; it never
   # compiles vLLM. The pod build intentionally uses a full checkout instead.
   git clone -q --no-checkout --sparse --filter=blob:none --depth="$fetch_depth" \
     "$BUILD_REPO" "$work_dir/vllm" || return 1
-  git -C "$work_dir/vllm" remote add elvircrn "$BUILD_REPO" || return 1
 
-  # Resolve and fetch all inputs before merging. Remote-tracking refs preserve
-  # exactly the branch/action order requested by the experimenter.
-  for i in "${!source_branches[@]}"; do
-    branch=${source_branches[$i]}
-    git -C "$work_dir/vllm" fetch -q --no-tags --filter=blob:none --depth="$fetch_depth" elvircrn \
-      "refs/heads/${branch}:refs/remotes/benchmark-input/${i}" || {
-      echo "FATAL: could not fetch elvircrn/${branch}."
-      return 1
-    }
-  done
-  git -C "$work_dir/vllm" checkout -q --detach refs/remotes/benchmark-input/0 || return 1
-
-  for ((i = 1; i < ${#source_branches[@]}; i++)); do
-    action=${source_actions[$i]}
-    branch=${source_branches[$i]}
-    case "$action" in
-      merge)
-        git -C "$work_dir/vllm" -c user.name=benchmark-publisher \
-          -c user.email=benchmark-publisher@localhost merge --no-edit "refs/remotes/benchmark-input/${i}" || return 1
-        ;;
-      cherry-pick|cherry-pick-m*)
-        if [ "$action" = "cherry-pick" ]; then
-          git -C "$work_dir/vllm" cherry-pick "refs/remotes/benchmark-input/${i}" || return 1
-        else
-          if ! [[ "${action#cherry-pick-m}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "FATAL: invalid mainline action ${action}."
-            return 1
-          fi
-          git -C "$work_dir/vllm" cherry-pick -m "${action#cherry-pick-m}" "refs/remotes/benchmark-input/${i}" || return 1
-        fi
-        ;;
-      cherry-pick-parent1)
-        # A feature branch may be refreshed by merging main into it. Its first
-        # parent remains the feature tip; cherry-pick that commit, not the
-        # merge delta, which would replay unrelated upstream changes.
-        git -C "$work_dir/vllm" cherry-pick "refs/remotes/benchmark-input/${i}^1" || return 1
-        ;;
-      *)
-        echo "FATAL: unsupported action ${action} for ${branch}."
-        return 1
-        ;;
-    esac
-  done
+  # Resolve and fetch all inputs before merging. The refs/build-inputs
+  # namespace preserves exactly the branch/action order requested by the
+  # experimenter.
+  fetch_build_inputs "$work_dir/vllm" origin "$fetch_depth" --filter=blob:none || return 1
+  apply_build_recipe "$work_dir/vllm" benchmark-publisher benchmark-publisher@localhost || return 1
 
   merged_head=$(git -C "$work_dir/vllm" rev-parse HEAD) || return 1
-  git -C "$work_dir/vllm" push elvircrn "${merged_head}:refs/heads/${target_branch}" || return 1
-  remote_head=$(git -C "$work_dir/vllm" ls-remote elvircrn "refs/heads/${target_branch}" | awk '{print $1}')
+  git -C "$work_dir/vllm" push origin "${merged_head}:refs/heads/${target_branch}" || return 1
+  remote_head=$(git -C "$work_dir/vllm" ls-remote origin "refs/heads/${target_branch}" | awk '{print $1}')
   if [ "$remote_head" != "$merged_head" ]; then
     echo "FATAL: remote verification failed for ${target_branch}."
     return 1
@@ -145,13 +101,8 @@ case "$VLLM_BUILD_MODE" in
       0) echo "Using vLLM from the runtime image."; return 0 ;;
       1)
         BASE_RUNTIME_IMAGE_ID=${VLLM_BUILD_BASE_IMAGE_ID:-unspecified}
-        BASE_RUNTIME_TORCH_VERSION=$(cd / && python3 -c 'import torch; print(torch.__version__)')
-        BASE_RUNTIME_CUDA_VERSION=$(cd / && python3 -c 'import torch; print(torch.version.cuda or "none")')
-        BASE_RUNTIME_PYTHON_ABI=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("SOABI") or "unknown")')
-        BUILD_LEADER=0
-        if [ "${VLLM_BUILD_ROLE:-}" = "prefill" ] && [ "${LWS_WORKER_INDEX:-}" = "0" ]; then
-          BUILD_LEADER=1
-        fi
+        detect_base_runtime_abi
+        elect_build_leader
         source "$(dirname "${BASH_SOURCE[0]}")/deepep-wheel-build.sh"
         return 0 ;;
       *) echo "FATAL: DEEPEP_BUILD_ENABLED must be 0 or 1."; exit 1 ;;
@@ -166,12 +117,22 @@ if ! [[ "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "FATAL: VLLM_BUILD_COMMIT must be a full 40-character Git SHA."
   exit 1
 fi
-BUILD_BRANCHES=${VLLM_BUILD_REFS:-$BUILD_BRANCH}
-BUILD_BRANCH_ACTIONS=${VLLM_BUILD_ACTIONS:-checkout}
-BUILD_SHA_VALUES=${VLLM_BUILD_SHAS:-$BUILD_SHA}
-
-
+read -r -a RECIPE_BRANCHES <<< "${VLLM_BUILD_REFS:-$BUILD_BRANCH}"
+read -r -a RECIPE_ACTIONS <<< "${VLLM_BUILD_ACTIONS:-checkout}"
+read -r -a RECIPE_SHAS <<< "${VLLM_BUILD_SHAS:-$BUILD_SHA}"
+validate_recipe_inputs
+if [ "${RECIPE_SHAS[0]}" != "$BUILD_SHA" ] || [ "${RECIPE_BRANCHES[0]}" != "$BUILD_BRANCH" ]; then
+  echo "FATAL: first build input differs from VLLM_BUILD_REF/COMMIT."
+  exit 1
+fi
 BUILD_FETCH_DEPTH=${VLLM_BUILD_FETCH_DEPTH:-256}
+validate_fetch_depth "$BUILD_FETCH_DEPTH"
+recipe_fetch_branch_refs
+BUILD_DESC=""
+for i in "${!RECIPE_BRANCHES[@]}"; do
+  BUILD_DESC+=" ${RECIPE_ACTIONS[$i]}:${RECIPE_BRANCHES[$i]}@${RECIPE_SHAS[$i]:0:12}"
+done
+echo "Using pinned build inputs:${BUILD_DESC}"
 
 # The base vLLM image already provides a mutually compatible torch, torchvision,
 # Triton, and CUDA stack. Re-resolving Humming's dependencies here can replace
@@ -203,69 +164,11 @@ command -v ibstat >/dev/null 2>&1 || {
   exit 1
 }
 
-read -r -a BUILD_BRANCH_ARRAY <<< "$BUILD_BRANCHES"
-if [ "${#BUILD_BRANCH_ARRAY[@]}" -eq 0 ]; then
-  echo "FATAL: BUILD_BRANCHES is empty."
-  exit 1
-fi
-read -r -a BUILD_BRANCH_ACTION_ARRAY <<< "$BUILD_BRANCH_ACTIONS"
-if [ "${#BUILD_BRANCH_ACTION_ARRAY[@]}" -ne "${#BUILD_BRANCH_ARRAY[@]}" ]; then
-  echo "FATAL: BUILD_BRANCH_ACTIONS must match BUILD_BRANCHES length."
-  exit 1
-fi
-if [ "${BUILD_BRANCH_ACTION_ARRAY[0]}" != "checkout" ]; then
-  echo "FATAL: the first BUILD_BRANCH_ACTIONS entry must be checkout."
-  exit 1
-fi
-read -r -a BUILD_SHA_ARRAY <<< "$BUILD_SHA_VALUES"
-if [ "${#BUILD_SHA_ARRAY[@]}" -ne "${#BUILD_BRANCH_ARRAY[@]}" ]; then
-  echo "FATAL: VLLM_BUILD_SHAS must match VLLM_BUILD_REFS length."
-  exit 1
-fi
-for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
-  if ! [[ "${BUILD_SHA_ARRAY[$i]}" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "FATAL: build input $i has no full Git SHA."
-    exit 1
-  fi
-  if ! [[ "${BUILD_BRANCH_ARRAY[$i]}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]]; then
-    echo "FATAL: build input $i has an invalid branch name."
-    exit 1
-  fi
-  if [ "$i" -gt 0 ] && ! [[ "${BUILD_BRANCH_ACTION_ARRAY[$i]}" =~ ^(merge|cherry-pick|cherry-pick-parent1|cherry-pick-m[1-9][0-9]*)$ ]]; then
-    echo "FATAL: unsupported build action ${BUILD_BRANCH_ACTION_ARRAY[$i]}."
-    exit 1
-  fi
-done
-if [ "${BUILD_SHA_ARRAY[0]}" != "$BUILD_SHA" ] || [ "${BUILD_BRANCH_ARRAY[0]}" != "$BUILD_BRANCH" ]; then
-  echo "FATAL: first build input differs from VLLM_BUILD_REF/COMMIT."
-  exit 1
-fi
-if ! [[ "$BUILD_FETCH_DEPTH" =~ ^[1-9][0-9]*$ ]]; then
-  echo "FATAL: VLLM_BUILD_FETCH_DEPTH must be a positive integer."
-  exit 1
-fi
-
-# A campaign recipe fetches each branch and verifies it still points to the
-# resolved SHA. A single pinned ref can still fetch its immutable object ID.
-BUILD_REMOTE_REF_ARRAY=()
-BUILD_DESC=""
-for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
-  if [ -n "${VLLM_BUILD_REFS:-}" ]; then
-    BUILD_REMOTE_REF_ARRAY+=("refs/heads/${BUILD_BRANCH_ARRAY[$i]}")
-  else
-    BUILD_REMOTE_REF_ARRAY+=("${BUILD_SHA_ARRAY[$i]}")
-  fi
-  BUILD_DESC+=" ${BUILD_BRANCH_ACTION_ARRAY[$i]}:${BUILD_BRANCH_ARRAY[$i]}@${BUILD_SHA_ARRAY[$i]:0:12}"
-done
-echo "Using pinned build inputs:${BUILD_DESC}"
-
 # The wheel reuses native extensions from the base image, so the cache must be
 # partitioned by that runtime too. This also prevents a floating/misconfigured
 # image from consuming a wheel built against another torch/CUDA ABI.
 BASE_RUNTIME_VLLM_VERSION=$(cd / && python3 -c 'import vllm; print(vllm.__version__)')
-BASE_RUNTIME_TORCH_VERSION=$(cd / && python3 -c 'import torch; print(torch.__version__)')
-BASE_RUNTIME_CUDA_VERSION=$(cd / && python3 -c 'import torch; print(torch.version.cuda or "none")')
-BASE_RUNTIME_PYTHON_ABI=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("SOABI") or "unknown")')
+detect_base_runtime_abi
 BASE_RUNTIME_IMAGE_ID=${VLLM_BUILD_BASE_IMAGE_ID:-unspecified}
 
 # Cache identity includes branch names, actions, ordered SHAs, recipe, and the
@@ -273,16 +176,16 @@ BASE_RUNTIME_IMAGE_ID=${VLLM_BUILD_BASE_IMAGE_ID:-unspecified}
 CACHE_HASH=$(
   {
     printf 'variant=%s\n' "$BUILD_VARIANT"
-    printf 'actions=%s\n' "$BUILD_BRANCH_ACTIONS"
+    printf 'actions=%s\n' "${VLLM_BUILD_ACTIONS:-checkout}"
     printf 'base_image=%s\n' "$BASE_RUNTIME_IMAGE_ID"
     printf 'base_vllm=%s\n' "$BASE_RUNTIME_VLLM_VERSION"
     printf 'torch=%s\n' "$BASE_RUNTIME_TORCH_VERSION"
     printf 'cuda=%s\n' "$BASE_RUNTIME_CUDA_VERSION"
     printf 'python_abi=%s\n' "$BASE_RUNTIME_PYTHON_ABI"
-    for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
-      printf '%s=%s\n' "${BUILD_BRANCH_ARRAY[$i]}" "${BUILD_SHA_ARRAY[$i]}"
+    for i in "${!RECIPE_BRANCHES[@]}"; do
+      printf '%s=%s\n' "${RECIPE_BRANCHES[$i]}" "${RECIPE_SHAS[$i]}"
     done
-  } | sha256sum | cut -c1-20
+  } | hash_cache_inputs
 )
 
 KEY="${CACHE_HASH}-${BUILD_VARIANT}"
@@ -294,8 +197,7 @@ LOCK_DIR="${CACHE}/build.lock"
 # setuptools_scm would otherwise include the synthetic merge commit produced
 # independently by each pod. Give every build for this cache key one stable
 # version, which is also one of NIXL's compatibility-hash inputs.
-BASE_VLLM_PUBLIC_VERSION=${BASE_RUNTIME_VLLM_VERSION%%+*}
-VLLM_BUILD_VERSION="${BASE_VLLM_PUBLIC_VERSION}+llmd.${CACHE_HASH}"
+VLLM_BUILD_VERSION="${BASE_RUNTIME_VLLM_VERSION%%+*}+llmd.${CACHE_HASH}"
 
 echo "Building branch set: ${BUILD_DESC}"
 echo "Build cache key: ${KEY}"
@@ -308,35 +210,23 @@ SITE=$(cd / && python3 -c "import sysconfig; print(sysconfig.get_paths()['pureli
 REUSE_DIRS="vllm_flash_attn third_party/deep_gemm third_party/flashmla"
 REUSE_FILES="_flashmla_C.abi3.so _flashmla_extension_C.abi3.so"
 rm -rf /tmp/base_reuse
+mkdir -p /tmp/base_reuse
 for d in $REUSE_DIRS; do
   if [ -d "${SITE}/vllm/${d}" ]; then
     mkdir -p "/tmp/base_reuse/$(dirname "$d")"
     cp -r "${SITE}/vllm/${d}" "/tmp/base_reuse/${d}"
   fi
 done
-mkdir -p /tmp/base_reuse
 for f in $REUSE_FILES; do
-  [ -f "${SITE}/vllm/${f}" ] && cp "${SITE}/vllm/${f}" "/tmp/base_reuse/${f}"
+  if [ -f "${SITE}/vllm/${f}" ]; then
+    cp "${SITE}/vllm/${f}" "/tmp/base_reuse/${f}"
+  fi
 done
 
 ready_wheel_path() {
-  local ready_version ready_wheel
   [ -f "$READY_FILE" ] || return 1
-  ready_wheel=$(awk -F= '$1 == "wheel" { print $2; exit }' "$READY_FILE")
-  ready_version=$(awk -F= '$1 == "version" { print $2; exit }' "$READY_FILE")
-  [ "$ready_version" = "$VLLM_BUILD_VERSION" ] || return 1
-  case "$ready_wheel" in
-    vllm-*.whl) ;;
-    *) return 1 ;;
-  esac
-  [ "$ready_wheel" = "$(basename "$ready_wheel")" ] || return 1
-  [ -f "${WHEEL_DIR}/${ready_wheel}" ] || return 1
-  printf '%s\n' "${WHEEL_DIR}/${ready_wheel}"
-}
-
-wheel_is_valid() {
-  local candidate=$1
-  python3 -c "import zipfile,sys; p=sys.argv[1]; sys.exit(0 if zipfile.is_zipfile(p) and zipfile.ZipFile(p).testzip() is None else 1)" "$candidate" 2>/dev/null
+  [ "$(read_ready_field "$READY_FILE" version)" = "$VLLM_BUILD_VERSION" ] || return 1
+  ready_wheel_from_marker "$READY_FILE" "$WHEEL_DIR" 'vllm-*.whl'
 }
 
 validate_wheel_native_extensions() {
@@ -412,140 +302,16 @@ if install_ready_wheel; then
   NEED_BUILD=0
 fi
 
-BUILD_LEADER=0
-if [ "${VLLM_BUILD_ROLE:-}" = "prefill" ] && [ "${LWS_WORKER_INDEX:-}" = "0" ]; then
-  BUILD_LEADER=1
-fi
+elect_build_leader
 echo "vLLM build role=${VLLM_BUILD_ROLE:-unset} worker=${LWS_WORKER_INDEX:-unset} leader=${BUILD_LEADER}"
 
-BUILD_LOCK_HELD=0
 LOCK_TOKEN="${HOSTNAME:-unknown}.$$.$RANDOM"
 LOCK_HEARTBEAT_PID=""
+BUILD_LOCK_HELD=0
 
-claim_build_lock() {
-  mkdir "$LOCK_DIR" 2>/dev/null || return 1
-  printf '%s\n' "$LOCK_TOKEN" > "${LOCK_DIR}/token"
-  touch "${LOCK_DIR}/heartbeat"
-  BUILD_LOCK_HELD=1
-}
-
-start_build_lock_heartbeat() {
-  (
-    while [ "$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)" = "$LOCK_TOKEN" ]; do
-      touch "${LOCK_DIR}/heartbeat" || exit 0
-      sleep 30
-    done
-  ) &
-  LOCK_HEARTBEAT_PID=$!
-}
-
-release_build_lock() {
-  if [ "$BUILD_LOCK_HELD" = 1 ]; then
-    if [ -n "$LOCK_HEARTBEAT_PID" ]; then
-      kill "$LOCK_HEARTBEAT_PID" 2>/dev/null || true
-      wait "$LOCK_HEARTBEAT_PID" 2>/dev/null || true
-      LOCK_HEARTBEAT_PID=""
-    fi
-    # A stale-lock recovery may have replaced our lock. Never remove a lock
-    # unless it still carries this process's ownership token.
-    CURRENT_LOCK_TOKEN=$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)
-    if [ "$CURRENT_LOCK_TOKEN" = "$LOCK_TOKEN" ]; then
-      rm -rf "$LOCK_DIR"
-    fi
-    BUILD_LOCK_HELD=0
-  fi
-}
-
-recover_restarted_leader_lock() {
-  local owner_host owner_pid previous_token stale_lock
-  [ "$BUILD_LEADER" = 1 ] || return 1
-  [ -d "$LOCK_DIR" ] || return 1
-
-  owner_host=$(awk -F= '$1 == "host" { print $2; exit }' "${LOCK_DIR}/owner" 2>/dev/null || true)
-  owner_pid=$(awk -F= '$1 == "pid" { print $2; exit }' "${LOCK_DIR}/owner" 2>/dev/null || true)
-  previous_token=$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)
-
-  # Kubernetes may restart the container in the same pod, reusing both its
-  # hostname and PID 1. The random token distinguishes that dead incarnation
-  # from this process. Two live PID-1 processes cannot coexist in one pod.
-  if [ "$owner_host" = "${HOSTNAME:-unknown}" ] && \
-     [ "$owner_pid" = "$$" ] && \
-     [ -n "$previous_token" ] && \
-     [ "$previous_token" != "$LOCK_TOKEN" ]; then
-    stale_lock="${LOCK_DIR}.restarted.${HOSTNAME:-unknown}.$$.$RANDOM"
-    if mv "$LOCK_DIR" "$stale_lock" 2>/dev/null; then
-      echo "Recovered build lock left by a previous container incarnation of ${HOSTNAME:-unknown}."
-      rm -rf "$stale_lock"
-      return 0
-    fi
-  fi
-  return 1
-}
-
-if [ "$NEED_BUILD" = 1 ] && [ "$BUILD_LEADER" != 1 ]; then
-  LOCK_WAIT_SECONDS=${VLLM_BUILD_LOCK_WAIT_SECONDS:-10800}
-  LOCK_POLL_SECONDS=${VLLM_BUILD_LOCK_POLL_SECONDS:-10}
-  WAITED_SECONDS=0
-  echo "Non-leader pod waiting up to ${LOCK_WAIT_SECONDS}s for the prefill-0 READY wheel."
-
-  while [ "$WAITED_SECONDS" -lt "$LOCK_WAIT_SECONDS" ]; do
-    if install_ready_wheel; then
-      NEED_BUILD=0
-      break
-    fi
-    sleep "$LOCK_POLL_SECONDS"
-    WAITED_SECONDS=$((WAITED_SECONDS + LOCK_POLL_SECONDS))
-  done
-
-  if [ "$NEED_BUILD" = 1 ]; then
-    echo "FATAL: timed out waiting for prefill-0 vLLM build after ${WAITED_SECONDS}s."
-    exit 1
-  fi
-fi
-
-if [ "$NEED_BUILD" = 1 ] && [ "$BUILD_LEADER" = 1 ]; then
-  recover_restarted_leader_lock || true
-  if claim_build_lock; then
-    :
-  else
-    LOCK_WAIT_SECONDS=${VLLM_BUILD_LOCK_WAIT_SECONDS:-10800}
-    LOCK_STALE_SECONDS=${VLLM_BUILD_LOCK_STALE_SECONDS:-600}
-    LOCK_POLL_SECONDS=${VLLM_BUILD_LOCK_POLL_SECONDS:-10}
-    WAITED_SECONDS=0
-    echo "Another pod owns ${LOCK_DIR}; waiting up to ${LOCK_WAIT_SECONDS}s for its READY wheel."
-
-    while [ "$WAITED_SECONDS" -lt "$LOCK_WAIT_SECONDS" ]; do
-      if install_ready_wheel; then
-        NEED_BUILD=0
-        break
-      fi
-
-      if [ -d "$LOCK_DIR" ]; then
-        LOCK_MTIME=$(stat -c %Y "${LOCK_DIR}/heartbeat" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
-        NOW_EPOCH=$(date +%s)
-        LOCK_AGE=$((NOW_EPOCH - LOCK_MTIME))
-        if [ "$LOCK_MTIME" -gt 0 ] && [ "$LOCK_AGE" -ge "$LOCK_STALE_SECONDS" ]; then
-          STALE_LOCK="${LOCK_DIR}.stale.${HOSTNAME:-unknown}.$$"
-          if mv "$LOCK_DIR" "$STALE_LOCK" 2>/dev/null; then
-            echo "Recovered stale build lock aged ${LOCK_AGE}s."
-            rm -rf "$STALE_LOCK"
-            if claim_build_lock; then
-              break
-            fi
-          fi
-        fi
-      elif claim_build_lock; then
-        break
-      fi
-
-      sleep "$LOCK_POLL_SECONDS"
-      WAITED_SECONDS=$((WAITED_SECONDS + LOCK_POLL_SECONDS))
-    done
-
-    if [ "$NEED_BUILD" = 1 ] && [ "$BUILD_LOCK_HELD" != 1 ]; then
-      echo "FATAL: timed out waiting for shared vLLM build after ${WAITED_SECONDS}s."
-      exit 1
-    fi
+if [ "$NEED_BUILD" = 1 ]; then
+  if wait_for_ready_wheel install_ready_wheel "vLLM"; then
+    NEED_BUILD=0
   fi
 fi
 
@@ -566,114 +332,23 @@ if [ "$NEED_BUILD" = 1 ]; then
   # marker so no waiter repeatedly attempts it while this build runs.
   start_build_lock_heartbeat
   rm -f "$READY_FILE"
-  printf 'host=%s\npid=%s\ntoken=%s\nstarted=%s\nkey=%s\n' \
-    "${HOSTNAME:-unknown}" "$$" "$LOCK_TOKEN" \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$KEY" \
-    > "${LOCK_DIR}/owner"
+  write_lock_owner_file "$KEY"
+  set -x
   apt-get update -qq && apt-get install -y -qq ccache mold > /dev/null 2>&1
   rm -rf /tmp/vllm-pr
   mkdir -p /tmp/vllm-pr && cd /tmp/vllm-pr || exit 1
   git init -q
 
-  # Fetch all resolved refs and verify that none moved after resolution.
-  BUILD_FETCH_REFS=()
-  for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
-    BUILD_FETCH_REFS+=("${BUILD_REMOTE_REF_ARRAY[$i]}:refs/remotes/llmd-build/${i}")
-  done
-  echo "Fetching pinned build inputs (depth=${BUILD_FETCH_DEPTH})..."
-  git fetch -q --no-tags --depth="$BUILD_FETCH_DEPTH" \
-    "$BUILD_REPO" "${BUILD_FETCH_REFS[@]}" || {
+  fetch_build_inputs /tmp/vllm-pr "$BUILD_REPO" "$BUILD_FETCH_DEPTH" || {
     echo "FATAL: pinned build fetch failed. Verify inputs remain available on ${BUILD_REPO}."
     exit 1
   }
-
-  for i in "${!BUILD_BRANCH_ARRAY[@]}"; do
-    FETCHED_SHA=$(git rev-parse "refs/remotes/llmd-build/${i}")
-    if [ "$FETCHED_SHA" != "${BUILD_SHA_ARRAY[$i]}" ]; then
-      echo "FATAL: ${BUILD_BRANCH_ARRAY[$i]} moved while preparing build; refusing stale cache key."
-      exit 1
-    fi
-  done
-
-  BASE_BRANCH="${BUILD_BRANCH_ARRAY[0]}"
-  BASE_SHA="${BUILD_SHA_ARRAY[0]}"
-
-  echo "Checking out base ${BASE_BRANCH} (${BASE_SHA})..."
-  git checkout -q --detach refs/remotes/llmd-build/0 || {
-    echo "FATAL: checkout ${BASE_BRANCH} failed"
-    exit 1
-  }
-
-  # Make sure the fetched tip is exactly the SHA used in the cache key.
-  if [ "$(git rev-parse HEAD)" != "$BASE_SHA" ]; then
-    echo "FATAL: ${BASE_BRANCH} moved while preparing build; refusing stale cache key."
-    exit 1
-  fi
-
-  for ((i = 1; i < ${#BUILD_BRANCH_ARRAY[@]}; i++)); do
-    MERGE_BRANCH="${BUILD_BRANCH_ARRAY[$i]}"
-    MERGE_SHA="${BUILD_SHA_ARRAY[$i]}"
-    BRANCH_ACTION="${BUILD_BRANCH_ACTION_ARRAY[$i]}"
-    MERGE_REF="refs/remotes/llmd-build/${i}"
-
-    if [[ "$BRANCH_ACTION" == cherry-pick* ]]; then
-      CHERRY_PICK_MAINLINE=()
-      CHERRY_PICK_TARGET=$MERGE_SHA
-      if [[ "$BRANCH_ACTION" =~ ^cherry-pick-m([1-9][0-9]*)$ ]]; then
-        CHERRY_PICK_MAINLINE=(-m "${BASH_REMATCH[1]}")
-      elif [ "$BRANCH_ACTION" = "cherry-pick-parent1" ]; then
-        CHERRY_PICK_TARGET=$(git rev-parse "${MERGE_SHA}^1") || {
-          echo "FATAL: first parent of ${MERGE_SHA} is unavailable."
-          exit 1
-        }
-      elif [ "$BRANCH_ACTION" != "cherry-pick" ]; then
-        echo "FATAL: invalid cherry-pick action ${BRANCH_ACTION} for ${MERGE_BRANCH}."
-        exit 1
-      fi
-      if git merge-base --is-ancestor "${CHERRY_PICK_TARGET}" HEAD; then
-        echo "Patch ${MERGE_BRANCH} (${MERGE_SHA}) is already in the build."
-        continue
-      fi
-
-      echo "Applying ${MERGE_BRANCH} tip (${MERGE_SHA})..."
-      git cherry-pick "${CHERRY_PICK_MAINLINE[@]}" --no-commit "${CHERRY_PICK_TARGET}" || {
-        echo "FATAL: cherry-pick ${MERGE_BRANCH} failed"
-        git status || true
-        exit 1
-      }
-
-      if git diff --cached --quiet; then
-        echo "Patch ${MERGE_BRANCH} is already present with equivalent changes."
-      else
-        git \
-          -c user.name=vllm-build \
-          -c user.email=vllm-build@localhost \
-          commit --no-gpg-sign --no-verify -C "${CHERRY_PICK_TARGET}" || {
-            echo "FATAL: commit ${MERGE_BRANCH} failed"
-            git status || true
-            exit 1
-          }
-      fi
-    elif [ "$BRANCH_ACTION" = "merge" ]; then
-      echo "Merging ${MERGE_BRANCH} (${MERGE_SHA})..."
-      git \
-        -c user.name=vllm-build \
-        -c user.email=vllm-build@localhost \
-        merge --no-edit "$MERGE_REF" || {
-          echo "FATAL: merge ${MERGE_BRANCH} failed"
-          git status || true
-          exit 1
-        }
-    else
-      echo "FATAL: unsupported action ${BRANCH_ACTION} for ${MERGE_BRANCH}."
-      exit 1
-    fi
-  done
+  apply_build_recipe /tmp/vllm-pr vllm-build vllm-build@localhost
 
   MERGED_HEAD=$(git rev-parse HEAD)
   echo "Building ${BUILD_DESC} (merged HEAD ${MERGED_HEAD}); SLOW (~30 min)..."
 
-  uv pip install --system -q setuptools wheel setuptools_scm setuptools_rust ninja cmake || { echo "FATAL: build-deps install failed"; exit 1; }
+  uv pip install --system -q setuptools setuptools_scm setuptools_rust ninja cmake || { echo "FATAL: build-deps install failed"; exit 1; }
   BASE_VLLM=$(cd / && python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent)")
   cp -r "${BASE_VLLM}/vllm-rs" vllm/ 2>/dev/null || true
   cp "${BASE_VLLM}"/_rust_*.so vllm/ 2>/dev/null || true
@@ -768,7 +443,6 @@ PYEOF
   LOCAL_WHEEL=/tmp/vllm-wheel-out
   rm -rf "$LOCAL_WHEEL" && mkdir -p "$LOCAL_WHEEL"
   BUILD_LOG="${CACHE}/logs/build-${HOSTNAME:-$(hostname)}.log"
-  set -o pipefail
   # Default to the CPU count visible inside the selected builder pod so this
   # remains correct if the common prefill/decode allocation changes later.
   if VLLM_TARGET_DEVICE=cuda \
@@ -776,18 +450,13 @@ PYEOF
        TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=${MAX_JOBS:-$(nproc)} \
        uv build --wheel --no-build-isolation -o "$LOCAL_WHEEL" . 2>&1 | tee "$BUILD_LOG"; then
     PUBLISHED_WHEEL=""
-    rm -f "$READY_FILE"
-    find "$WHEEL_DIR" -maxdepth 1 -type f -name 'vllm-*.whl' -delete
     for w in "$LOCAL_WHEEL"/vllm-*.whl; do
       [ -f "$w" ] || continue
-      wheel_is_valid "$w" || { echo "FATAL: built wheel is corrupt: $w"; exit 1; }
       validate_wheel_native_extensions "$w" || exit 1
-      bn=$(basename "$w")
-      PUBLISH_TMP="${WHEEL_DIR}/.${bn}.$$.tmp"
-      cp "$w" "$PUBLISH_TMP"
-      wheel_is_valid "$PUBLISH_TMP" || { echo "FATAL: copied wheel is corrupt: $PUBLISH_TMP"; exit 1; }
-      mv -f "$PUBLISH_TMP" "${WHEEL_DIR}/${bn}"
-      PUBLISHED_WHEEL="${WHEEL_DIR}/${bn}"
+      PUBLISHED_WHEEL=$(publish_wheel_atomic "$w" "$WHEEL_DIR") || {
+        echo "FATAL: built wheel is corrupt or could not be published: $w"
+        exit 1
+      }
     done
     [ -n "$PUBLISHED_WHEEL" ] || { echo "FATAL: build produced no vLLM wheel"; exit 1; }
     WHEEL=$PUBLISHED_WHEEL
@@ -799,18 +468,21 @@ PYEOF
       echo "FATAL: installed vLLM version ${INSTALLED_VLLM_VERSION} does not match build version ${VLLM_BUILD_VERSION}."
       exit 1
     fi
-    READY_TMP="${READY_FILE}.$$.tmp"
-    printf 'wheel=%s\nversion=%s\nmerged_head=%s\nbase_image=%s\nbase_vllm=%s\ntorch=%s\ncuda=%s\npython_abi=%s\n' \
-      "$(basename "$WHEEL")" "$VLLM_BUILD_VERSION" "$MERGED_HEAD" \
-      "$BASE_RUNTIME_IMAGE_ID" "$BASE_RUNTIME_VLLM_VERSION" \
-      "$BASE_RUNTIME_TORCH_VERSION" "$BASE_RUNTIME_CUDA_VERSION" \
-      "$BASE_RUNTIME_PYTHON_ABI" > "$READY_TMP"
-    mv -f "$READY_TMP" "$READY_FILE"
+    write_ready_file "$READY_FILE" \
+      "wheel=$(basename "$WHEEL")" \
+      "version=${VLLM_BUILD_VERSION}" \
+      "merged_head=${MERGED_HEAD}" \
+      "base_image=${BASE_RUNTIME_IMAGE_ID}" \
+      "base_vllm=${BASE_RUNTIME_VLLM_VERSION}" \
+      "torch=${BASE_RUNTIME_TORCH_VERSION}" \
+      "cuda=${BASE_RUNTIME_CUDA_VERSION}" \
+      "python_abi=${BASE_RUNTIME_PYTHON_ABI}"
     echo "Built + published vLLM ${BUILD_DESC} (${MERGED_HEAD}) -> ${WHEEL_DIR}"
   else
     echo "FATAL: vLLM ${BUILD_DESC} build failed; log at ${BUILD_LOG}; not publishing."
     exit 1
   fi
+  set +x
   cd / || exit 1
   rm -rf /tmp/vllm-pr "$LOCAL_WHEEL"
   release_build_lock

@@ -1,56 +1,7 @@
 #!/usr/bin/env bash
 # Optional DeepEP wheel build. Sourced by the campaign build script with either
 # the image's vLLM or a campaign-built vLLM. Uses the shared build-cache PVC.
-
-# The nightly path skips vLLM's lock setup, so provide the same primitives here.
-# A source build already defined them and can reuse them with DeepEP's lock path.
-if ! declare -F wheel_is_valid >/dev/null; then
-  wheel_is_valid() {
-    python3 -c 'import sys,zipfile; p=sys.argv[1]; sys.exit(0 if zipfile.is_zipfile(p) and zipfile.ZipFile(p).testzip() is None else 1)' "$1" 2>/dev/null
-  }
-fi
-if ! declare -F claim_build_lock >/dev/null; then
-  claim_build_lock() {
-    mkdir "$LOCK_DIR" 2>/dev/null || return 1
-    printf '%s\n' "$LOCK_TOKEN" > "${LOCK_DIR}/token"
-    touch "${LOCK_DIR}/heartbeat"
-    BUILD_LOCK_HELD=1
-  }
-  start_build_lock_heartbeat() {
-    (while [ "$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)" = "$LOCK_TOKEN" ]; do
-      touch "${LOCK_DIR}/heartbeat" || exit 0
-      sleep 30
-    done) &
-    LOCK_HEARTBEAT_PID=$!
-  }
-  release_build_lock() {
-    if [ "$BUILD_LOCK_HELD" = 1 ]; then
-      if [ -n "$LOCK_HEARTBEAT_PID" ]; then
-        kill "$LOCK_HEARTBEAT_PID" 2>/dev/null || true
-        wait "$LOCK_HEARTBEAT_PID" 2>/dev/null || true
-        LOCK_HEARTBEAT_PID=""
-      fi
-      if [ "$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)" = "$LOCK_TOKEN" ]; then
-        rm -rf "$LOCK_DIR"
-      fi
-      BUILD_LOCK_HELD=0
-    fi
-  }
-  recover_restarted_leader_lock() {
-    local owner_host owner_pid previous_token stale_lock
-    [ "$BUILD_LEADER" = 1 ] && [ -d "$LOCK_DIR" ] || return 1
-    owner_host=$(awk -F= '$1 == "host" { print $2; exit }' "${LOCK_DIR}/owner" 2>/dev/null || true)
-    owner_pid=$(awk -F= '$1 == "pid" { print $2; exit }' "${LOCK_DIR}/owner" 2>/dev/null || true)
-    previous_token=$(sed -n '1p' "${LOCK_DIR}/token" 2>/dev/null || true)
-    if [ "$owner_host" = "${HOSTNAME:-unknown}" ] && [ "$owner_pid" = "$$" ] && \
-       [ -n "$previous_token" ] && [ "$previous_token" != "$LOCK_TOKEN" ]; then
-      stale_lock="${LOCK_DIR}.restarted.${HOSTNAME:-unknown}.$$.$RANDOM"
-      if mv "$LOCK_DIR" "$stale_lock" 2>/dev/null; then
-        rm -rf "$stale_lock"
-      fi
-    fi
-  }
-fi
+source "$(dirname "${BASH_SOURCE[0]}")/build-lib.sh"
 
 DEEPEP_REPO=${DEEPEP_BUILD_REPO:?FATAL: DEEPEP_BUILD_REPO is required}
 DEEPEP_REF=${DEEPEP_BUILD_REF:?FATAL: DEEPEP_BUILD_REF is required}
@@ -71,7 +22,7 @@ DEEPEP_HASH=$(
     printf 'base_image=%s\ntorch=%s\ncuda=%s\npython_abi=%s\n' \
       "$BASE_RUNTIME_IMAGE_ID" "$BASE_RUNTIME_TORCH_VERSION" \
       "$BASE_RUNTIME_CUDA_VERSION" "$BASE_RUNTIME_PYTHON_ABI"
-  } | sha256sum | cut -c1-20
+  } | hash_cache_inputs
 )
 DEEPEP_CACHE_ROOT=${DEEPEP_BUILD_CACHE_ROOT:-/shared/vllm-build/deepep_build}
 DEEPEP_CACHE="${DEEPEP_CACHE_ROOT}/${DEEPEP_HASH}-${DEEPEP_VARIANT}"
@@ -86,13 +37,10 @@ mkdir -p "$DEEPEP_CACHE"
 deepep_ready_wheel() {
   local wheel commit
   [ -f "$DEEPEP_READY" ] || return 1
-  wheel=$(awk -F= '$1 == "wheel" { print $2; exit }' "$DEEPEP_READY")
-  commit=$(awk -F= '$1 == "commit" { print $2; exit }' "$DEEPEP_READY")
+  wheel=$(read_ready_field "$DEEPEP_READY" wheel)
+  commit=$(read_ready_field "$DEEPEP_READY" commit)
   [ "$commit" = "$DEEPEP_SHA" ] || return 1
-  case "$wheel" in deep_ep-*.whl) ;; *) return 1 ;; esac
-  [ "$wheel" = "$(basename "$wheel")" ] || return 1
-  [ -f "${DEEPEP_WHEEL_DIR}/${wheel}" ] || return 1
-  printf '%s\n' "${DEEPEP_WHEEL_DIR}/${wheel}"
+  ready_wheel_from_marker "$DEEPEP_READY" "$DEEPEP_WHEEL_DIR" 'deep_ep-*.whl'
 }
 
 install_ready_deepep() {
@@ -106,7 +54,7 @@ install_ready_deepep() {
 
 build_deepep_wheel() {
   local fetched nvrtc_header nvrtc_library nccl_library nvshmem_library
-  local link_dir local_wheels build_log wheel published temp_wheel
+  local link_dir local_wheels build_log wheel published
   echo "Building DeepEP ${DEEPEP_REF}@${DEEPEP_SHA}; cache ${DEEPEP_CACHE}"
   rm -rf /tmp/deepep-src /tmp/deepep-wheel-out || return 1
   mkdir -p /tmp/deepep-src /tmp/deepep-wheel-out "$DEEPEP_WHEEL_DIR" "${DEEPEP_CACHE}/logs" || return 1
@@ -119,7 +67,7 @@ build_deepep_wheel() {
     return 1
   fi
   git checkout -q --detach FETCH_HEAD || return 1
-  uv pip install --system -q setuptools wheel setuptools_scm ninja cmake || return 1
+  uv pip install --system -q setuptools setuptools_scm ninja cmake || return 1
 
   # The base image can place CUDA and communication libraries under pip's
   # nvidia package rather than under /usr/local/cuda.
@@ -141,7 +89,7 @@ build_deepep_wheel() {
   nccl_library=$(find /usr/local/lib/python*/dist-packages/nvidia /usr/local/cuda* \
     /usr/lib/x86_64-linux-gnu /usr/lib -type f -name 'libnccl.so*' -print 2>/dev/null | sort | head -1 || true)
   nvshmem_library=$(find /usr/local/lib/python*/dist-packages/nvidia /usr/local/cuda* \
-    /usr/lib/x86_64-linux-gnu /usr/lib -type f -name 'libnvshmem_host.so*' -print 2>/dev/null | sort | head -1 || true)
+    /usr/lib -type f -name 'libnvshmem_host.so*' -print 2>/dev/null | sort | head -1 || true)
   if [ -n "$nccl_library" ]; then
     ln -sf "$nccl_library" "$link_dir/libnccl.so" || return 1
     ln -sf "$nccl_library" "$link_dir/libnccl.so.2" || return 1
@@ -164,78 +112,35 @@ build_deepep_wheel() {
   published=""
   for wheel in "$local_wheels"/deep_ep-*.whl; do
     [ -f "$wheel" ] || continue
-    wheel_is_valid "$wheel" || return 1
-    temp_wheel="${DEEPEP_WHEEL_DIR}/.$(basename "$wheel").$$.tmp"
-    cp "$wheel" "$temp_wheel" || return 1
-    wheel_is_valid "$temp_wheel" || return 1
-    published="${DEEPEP_WHEEL_DIR}/$(basename "$wheel")"
-    mv -f "$temp_wheel" "$published" || return 1
+    published=$(publish_wheel_atomic "$wheel" "$DEEPEP_WHEEL_DIR") || return 1
   done
   [ -n "$published" ] || { echo "FATAL: DeepEP build produced no wheel."; return 1; }
   uv pip install --system --force-reinstall --no-deps "$published" || return 1
   (cd / && python3 -c 'import deep_ep') || return 1
-  printf 'wheel=%s\ncommit=%s\n' "$(basename "$published")" "$DEEPEP_SHA" \
-    > "${DEEPEP_READY}.$$.tmp" || return 1
-  mv -f "${DEEPEP_READY}.$$.tmp" "$DEEPEP_READY" || return 1
+  write_ready_file "$DEEPEP_READY" "wheel=$(basename "$published")" "commit=${DEEPEP_SHA}"
   echo "Built and cached DeepEP ${DEEPEP_REF}@${DEEPEP_SHA}: $published"
   cd / || return 1
   rm -rf /tmp/deepep-src "$local_wheels" "$link_dir" || return 1
 }
 
 if ! install_ready_deepep; then
-  if [ "$BUILD_LEADER" != 1 ]; then
-    waited=0
-    wait_seconds=${VLLM_BUILD_LOCK_WAIT_SECONDS:-10800}
-    poll_seconds=${VLLM_BUILD_LOCK_POLL_SECONDS:-10}
-    echo "Waiting for the DeepEP READY wheel from the build leader."
-    while [ "$waited" -lt "$wait_seconds" ]; do
-      if install_ready_deepep; then break; fi
-      sleep "$poll_seconds"
-      waited=$((waited + poll_seconds))
-    done
-    if [ "$waited" -ge "$wait_seconds" ]; then
-      echo "FATAL: timed out waiting for the DeepEP READY wheel."
-      exit 1
-    fi
-  else
-    recover_restarted_leader_lock || true
-    waited=0
-    wait_seconds=${VLLM_BUILD_LOCK_WAIT_SECONDS:-10800}
-    poll_seconds=${VLLM_BUILD_LOCK_POLL_SECONDS:-10}
-    stale_seconds=${VLLM_BUILD_LOCK_STALE_SECONDS:-600}
-    while ! claim_build_lock; do
-      if install_ready_deepep; then break; fi
-      if [ -d "$LOCK_DIR" ]; then
-        lock_mtime=$(stat -c %Y "${LOCK_DIR}/heartbeat" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
-        lock_age=$(($(date +%s) - lock_mtime))
-        if [ "$lock_mtime" -gt 0 ] && [ "$lock_age" -ge "$stale_seconds" ]; then
-          stale_lock="${LOCK_DIR}.stale.${HOSTNAME:-unknown}.$$"
-          if mv "$LOCK_DIR" "$stale_lock" 2>/dev/null; then
-            rm -rf "$stale_lock"
-          fi
-        fi
-      fi
-      if [ "$waited" -ge "$wait_seconds" ]; then
-        echo "FATAL: timed out acquiring DeepEP build lock."
+  # The nightly path sources this script without a leader election.
+  BUILD_LEADER=${BUILD_LEADER:-0}
+  if ! wait_for_ready_wheel install_ready_deepep "DeepEP"; then
+    trap release_build_lock EXIT
+
+    # A publisher may have completed between our initial lookup and lock
+    # acquisition. Recheck while holding the lock before paying for a build.
+    if ! install_ready_deepep; then
+      start_build_lock_heartbeat
+      rm -f "$DEEPEP_READY"
+      write_lock_owner_file "${DEEPEP_HASH}-${DEEPEP_VARIANT}"
+      if ! build_deepep_wheel; then
+        echo "FATAL: DeepEP build failed."
         exit 1
       fi
-      sleep "$poll_seconds"
-      waited=$((waited + poll_seconds))
-    done
-    if [ "$BUILD_LOCK_HELD" = 1 ]; then
-      trap release_build_lock EXIT
-      if ! install_ready_deepep; then
-        start_build_lock_heartbeat
-        rm -f "$DEEPEP_READY"
-        printf 'host=%s\npid=%s\ntoken=%s\n' "${HOSTNAME:-unknown}" "$$" "$LOCK_TOKEN" \
-          > "${LOCK_DIR}/owner"
-        if ! build_deepep_wheel; then
-          echo "FATAL: DeepEP build failed."
-          exit 1
-        fi
-      fi
-      release_build_lock
-      trap - EXIT
     fi
+    release_build_lock
+    trap - EXIT
   fi
 fi

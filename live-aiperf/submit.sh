@@ -7,9 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPORTER_SCRIPT="${SCRIPT_DIR}/report.py"
 GENERATOR_SCRIPT="${SCRIPT_DIR}/../gen_interactivity_chart.py"
 OVERLAY_SCRIPT="${SCRIPT_DIR}/../overlay_dashboards.py"
+DASHBOARD_COMMON="${SCRIPT_DIR}/../dashboard_common.py"
 PLOTLY_BUNDLE="${SCRIPT_DIR}/plotly-basic-2.35.2.min.js.gz"
 RESET_SCRIPT="${SCRIPT_DIR}/reset-prefix-caches.py"
 LLMD_CAPTURE_SCRIPT="${SCRIPT_DIR}/capture-llmd-resources.sh"
+source "${SCRIPT_DIR}/../live-lib.sh"
 
 CONCURRENCY="${1:-}"
 DURATION="${2:-900}"
@@ -31,19 +33,7 @@ fi
 
 # Do not inherit the repository's legacy NAMESPACE setting. The live workflow
 # targets the namespace currently carrying one valid deployed vLLM build.
-NAMESPACE="${LIVE_AIPERF_NAMESPACE:-}"
-if [[ -z "$NAMESPACE" ]]; then
-  DEPLOYMENT_NAMESPACES=()
-  while IFS=$'\t' read -r namespace commit; do
-    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] && DEPLOYMENT_NAMESPACES+=("$namespace")
-  done < <(kubectl get configmaps --all-namespaces -o go-template='{{range .items}}{{if eq .metadata.name "vllm-build-ref"}}{{.metadata.namespace}}{{"\t"}}{{index .data "VLLM_BUILD_COMMIT"}}{{"\n"}}{{end}}{{end}}')
-  if (( ${#DEPLOYMENT_NAMESPACES[@]} != 1 )); then
-    echo "Could not identify exactly one deployed vLLM namespace (found: ${DEPLOYMENT_NAMESPACES[*]:-none})" >&2
-    echo "Set LIVE_AIPERF_NAMESPACE only when choosing intentionally among multiple deployments." >&2
-    exit 1
-  fi
-  NAMESPACE="${DEPLOYMENT_NAMESPACES[0]}"
-fi
+NAMESPACE="$(discover_live_namespace LIVE_AIPERF_NAMESPACE)" || exit 1
 BASE_URL="${BASE_URL:-http://llm-d-inference-gateway-istio.${NAMESPACE}.svc.cluster.local/v1}"
 AIPERF_IMAGE="${AIPERF_IMAGE:-quay.io/rh-ee-robshaw/aiperf@sha256:9bb54497579481be375e3730dd52c353dc01e8a2fc8e0840acf36a843c3122e4}"
 HF_SECRET="${HF_SECRET:-llm-d-hf-token}"
@@ -53,39 +43,14 @@ MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-1000000000}"
 TOPOLOGY="${TOPOLOGY:-auto}"
 REQUESTED_TOPOLOGY="$TOPOLOGY"
 KUBECTL_IMAGE="${KUBECTL_IMAGE:-docker.io/alpine/k8s:1.31.0}"
-BENCHMARK_QUEUE="${LIVE_BENCHMARK_QUEUE:-live-benchmark-client}"
 READY_TIMEOUT_SECONDS="${LIVE_AIPERF_READY_TIMEOUT_SECONDS:-1800}"
-if [[ ! "$BENCHMARK_QUEUE" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || (( ${#BENCHMARK_QUEUE} > 63 )); then
-  echo "invalid LIVE_BENCHMARK_QUEUE: ${BENCHMARK_QUEUE}" >&2
-  exit 2
-fi
 if [[ ! "$READY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || (( READY_TIMEOUT_SECONDS < 60 || READY_TIMEOUT_SECONDS > 7200 )); then
   echo "LIVE_AIPERF_READY_TIMEOUT_SECONDS must be 60-7200" >&2
   exit 2
 fi
-kubectl get localqueue "$BENCHMARK_QUEUE" -n "$NAMESPACE" -o name >/dev/null || {
-  echo "Missing Kueue LocalQueue ${NAMESPACE}/${BENCHMARK_QUEUE}; run just live-benchmark-kueue-setup ${NAMESPACE}" >&2
-  exit 1
-}
+BENCHMARK_QUEUE="$(require_live_benchmark_queue "$NAMESPACE")" || exit 1
 
-# Campaigns pin the llm-d deployment source directly. Standalone live runs
-# continue to read the published vLLM build marker from the namespace.
-if [[ -n "${LIVE_BENCHMARK_SOURCE_COMMIT:-}" ]]; then
-  SOURCE_REF="${LIVE_BENCHMARK_SOURCE_REF:-}"
-  SOURCE_COMMIT="$LIVE_BENCHMARK_SOURCE_COMMIT"
-  SOURCE_KIND="${LIVE_BENCHMARK_SOURCE_KIND:-llm-d}"
-else
-  SOURCE_REF="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_REF}')"
-  SOURCE_COMMIT="$(kubectl get configmap vllm-build-ref -n "$NAMESPACE" -o jsonpath='{.data.VLLM_BUILD_COMMIT}')"
-  SOURCE_KIND=vllm
-fi
-if [[ ! "$SOURCE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
-   ! [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
-   ! [[ "$SOURCE_KIND" == vllm || "$SOURCE_KIND" == llm-d ]]; then
-  echo "Benchmark source ref/commit is missing or malformed" >&2
-  exit 1
-fi
-SOURCE_SHORT="${SOURCE_COMMIT:0:12}"
+resolve_live_benchmark_source "$NAMESPACE"
 echo "Benchmarking ${SOURCE_KIND} source ${SOURCE_REF} (${SOURCE_COMMIT})"
 
 RUN_TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
@@ -132,26 +97,7 @@ ARTIFACT_CONFIGMAP="aiperf-artifacts-${SOURCE_SHORT}-${RUN_TIMESTAMP}"
 # Discover the serving model from the cluster rather than baking a model name
 # into this launcher. More than one model is an ambiguous benchmark target, so
 # require an explicit MODEL_LABEL only in that exceptional case.
-DISCOVERED_MODELS=()
-while IFS= read -r discovered_model; do
-  [[ -n "$discovered_model" ]] && DISCOVERED_MODELS+=("$discovered_model")
-done < <(
-  kubectl get pods -n "$NAMESPACE" -l llm-d.ai/inference-serving=true \
-    -o go-template='{{range .items}}{{index .metadata.labels "llm-d.ai/model"}}{{"\n"}}{{end}}' \
-    | awk 'NF' | sort -u
-)
-if [[ -z "${MODEL_LABEL:-}" ]]; then
-  if (( ${#DISCOVERED_MODELS[@]} == 0 )); then
-    echo "No inference-serving pods with llm-d.ai/model found in ${NAMESPACE}" >&2
-    exit 1
-  fi
-  if (( ${#DISCOVERED_MODELS[@]} != 1 )); then
-    echo "More than one serving model was found: ${DISCOVERED_MODELS[*]}" >&2
-    echo "Set MODEL_LABEL only when selecting one intentionally." >&2
-    exit 1
-  fi
-  MODEL_LABEL="${DISCOVERED_MODELS[0]}"
-fi
+discover_live_serving_model "$NAMESPACE"
 
 BASE_SELECTOR="llm-d.ai/model=${MODEL_LABEL},llm-d.ai/inference-serving=true"
 PREFILL_SELECTOR="${BASE_SELECTOR},llm-d.ai/role=prefill"
@@ -456,6 +402,7 @@ kubectl create configmap "$ARTIFACT_CONFIGMAP" -n "$NAMESPACE" \
   --from-file=llm-d-deployment.yaml.gz="$LLMD_SNAPSHOT_GZ" \
   --from-file=gen_interactivity_chart.py="$GENERATOR_SCRIPT" \
   --from-file=overlay_dashboards.py="$OVERLAY_SCRIPT" \
+  --from-file=dashboard_common.py="$DASHBOARD_COMMON" \
   --from-file=plotly-basic-2.35.2.min.js.gz="$PLOTLY_BUNDLE" \
   --dry-run=client -o yaml | kubectl create -f -
 kubectl apply -f "$JOB_MANIFEST"

@@ -6,6 +6,7 @@ import argparse
 import base64
 import io
 from collections import Counter
+from collections.abc import Iterator
 from contextlib import contextmanager
 import copy
 import csv
@@ -59,12 +60,16 @@ ROUTER_CHART_VERSION = "v0"
 HELM_VERSION = "v3.22.0"
 CAMPAIGN_SOURCE_FILES = (
     "campaign/run.py", "campaign/transfer.py", "campaign/vllm-wheel-build.sh",
-    "campaign/vllm-source-build.sh", "campaign/deepep-wheel-build.sh",
+    "campaign/vllm-source-build.sh", "campaign/deepep-wheel-build.sh", "campaign/build-lib.sh",
     "live-aiperf/submit.sh", "live-aiperf/report.py",
     "live-aiperf/plotly-basic-2.35.2.min.js.gz", "live-aiperf/reset-prefix-caches.py",
-    "live-aiperf/capture-llmd-resources.sh", "live-nyann/submit.sh",
-    "export_dashboard.py", "gen_interactivity_chart.py", "overlay_dashboards.py",
+    "live-aiperf/capture-llmd-resources.sh", "live-nyann/submit.sh", "live-lib.sh",
+    "dashboard_common.py", "export_dashboard.py", "gen_interactivity_chart.py", "overlay_dashboards.py",
 )
+# Kinds a campaign may not create (cluster-scoped) in overlays or the router chart.
+CLUSTER_SCOPED = {"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
+                  "StorageClass", "PersistentVolume", "Node", "ResourceFlavor", "ClusterQueue"}
+PLOTLY_BUNDLE = ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"
 
 
 class CleanupError(RuntimeError):
@@ -207,7 +212,8 @@ def load_config(path: Path) -> dict[str, Any]:
     source = config.get("source")
     if not isinstance(source, dict) or set(source) != {"repo", "ref"}:
         raise ValueError("source needs repo and ref")
-    repo, ref = git_repo(source["repo"], "source.repo"), source["ref"]
+    git_repo(source["repo"], "source.repo")
+    ref = source["ref"]
     if not isinstance(ref, str) or not GIT_REF.fullmatch(ref) or ".." in ref or ref.endswith(".lock"):
         raise ValueError("source.ref must be a branch, tag, or commit")
     for key, default, low, high in (("rollout_timeout_seconds", 3600, 60, 21600),
@@ -336,7 +342,7 @@ def load_config(path: Path) -> dict[str, Any]:
             fields |= {"isl", "osl", "warmup_seconds"}
         elif tool == "aiperf":
             fields |= {"max_context_length"}
-        elif tool != "aiperf":
+        else:
             raise ValueError("tool must be aiperf or nyann")
         if set(bench) != fields or tool in tools:
             raise ValueError(f"{tool}: missing/extra fields or duplicate tool")
@@ -373,6 +379,53 @@ def sweep_variants(config: dict[str, Any]) -> list[dict[str, Any] | None]:
     if "builds" in config:
         return list(config["builds"])
     return list(config.get("vllm_images") or [None])
+
+
+def sample_names(concurrencies: list[int]) -> list[str]:
+    """Sweep sample names: c<N>, or c<N>-r<M> when a concurrency repeats."""
+    counts = Counter(concurrencies)
+    seen: Counter[int] = Counter()
+    names = []
+    for concurrency in concurrencies:
+        seen[concurrency] += 1
+        names.append(f"c{concurrency}" if counts[concurrency] == 1 else f"c{concurrency}-r{seen[concurrency]}")
+    return names
+
+
+def iter_cases(config: dict[str, Any]) -> Iterator[tuple[dict[str, Any] | None, dict[str, Any], str]]:
+    """Yield (variant, overlay, case name) for every planned deployment."""
+    for variant in sweep_variants(config):
+        for overlay in config["overlays"]:
+            name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
+            yield variant, overlay, name
+
+
+def make_case_record(variant: dict[str, Any] | None, overlay: dict[str, Any], name: str,
+                     status: str) -> dict[str, Any]:
+    """Initialize one deployment record for the campaign summary."""
+    record: dict[str, Any] = {"name": name, "overlay": overlay["name"],
+                              "dimensions": overlay.get("dimensions", {}),
+                              "status": status, "benchmarks": []}
+    if variant:
+        if "image" in variant:
+            record["image"] = variant["name"]
+            record["vllm_image"] = variant["image"]
+        else:
+            record["build"] = variant["name"]
+    return record
+
+
+def case_label(record: dict[str, Any], summary: dict[str, Any]) -> str:
+    """One human identity for a case, used by charts and the run identity table."""
+    build = record.get("vllm_build_inputs", {})
+    steps = build.get("steps", [])
+    identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
+    dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
+    label = f"{record.get('build') or record.get('image') or 'nightly'} / {record.get('overlay', record['name'])}"
+    label += f" — vLLM {identity or record.get('vllm_image') or summary.get('vllm_image', 'nightly image')}"
+    if dimensions:
+        label += f" ({dimensions})"
+    return label
 
 
 def fetch_source(source: dict[str, str]) -> tuple[Path, str]:
@@ -434,8 +487,6 @@ def resolve_build(build: dict[str, Any], pins: dict[tuple[str, str], str] | None
 
 
 def validate_manifest(rendered: str, namespace: str) -> None:
-    cluster_scoped = {"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
-                      "StorageClass", "PersistentVolume", "Node", "ResourceFlavor", "ClusterQueue"}
     documents = list(yaml.safe_load_all(rendered))
     if not documents:
         raise ValueError("overlay rendered no resources")
@@ -443,7 +494,7 @@ def validate_manifest(rendered: str, namespace: str) -> None:
         if not isinstance(item, dict) or not item.get("kind") or not isinstance(item.get("metadata"), dict):
             raise ValueError("overlay contains a malformed resource")
         kind = item["kind"]
-        if kind in cluster_scoped:
+        if kind in CLUSTER_SCOPED:
             raise ValueError(f"cluster-scoped {kind} is not allowed in a campaign overlay")
         metadata = item["metadata"]
         if not metadata.get("name") or metadata.get("namespace", namespace) != namespace:
@@ -604,6 +655,7 @@ def inject_vllm_build_script(rendered: str, build: dict[str, Any] | None = None,
     script_map["data"] = {
         "vllm-wheel-build.sh": (ROOT / "campaign" / "vllm-wheel-build.sh").read_text(),
         "deepep-wheel-build.sh": (ROOT / "campaign" / "deepep-wheel-build.sh").read_text(),
+        "build-lib.sh": (ROOT / "campaign" / "build-lib.sh").read_text(),
     }
     ref_map = next((item for item in documents if isinstance(item, dict) and item.get("kind") == "ConfigMap" and
                     item.get("metadata", {}).get("name") == "vllm-build-ref"), None)
@@ -698,7 +750,8 @@ def inject_generic_build(documents: list[Any], build: dict[str, Any], cache_pvc:
     documents.extend([
         {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "vllm-build"}, "data": {
             "vllm-wheel-build.sh": (ROOT / "campaign" / "vllm-source-build.sh").read_text(),
-            "deepep-wheel-build.sh": (ROOT / "campaign" / "deepep-wheel-build.sh").read_text()}},
+            "deepep-wheel-build.sh": (ROOT / "campaign" / "deepep-wheel-build.sh").read_text(),
+            "build-lib.sh": (ROOT / "campaign" / "build-lib.sh").read_text()}},
         {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "vllm-build-ref"}, "data": data},
     ])
     workers = 0
@@ -839,7 +892,6 @@ def wait_ready(config: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
                 condition.get("type") == "Ready" and condition.get("status") == "True"
                 for condition in pod.get("status", {}).get("conditions", [])) for pod in pods
         ):
-            build_commit(namespace)
             return snapshot(namespace, selector)
         time.sleep(10)
     raise TimeoutError(f"{overlay['name']}: expected {overlay['expected_pods']} ready Pods for {selector}")
@@ -880,13 +932,7 @@ def wait_job(config: dict[str, Any], name: str, timeout: int) -> None:
 
 
 def aiperf_measurements(artifact: Path, run_id: str, concurrencies: list[int]) -> list[dict[str, Any]]:
-    counts = Counter(concurrencies)
-    seen: Counter[int] = Counter()
-    expected_samples = {}
-    for concurrency in concurrencies:
-        seen[concurrency] += 1
-        sample = f"c{concurrency}" if counts[concurrency] == 1 else f"c{concurrency}-r{seen[concurrency]}"
-        expected_samples[sample] = concurrency
+    expected_samples = dict(zip(sample_names(concurrencies), concurrencies))
     measurements = []
     for directory in sorted(artifact.iterdir()):
         data = AIPERF_REPORT.run_data(directory)
@@ -907,17 +953,23 @@ def aiperf_measurements(artifact: Path, run_id: str, concurrencies: list[int]) -
     return measurements
 
 
-def nyann_summary(log: str) -> dict[str, Any] | None:
+def stage_summaries(log: str) -> list[dict[str, Any]]:
+    """Every JSON object in a log that carries a Nyann-style stages list."""
     decoder = json.JSONDecoder()
-    summary = None
+    summaries = []
     for match in re.finditer(r"(?m)^\{", log):
         try:
             candidate, _ = decoder.raw_decode(log[match.start():])
         except json.JSONDecodeError:
             continue
         if isinstance(candidate, dict) and isinstance(candidate.get("stages"), list):
-            summary = candidate
-    return summary
+            summaries.append(candidate)
+    return summaries
+
+
+def nyann_summary(log: str) -> dict[str, Any] | None:
+    summaries = stage_summaries(log)
+    return summaries[-1] if summaries else None
 
 
 def nyann_source_results(campaign_dir: Path, records: list[dict[str, Any]]) -> str:
@@ -1145,14 +1197,7 @@ def enrich_nyann_request_metrics(measurements: list[dict[str, Any]], log: str,
 def nyann_stage_windows(log: str, concurrencies: list[int],
                         measurements: list[dict[str, Any]], duration_seconds: int) -> dict[str, tuple[float, float]]:
     """Use Nyann's recorded stage times, or completed live rows and scheduled duration."""
-    decoder = json.JSONDecoder()
-    for match in reversed(list(re.finditer(r"(?m)^\{", log))):
-        try:
-            candidate, _ = decoder.raw_decode(log[match.start():])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(candidate, dict) or not isinstance(candidate.get("stages"), list):
-            continue
+    for candidate in reversed(stage_summaries(log)):
         timestamps = candidate.get("timestamps", {}).get("stages", [])
         if len(timestamps) != len(concurrencies) or [stage.get("concurrency") for stage in timestamps] != concurrencies:
             raise RuntimeError("Nyann stage timestamps differ from the requested sweep")
@@ -1232,6 +1277,17 @@ def grafana_connection(monitoring: dict[str, str]):
             forward.wait()
 
 
+def grafana_export_command(url: str, auth: str, monitoring: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
+    """Env and command prefix for one export_dashboard.py invocation; append mode args."""
+    env = os.environ.copy()
+    env["CAMPAIGN_GRAFANA_AUTH"] = auth
+    command = [sys.executable, str(ROOT / "export_dashboard.py"),
+               "--grafana-url", url, "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
+               "--dashboard", monitoring["dashboard_uid"],
+               "--plotly-bundle", str(PLOTLY_BUNDLE)]
+    return env, command
+
+
 def export_campaign_monitoring(config: dict[str, Any], artifact: Path, job_name: str,
                                baseline: list[str], measurements: list[dict[str, Any]]) -> None:
     """Use the existing Grafana exporter on the completed AIPerf sweep."""
@@ -1246,15 +1302,10 @@ def export_campaign_monitoring(config: dict[str, Any], artifact: Path, job_name:
         raise RuntimeError("Grafana export needs the saved serving Pod names")
     directories = [artifact / measurement["sample"] for measurement in measurements]
     with grafana_connection(monitoring) as (url, auth):
-        env = os.environ.copy()
-        env["CAMPAIGN_GRAFANA_AUTH"] = auth
-        command = [sys.executable, str(ROOT / "export_dashboard.py"),
-                   "--grafana-url", url, "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
-                   "--dashboard", monitoring["dashboard_uid"],
-                   "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
-                   "--aiperf-log", str(log_path), "--pod-regex", "|".join(re.escape(name) for name in names),
-                   "--metrics-namespace", config["namespace"],
-                   "results", *(str(directory) for directory in directories), "--pad", "0"]
+        env, command = grafana_export_command(url, auth, monitoring)
+        command += ["--aiperf-log", str(log_path), "--pod-regex", "|".join(re.escape(name) for name in names),
+                    "--metrics-namespace", config["namespace"],
+                    "results", *(str(directory) for directory in directories), "--pad", "0"]
         output = call(command, env=env).stdout
     (artifact / "grafana-export.log").write_text(output)
     if any(not (directory / "dashboard.html").is_file() or not (directory / "dashboard.html").stat().st_size
@@ -1290,17 +1341,12 @@ def export_nyann_monitoring(config: dict[str, Any], overlay_dir: Path, serving_p
     if not tasks:
         return
     with grafana_connection(monitoring) as (url, auth):
-        env = os.environ.copy()
-        env["CAMPAIGN_GRAFANA_AUTH"] = auth
         for sample, start, end, directory, dashboard, marker, identity in tasks:
             staged = directory / "dashboard.html.tmp"
-            command = [sys.executable, str(ROOT / "export_dashboard.py"),
-                       "--grafana-url", url, "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
-                       "--dashboard", monitoring["dashboard_uid"],
-                       "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
-                       "--pod-regex", "|".join(re.escape(name) for name in names),
-                       "--metrics-namespace", config["namespace"],
-                       "single", "--start", str(start), "--end", str(end), "--output", str(staged)]
+            env, command = grafana_export_command(url, auth, monitoring)
+            command += ["--pod-regex", "|".join(re.escape(name) for name in names),
+                        "--metrics-namespace", config["namespace"],
+                        "single", "--start", str(start), "--end", str(end), "--output", str(staged)]
             try:
                 call(command, env=env)
                 if not staged.is_file() or not staged.stat().st_size:
@@ -1316,8 +1362,6 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
                      artifact_fetcher: Callable[[Path], Path] | None = None) -> dict[str, Any]:
     tool = bench["tool"]
     run_id = f"{config['id']}-{overlay['name']}-{tool}"
-    if len(run_id) > 120:
-        raise ValueError("campaign/overlay names produce a run ID longer than 120 characters")
     env = os.environ.copy()
     env.update({"MODEL_LABEL": overlay["model_label"], "RESULTS_PVC": config["results_pvc"],
                 "LIVE_BENCHMARK_QUEUE": config["benchmark_queue"],
@@ -1473,12 +1517,7 @@ def nyann_chart_runs(destination: Path, summary: dict[str, Any], record: dict[st
             })
     build = record.get("vllm_build_inputs", {})
     steps = build.get("steps", [])
-    identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
-    dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
-    label = f"{record.get('build') or record.get('image') or 'nightly'} / {record.get('overlay', record['name'])}"
-    label += f" — vLLM {identity or record.get('vllm_image') or summary.get('vllm_image', 'nightly image')}"
-    if dimensions:
-        label += f" ({dimensions})"
+    label = case_label(record, summary)
     repeats = Counter(item["concurrency"] for item in bench["measurements"])
     seen: Counter[int] = Counter()
     runs = []
@@ -1514,12 +1553,7 @@ def write_final_report(destination: Path, summary: dict[str, Any]) -> None:
     for record in summary["overlays"]:
         build = record.get("vllm_build_inputs", {})
         steps = build.get("steps", [])
-        identity = " + ".join(f"{step['ref']}@{step['commit'][:12]}" for step in steps)
-        dimensions = ", ".join(f"{key}={value}" for key, value in sorted(record.get("dimensions", {}).items()))
-        label = f"{record.get('build') or record.get('image') or 'nightly'} / {record.get('overlay', record['name'])}"
-        label += f" — vLLM {identity or record.get('vllm_image') or summary.get('vllm_image', 'nightly image')}"
-        if dimensions:
-            label += f" ({dimensions})"
+        label = case_label(record, summary)
         gpu_metadata = {}
         for bench in record.get("benchmarks", []):
             if bench.get("tool") != "aiperf" or (bench.get("status") != "completed" and not bench.get("measurements")):
@@ -1576,14 +1610,12 @@ def render_router(source_root: Path, config: dict[str, Any]) -> str:
         args += ["-f", str(source_root / path)]
     rendered = call(args, timeout=600).stdout
     documents = [item for item in yaml.safe_load_all(rendered) if item is not None]
-    cluster_scoped = {"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
-                      "StorageClass", "PersistentVolume", "Node", "ResourceFlavor", "ClusterQueue"}
     kept: list[dict[str, Any]] = []
     stripped: list[str] = []
     for item in documents:
         if not isinstance(item, dict) or not item.get("kind") or not isinstance(item.get("metadata"), dict):
             raise RuntimeError("router chart rendered a malformed resource")
-        if item["kind"] in cluster_scoped:
+        if item["kind"] in CLUSTER_SCOPED:
             stripped.append(f"{item['kind']}/{item['metadata'].get('name')}")
             continue
         item["metadata"].setdefault("namespace", config["namespace"])
@@ -1677,12 +1709,7 @@ def write_mock_report(config: dict[str, Any], destination: Path, summary: dict[s
             if bench["tool"] == "aiperf":
                 run_id = f"{config['id']}-{record['name']}-aiperf"
                 artifact = destination / "mock-artifacts" / run_id
-                counts = Counter(concurrencies)
-                seen: Counter[int] = Counter()
-                for concurrency in concurrencies:
-                    seen[concurrency] += 1
-                    sample = (f"c{concurrency}" if counts[concurrency] == 1 else
-                              f"c{concurrency}-r{seen[concurrency]}")
+                for concurrency, sample in zip(concurrencies, sample_names(concurrencies)):
                     folder = artifact / sample
                     folder.mkdir(parents=True)
                     (folder / "benchmark-metadata.json").write_text(json.dumps({
@@ -1763,17 +1790,8 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
                 except Exception as exc:
                     record["status"] = "failed"
                     record["error"] = str(exc)
-        cases = [(variant, overlay) for variant in sweep_variants(config) for overlay in config["overlays"]]
-        for variant, overlay in cases:
-            name = f"{variant['name']}-{overlay['name']}" if variant else overlay["name"]
-            record = {"name": name, "overlay": overlay["name"], "dimensions": overlay.get("dimensions", {}),
-                      "status": "validated", "benchmarks": []}
-            if variant:
-                if "image" in variant:
-                    record["image"] = variant["name"]
-                    record["vllm_image"] = variant["image"]
-                else:
-                    record["build"] = variant["name"]
+        for variant, overlay, name in iter_cases(config):
+            record = make_case_record(variant, overlay, name, "validated")
             summary["overlays"].append(record)
             if variant and "image" not in variant and variant["name"] not in resolved:
                 record["status"] = "skipped"
@@ -1830,6 +1848,14 @@ def test_local(config: dict[str, Any], destination: Path, source_dir: Path | Non
             shutil.rmtree(overlay_root)
 
 
+def fail_campaign(destination: Path, summary: dict[str, Any], error: str) -> None:
+    """Mark the campaign summary failed and persist it."""
+    summary["status"] = "failed"
+    summary["error"] = error
+    summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+    write_summary(destination, summary)
+
+
 def run(config: dict[str, Any], results_root: Path = Path("/workload"),
         artifact_fetcher: Callable[[Path], Path] | None = None) -> int:
     destination = results_root / "campaigns" / config["id"]
@@ -1843,10 +1869,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
     try:
         overlay_root, source_commit = fetch_source(config["source"])
     except Exception as exc:
-        summary["status"] = "failed"
-        summary["error"] = f"llm-d source checkout failed: {exc}"
-        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-        write_summary(destination, summary)
+        fail_campaign(destination, summary, f"llm-d source checkout failed: {exc}")
         raise
     overlay_root = overlay_root.resolve(strict=True)
     summary["source_commit"] = source_commit
@@ -1857,10 +1880,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
         try:
             router_manifest = render_router(overlay_root, config)
         except Exception as exc:
-            summary["status"] = "failed"
-            summary["error"] = f"router chart render failed: {exc}"
-            summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-            write_summary(destination, summary)
+            fail_campaign(destination, summary, f"router chart render failed: {exc}")
             print(f"campaign: {summary['error']}", file=sys.stderr, flush=True)
             shutil.rmtree(overlay_root)
             return 1
@@ -1874,10 +1894,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
             matrix_builds, base_manifests, failed, stopped = prepare_matrix_builds(
                 config, overlay_root, destination, summary)
         except Exception as exc:
-            summary["status"] = "failed"
-            summary["error"] = f"build preparation failed: {exc}"
-            summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-            write_summary(destination, summary)
+            fail_campaign(destination, summary, f"build preparation failed: {exc}")
             print(f"campaign: {summary['error']}", file=sys.stderr, flush=True)
             shutil.rmtree(overlay_root)
             return 1
@@ -1891,9 +1908,9 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
                 reason = ("build preparation stopped after a failure" if stopped and name in matrix_builds
                           else build_status[name].get("error", "build was not prepared"))
                 for overlay in config["overlays"]:
-                    summary["overlays"].append({"name": f"{name}-{overlay['name']}", "build": name,
-                                                "overlay": overlay["name"], "dimensions": overlay.get("dimensions", {}),
-                                                "status": "skipped", "error": reason, "benchmarks": []})
+                    skipped = make_case_record(variant, overlay, f"{name}-{overlay['name']}", "skipped")
+                    skipped["error"] = reason
+                    summary["overlays"].append(skipped)
         write_summary(destination, summary)
     if "builds" in config:
         cases = ([(variant, overlay) for variant in config["builds"] if variant["name"] in matrix_builds
@@ -1906,14 +1923,7 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
             overlay["name"] = f"{variant['name']}-{base_overlay['name']}"
         name = overlay["name"]
         print(f"Deploying overlay {name}", flush=True)
-        record: dict[str, Any] = {"name": name, "status": "running", "benchmarks": [],
-                                  "overlay": base_overlay["name"], "dimensions": base_overlay.get("dimensions", {})}
-        if variant:
-            if "image" in variant:
-                record["image"] = variant["name"]
-                record["vllm_image"] = variant["image"]
-            else:
-                record["build"] = variant["name"]
+        record = make_case_record(variant, base_overlay, name, "running")
         summary["overlays"].append(record)
         write_summary(destination, summary)
         folder = destination / name
@@ -2022,57 +2032,79 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
     return 1 if failed else 0
 
 
-def run_local(config: dict[str, Any], output: Path) -> int:
-    """Orchestrate with local kubectl; copy Job artifacts from the shared PVC."""
-    output = output.resolve()
-    output.mkdir(parents=True, exist_ok=False)
+def artifacts_pod_name(config: dict[str, Any]) -> str:
+    """Stable helper Pod name for a campaign's shared PVC access."""
+    return "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
+
+
+def artifacts_pod(namespace: str, name: str, pvc: str, *, restart_policy: str,
+                  labels: dict[str, str] | None = None) -> dict[str, Any]:
+    """One alpine helper Pod mounting the results PVC at /workload."""
+    metadata: dict[str, Any] = {"name": name, "namespace": namespace}
+    if labels:
+        metadata["labels"] = labels
+    return {"apiVersion": "v1", "kind": "Pod", "metadata": metadata,
+            "spec": {"restartPolicy": restart_policy, "containers": [{"name": "artifacts",
+            "image": "docker.io/library/alpine:3.20", "command": ["sleep", "86400"],
+            "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                          "limits": {"cpu": "500m", "memory": "256Mi"}},
+            "volumeMounts": [{"name": "results", "mountPath": "/workload"}]}],
+            "volumes": [{"name": "results", "persistentVolumeClaim": {"claimName": pvc}}]}}
+
+
+@contextmanager
+def helper_pod(config: dict[str, Any], pod: dict[str, Any]) -> Iterator[str]:
+    """Create an artifacts helper Pod, wait for Ready, and always delete it."""
     namespace = config["namespace"]
-    pod_name = "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
-    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": pod_name, "namespace": namespace,
-           "labels": {"app.kubernetes.io/name": "benchmark-campaign-artifacts"}},
-           "spec": {"restartPolicy": "Always", "containers": [{"name": "artifacts",
-           "image": "docker.io/library/alpine:3.20", "command": ["sleep", "86400"],
-           "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
-                         "limits": {"cpu": "500m", "memory": "256Mi"}},
-           "volumeMounts": [{"name": "results", "mountPath": "/workload"}]}],
-           "volumes": [{"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}
-    kube(namespace, "get", "localqueue", config["benchmark_queue"])
-    kube(namespace, "get", "pvc", config["results_pvc"])
+    pod_name = pod["metadata"]["name"]
     kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
     try:
         kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
-
-        def fetch(artifact: Path) -> Path:
-            destination = output / artifact.relative_to("/workload")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if artifact.parent.name == "aiperf-agentx":
-                profiles = kube(namespace, "exec", pod_name, "--", "find", str(artifact),
-                                "-mindepth", "2", "-maxdepth", "2", "-type", "f",
-                                "-name", "profile_export_aiperf.json").stdout.splitlines()
-                if not profiles:
-                    raise RuntimeError(f"No completed AIPerf profiles in {artifact}")
-                for profile in profiles:
-                    copy_aiperf_sample(namespace, pod_name, Path(profile), destination)
-            else:
-                TRANSFER.download_tree(namespace, pod_name, str(artifact), destination)
-            return destination
-
-        return run(config, output, artifact_fetcher=fetch)
-    except KeyboardInterrupt:
-        campaign_dir = output / "campaigns" / config["id"]
-        cleanup_error = None
-        try:
-            delete_campaign_benchmark_jobs(config)
-        except Exception as exc:
-            cleanup_error = str(exc)
-        mark_campaign_cancelled(campaign_dir, cleanup_error)
-        print(f"Campaign {config['id']} cancelled", flush=True)
-        return 130
+        yield pod_name
     finally:
         deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
                        f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
         if deleted.returncode:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
+
+
+def run_local(config: dict[str, Any], output: Path) -> int:
+    """Orchestrate with local kubectl; copy Job artifacts from the shared PVC."""
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    namespace = config["namespace"]
+    kube(namespace, "get", "localqueue", config["benchmark_queue"])
+    kube(namespace, "get", "pvc", config["results_pvc"])
+    pod = artifacts_pod(namespace, artifacts_pod_name(config), config["results_pvc"],
+                        restart_policy="Always", labels={"app.kubernetes.io/name": "benchmark-campaign-artifacts"})
+    with helper_pod(config, pod) as pod_name:
+        try:
+            def fetch(artifact: Path) -> Path:
+                destination = output / artifact.relative_to("/workload")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if artifact.parent.name == "aiperf-agentx":
+                    profiles = kube(namespace, "exec", pod_name, "--", "find", str(artifact),
+                                    "-mindepth", "2", "-maxdepth", "2", "-type", "f",
+                                    "-name", "profile_export_aiperf.json").stdout.splitlines()
+                    if not profiles:
+                        raise RuntimeError(f"No completed AIPerf profiles in {artifact}")
+                    for profile in profiles:
+                        copy_aiperf_sample(namespace, pod_name, Path(profile), destination)
+                else:
+                    TRANSFER.download_tree(namespace, pod_name, str(artifact), destination)
+                return destination
+
+            return run(config, output, artifact_fetcher=fetch)
+        except KeyboardInterrupt:
+            campaign_dir = output / "campaigns" / config["id"]
+            cleanup_error = None
+            try:
+                delete_campaign_benchmark_jobs(config)
+            except Exception as exc:
+                cleanup_error = str(exc)
+            mark_campaign_cancelled(campaign_dir, cleanup_error)
+            print(f"Campaign {config['id']} cancelled", flush=True)
+            return 130
 
 
 def start_local(config_path: Path, output: Path, campaign_id: str) -> Path:
@@ -2175,16 +2207,22 @@ def local_runner_pids(output: Path, config_path: Path | None = None) -> list[int
     return pids
 
 
+def assert_saved_config(campaign_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Load a saved campaign configuration, allowing monitoring-only differences."""
+    saved = json.loads((campaign_dir / "campaign.json").read_text())
+    if {key: value for key, value in saved.items() if key != "monitoring"} != \
+            {key: value for key, value in config.items() if key != "monitoring"}:
+        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    return saved
+
+
 def stop_local(config: dict[str, Any], output: Path, config_path: Path) -> None:
     """Interrupt one local campaign, then verify and finish its cleanup."""
     output = output.resolve()
     campaign_dir = output / "campaigns" / config["id"]
     saved_config = campaign_dir / "campaign.json"
     if saved_config.is_file():
-        saved = json.loads(saved_config.read_text())
-        if {key: value for key, value in saved.items() if key != "monitoring"} != \
-                {key: value for key, value in config.items() if key != "monitoring"}:
-            raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+        assert_saved_config(campaign_dir, config)
         status = json.loads((campaign_dir / "summary.json").read_text())["status"]
         if status != "running":
             print(f"Campaign {config['id']} is already {status}")
@@ -2211,7 +2249,7 @@ def stop_local(config: dict[str, Any], output: Path, config_path: Path) -> None:
             time.sleep(1)
         if pid in local_runner_pids(output, config_path):
             raise RuntimeError(f"Runner process {pid} is still active; cleanup is not complete")
-    pod_name = "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
+    pod_name = artifacts_pod_name(config)
     kube(config["namespace"], "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
          f"--timeout={config['cleanup_timeout_seconds']}s")
     if not saved_config.is_file():
@@ -2288,16 +2326,8 @@ def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: P
             raise ValueError("--remote must be an artifact directory below /workload")
     pod_name = "campaign-download-" + secrets.token_hex(8)
     namespace = config["namespace"]
-    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": pod_name, "namespace": namespace},
-           "spec": {"restartPolicy": "Never", "containers": [{"name": "artifacts",
-           "image": "docker.io/library/alpine:3.20", "command": ["sleep", "86400"],
-           "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
-                         "limits": {"cpu": "500m", "memory": "256Mi"}},
-           "volumeMounts": [{"name": "results", "mountPath": "/workload"}]}],
-           "volumes": [{"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}
-    kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
-    try:
-        kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
+    pod = artifacts_pod(namespace, pod_name, config["results_pvc"], restart_policy="Never")
+    with helper_pod(config, pod) as pod_name:
         listing = kube(namespace, "exec", pod_name, "--", "sh", "-c",
                        'for root in /workload/aiperf-agentx /workload/nyann-agentx; do '
                        'if test -d "$root"; then find "$root" -mindepth 1 -maxdepth 1 -type d; fi; done').stdout
@@ -2319,11 +2349,6 @@ def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: P
             destination = output.resolve() / item.relative_to(root)
             TRANSFER.download_tree(namespace, pod_name, str(item), destination)
             print(f"Downloaded artifacts: {destination}", flush=True)
-    finally:
-        deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
-                       f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
-        if deleted.returncode:
-            raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
     return output.resolve()
 
 
@@ -2334,16 +2359,8 @@ def download_cluster_report(config: dict[str, Any], output: Path,
     remote_campaign = Path("/workload/campaigns") / config["id"]
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     pod_name = "campaign-download-" + secrets.token_hex(8)
-    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": pod_name, "namespace": namespace},
-           "spec": {"restartPolicy": "Never", "containers": [{"name": "artifacts",
-           "image": "docker.io/library/alpine:3.20", "command": ["sleep", "86400"],
-           "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
-                         "limits": {"cpu": "500m", "memory": "256Mi"}},
-           "volumeMounts": [{"name": "results", "mountPath": "/workload"}]}],
-           "volumes": [{"name": "results", "persistentVolumeClaim": {"claimName": config["results_pvc"]}}]}}
-    kube(namespace, "create", "-f", "-", input_text=json.dumps(pod))
-    try:
-        kube(namespace, "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=600s")
+    pod = artifacts_pod(namespace, pod_name, config["results_pvc"], restart_policy="Never")
+    with helper_pod(config, pod) as pod_name:
         # Copy only stable files while a runner is writing its campaign tree.
         remote_summary = json.loads(kube(namespace, "exec", pod_name, "--", "cat",
                                          str(remote_campaign / "summary.json")).stdout)
@@ -2385,11 +2402,6 @@ def download_cluster_report(config: dict[str, Any], output: Path,
                        for bench in record.get("benchmarks", [])):
                     copy_nyann_request_files(config, pod_name, record, campaign_dir, stable=True)
             write_summary(campaign_dir, summary)
-    finally:
-        deleted = kube(namespace, "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
-                       f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
-        if deleted.returncode:
-            raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
     if remote_summary["status"] != "running":
         report_local(config, output)
     return download_latest_local(config, output, destination, refresh_running=False)
@@ -2451,12 +2463,8 @@ def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[s
                     samples = ", ".join(f"c{value}" for value in bench["concurrencies"])
                     add_row(name, tool, samples, status)
                     continue
-                repeat_counts = Counter(bench["concurrencies"])
-                seen: Counter[int] = Counter()
-                for concurrency in bench["concurrencies"]:
-                    seen[concurrency] += 1
-                    sample = (f"c{concurrency}" if repeat_counts[concurrency] == 1 else
-                              f"c{concurrency}-r{seen[concurrency]}")
+                for concurrency, sample in zip(bench["concurrencies"],
+                                               sample_names(bench["concurrencies"])):
                     if tool == "aiperf" and (run_id, sample) in completed:
                         status = "completed"
                     elif result.get("status") in {"failed", "skipped"}:
@@ -2488,15 +2496,12 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
     saved_config = campaign_dir / "campaign.json"
     if not saved_config.is_file():
         raise ValueError(f"{campaign_dir} does not match this campaign configuration")
-    saved = json.loads(saved_config.read_text())
-    if {key: value for key, value in saved.items() if key != "monitoring"} != \
-            {key: value for key, value in config.items() if key != "monitoring"}:
-        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    assert_saved_config(campaign_dir, config)
     summary = json.loads((campaign_dir / "summary.json").read_text())
     if summary["status"] != "running":
         print(f"Campaign is {summary['status']}; use its final report if available")
         return 0
-    pod_name = pod_name or "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
+    pod_name = pod_name or artifacts_pod_name(config)
     namespace = config["namespace"]
     remote_root = "/workload/aiperf-agentx"
     if kube(namespace, "exec", pod_name, "--", "test", "-d", remote_root, check=False).returncode == 0:
@@ -2567,16 +2572,12 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
                     log_path = Path(temporary) / (run_id + ".log")
                     log_path.write_text(kube(namespace, "logs", f"job/{match.group(1)}",
                                              "--timestamps=true").stdout)
-                    env = os.environ.copy()
-                    env["CAMPAIGN_GRAFANA_AUTH"] = auth
-                    call([sys.executable, str(ROOT / "export_dashboard.py"),
-                          "--grafana-url", url, "--auth-env", "CAMPAIGN_GRAFANA_AUTH",
-                          "--dashboard", monitoring["dashboard_uid"],
-                          "--plotly-bundle", str(ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"),
-                          "--aiperf-log", str(log_path),
-                          "--pod-regex", "|".join(re.escape(name) for name in names),
-                          "--metrics-namespace", namespace,
-                          "results", *(str(sample) for sample in samples), "--pad", "0"], env=env)
+                    env, command = grafana_export_command(url, auth, monitoring)
+                    command += ["--aiperf-log", str(log_path),
+                                "--pod-regex", "|".join(re.escape(name) for name in names),
+                                "--metrics-namespace", namespace,
+                                "results", *(str(sample) for sample in samples), "--pad", "0"]
+                    call(command, env=env)
                 for data in runs:
                     dashboard = data["directory"] / "dashboard.html"
                     if not dashboard.is_file():
@@ -2710,10 +2711,7 @@ def download_latest_local(config: dict[str, Any], output: Path, destination: Pat
     saved_config = campaign_dir / "campaign.json"
     if not saved_config.is_file():
         raise ValueError(f"No campaign at {campaign_dir}")
-    saved = json.loads(saved_config.read_text())
-    if {key: value for key, value in saved.items() if key != "monitoring"} != \
-            {key: value for key, value in config.items() if key != "monitoring"}:
-        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    assert_saved_config(campaign_dir, config)
     status = json.loads((campaign_dir / "summary.json").read_text())["status"]
     if status == "running" and refresh_running:
         preview_local(config, output)
@@ -2746,10 +2744,7 @@ def report_local(config: dict[str, Any], output: Path) -> int:
     saved_config = campaign_dir / "campaign.json"
     if not saved_config.is_file():
         raise ValueError(f"{campaign_dir} does not match this campaign configuration")
-    saved = json.loads(saved_config.read_text())
-    if {key: value for key, value in saved.items() if key != "monitoring"} != \
-            {key: value for key, value in config.items() if key != "monitoring"}:
-        raise ValueError(f"{campaign_dir} does not match this campaign configuration")
+    assert_saved_config(campaign_dir, config)
     summary = json.loads((campaign_dir / "summary.json").read_text())
     if summary["status"] == "running":
         raise ValueError("campaign is still running; use preview-local until it finishes")
@@ -2875,6 +2870,11 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     print(f"Results: {config['results_pvc']}:/workload/campaigns/{campaign_id}")
 
 
+# Actions that write into a local artifact directory.
+NEEDS_OUTPUT = {"test-local", "run-local", "start-local", "stop-local", "preview-local",
+                "download-latest", "download-cluster", "download-artifacts", "report-local"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "start-local", "test-local",
@@ -2890,6 +2890,12 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config = load_config(args.config)
+        if args.action in NEEDS_OUTPUT and args.output is None:
+            raise ValueError(f"--output is required for {args.action}")
+        if args.action != "preview-local" and args.watch:
+            raise ValueError("--watch is only supported with preview-local")
+        if args.action not in {"download-latest", "download-cluster"} and args.dest is not None:
+            raise ValueError("--dest is only supported with download-latest and download-cluster")
         if args.action == "validate":
             print("Campaign configuration is valid")
             return 0
@@ -2899,51 +2905,27 @@ def main() -> int:
             submit(config, args.image, args.service_account)
             return 0
         if args.action == "test-local":
-            if args.output is None:
-                raise ValueError("--output is required for test-local")
             return test_local(config, args.output, args.source_dir)
         if args.action == "run-local":
-            if args.output is None:
-                raise ValueError("--output is required for run-local")
             return run_local(config, args.output)
         if args.action == "start-local":
-            if args.output is None:
-                raise ValueError("--output is required for start-local")
             start_local(args.config, args.output, config["id"])
             return 0
         if args.action == "stop-local":
-            if args.output is None:
-                raise ValueError("--output is required for stop-local")
             stop_local(config, args.output, args.config)
             return 0
         if args.action == "preview-local":
-            if args.output is None:
-                raise ValueError("--output is required for preview-local")
             return watch_preview_local(config, args.output) if args.watch else preview_local(config, args.output)
         if args.action == "download-latest":
-            if args.output is None:
-                raise ValueError("--output is required for download-latest")
-            if args.watch:
-                raise ValueError("--watch is only supported with preview-local")
             download_latest_local(config, args.output, args.dest)
             return 0
         if args.action == "download-cluster":
-            if args.output is None:
-                raise ValueError("--output is required for download-cluster")
             download_cluster_report(config, args.output, args.dest)
             return 0
         if args.action == "download-artifacts":
-            if args.output is None:
-                raise ValueError("--output is required for download-artifacts")
             download_pvc_artifacts(config, args.remote, args.output)
             return 0
-        if args.watch:
-            raise ValueError("--watch is only supported with preview-local")
-        if args.dest is not None:
-            raise ValueError("--dest is only supported with download-latest")
         if args.action == "report-local":
-            if args.output is None:
-                raise ValueError("--output is required for report-local")
             return report_local(config, args.output)
         return run(config)
     except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:

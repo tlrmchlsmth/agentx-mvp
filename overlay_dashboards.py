@@ -1,13 +1,34 @@
 #!/usr/bin/env python3
 import argparse
-import gzip
 import html
+import importlib.util
 import json
 import os
 import re
+from pathlib import Path
+
+
+def _load_common():
+    path = Path(__file__).with_name("dashboard_common.py")
+    spec = importlib.util.spec_from_file_location("agentx_dashboard_common", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Missing shared dashboard plumbing: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+COMMON = _load_common()
 
 
 def extract_data(html_path):
+    # Prefer the JSON sidecar written next to the page by export_dashboard;
+    # fall back to scraping the page for artifacts that predate it.
+    sidecar = os.path.splitext(html_path)[0] + ".json"
+    if os.path.exists(sidecar):
+        with open(sidecar) as f:
+            payload = json.load(f)
+        return payload["panels"], payload.get("rows", [])
     with open(html_path) as f:
         content = f.read()
     panels_match = re.search(r'const panels = ({.*?});\s*\n\s*const rows', content, re.DOTALL)
@@ -53,10 +74,7 @@ def generate_html(merged, rows, labels, plotly_bundle=None, *, notes=None):
     labels_json = json.dumps(labels)
     notice_html = "".join(f'<p class="subtitle">{html.escape(note)}</p>' for note in (notes or []))
 
-    plotly_tag = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
-    if plotly_bundle:
-        with gzip.open(plotly_bundle, "rt", encoding="utf-8") as f:
-            plotly_tag = "<script>" + f.read() + "</script>"
+    plotly_tag = COMMON.plotly_tag(plotly_bundle)
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -64,36 +82,13 @@ def generate_html(merged, rows, labels, plotly_bundle=None, *, notes=None):
 <title>Overlay — {', '.join(labels)}</title>
 {plotly_tag}
 <style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #111217; color: #d8d9da; font-family: Inter, -apple-system, sans-serif; padding: 16px; }}
-  h1 {{ font-size: 20px; font-weight: 500; margin-bottom: 4px; }}
-  .subtitle {{ font-size: 13px; color: #8e8e8e; margin-bottom: 20px; }}
-  .row-header {{ font-size: 15px; font-weight: 500; color: #d8d9da; padding: 10px 0 6px 4px;
-                 border-bottom: 1px solid #2a2a2e; margin: 16px 0 8px 0; cursor: pointer; user-select: none; }}
-  .row-header:hover {{ color: #fff; }}
-  .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
-  .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
-  .toolbar {{ position: sticky; top: 0; z-index: 20; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+{COMMON.BASE_CSS}  .toolbar {{ position: sticky; top: 0; z-index: 20; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
               margin: 0 0 12px; padding: 9px 10px; background: rgba(17,18,23,.96); border: 1px solid #2a2a2e; border-radius: 5px; }}
   .toolbar-label {{ color: #8e8e8e; font-size: 12px; margin-right: 2px; }}
   #concurrencyFilters {{ display: flex; flex-wrap: wrap; gap: 6px; }}
   button {{ border: 1px solid #3a3a3e; border-radius: 4px; background: #1e2127; color: #a9a9a9; padding: 4px 9px; cursor: pointer; }}
   button:hover {{ color: #fff; border-color: #666; }}
   .concurrency-filter.active {{ color: #fff; border-color: var(--filter-color); box-shadow: inset 0 0 0 1px var(--filter-color); }}
-  .grid {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
-  .panel {{ position: relative; isolation: isolate; z-index: 0; flex: 0 0 auto; width: calc(50% - 4px); max-width: 100%;
-            min-width: min(420px, 100%); min-height: 300px; height: 380px; background: #181b1f;
-            border: 1px solid #2a2a2e; border-radius: 4px; overflow: hidden; resize: both; }}
-  .panel.wide {{ width: 100% !important; }}
-  @media (max-width: 1000px) {{ .panel {{ width: 100%; }} }}
-  .panel-title {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 36px;
-                  font-size: 13px; font-weight: 500; padding: 5px 8px 5px 12px; color: #d8d9da; cursor: grab; user-select: none; }}
-  .panel-actions {{ display: flex; gap: 4px; flex: 0 0 auto; }}
-  .panel-actions button {{ padding: 2px 7px; font-size: 11px; }}
-  .panel.dragging {{ opacity: .45; }}
-  .panel .plot {{ position: relative; z-index: 0; width: 100%; height: calc(100% - 36px); min-width: 0; min-height: 260px; }}
-  .empty {{ color: #555; font-size: 12px; padding: 60px 12px; text-align: center; }}
-  .hidden {{ display: none; }}
 </style>
 </head>
 <body>
@@ -103,7 +98,7 @@ def generate_html(merged, rows, labels, plotly_bundle=None, *, notes=None):
 <div class="toolbar"><span class="toolbar-label">Run / concurrency</span><span id="concurrencyFilters"></span><button id="showAll">All</button><button id="showNone">None</button></div>
 <div id="root"></div>
 <script>
-const merged = {merged_json};
+{COMMON.PARENT_PLOTLY_SHIM}const merged = {merged_json};
 const rows = {rows_json};
 const labels = {labels_json};
 
@@ -199,26 +194,7 @@ function rgbStr(rgb, alpha) {{
 }}
 
 const root = document.getElementById('root');
-let currentGrid = null;
-let draggedPanel = null;
-function makePanelInteractive(panel, plot) {{
-  const title = panel.querySelector('.panel-title');
-  title.draggable = true;
-  title.addEventListener('dragstart', () => {{ draggedPanel = panel; panel.classList.add('dragging'); }});
-  title.addEventListener('dragend', () => {{ draggedPanel = null; panel.classList.remove('dragging'); }});
-  panel.addEventListener('dragover', event => {{
-    event.preventDefault();
-    if (!draggedPanel || draggedPanel === panel || draggedPanel.parentElement !== panel.parentElement) return;
-    panel.parentElement.insertBefore(draggedPanel, event.clientY < panel.getBoundingClientRect().top + panel.offsetHeight / 2 ? panel : panel.nextSibling);
-  }});
-  title.addEventListener('dblclick', event => {{ if (!event.target.closest('button')) panel.classList.toggle('wide'); }});
-  panel.querySelector('[data-action="shorter"]').addEventListener('click', () => {{ panel.style.height = Math.max(300, panel.offsetHeight - 120) + 'px'; }});
-  panel.querySelector('[data-action="taller"]').addEventListener('click', () => {{ panel.style.height = Math.min(1200, panel.offsetHeight + 160) + 'px'; }});
-  panel.querySelector('[data-action="wide"]').addEventListener('click', () => {{ panel.classList.toggle('wide'); }});
-  panel.querySelector('[data-action="legend"]').addEventListener('click', () => {{ Plotly.relayout(plot, {{ showlegend: !plot.layout.showlegend }}); }});
-  new ResizeObserver(() => Plotly.Plots.resize(plot)).observe(panel);
-}}
-
+{COMMON.PANEL_JS}
 // Building dozens of Plotly charts at page load blocks the overlay window.
 // Render each chart when it approaches the viewport instead.
 const panelObserver = new IntersectionObserver((entries, observer) => {{
@@ -230,42 +206,12 @@ const panelObserver = new IntersectionObserver((entries, observer) => {{
   }}
 }}, {{ rootMargin: '300px 0px' }});
 
-if (rows.length === 0) {{
-  currentGrid = document.createElement('div');
-  currentGrid.className = 'grid';
-  root.appendChild(currentGrid);
-  for (const pid of Object.keys(merged)) renderPanel(currentGrid, pid, merged[pid]);
-}} else {{
-  for (const item of rows) {{
-    if (item.type === 'row') {{
-      const h = document.createElement('div');
-      h.className = 'row-header';
-      h.innerHTML = '<span class="arrow">▾</span> ' + item.title;
-      currentGrid = document.createElement('div');
-      currentGrid.className = 'grid';
-      h.addEventListener('click', () => {{
-        h.classList.toggle('collapsed');
-        currentGrid.classList.toggle('hidden');
-      }});
-      root.appendChild(h);
-      root.appendChild(currentGrid);
-    }} else if (item.type === 'panel' && merged[item.id]) {{
-      if (!currentGrid) {{
-        currentGrid = document.createElement('div');
-        currentGrid.className = 'grid';
-        root.appendChild(currentGrid);
-      }}
-      renderPanel(currentGrid, item.id, merged[item.id]);
-    }}
-  }}
-}}
+scaffoldRows(rows, merged, renderPanel);
 
 function renderPanel(container, pid, m) {{
   const div = document.createElement('div');
   div.className = 'panel';
-  div.innerHTML = '<div class="panel-title"><span>' + m.title + '</span><span class="panel-actions">' +
-    '<button data-action="shorter" title="Shorter">−</button><button data-action="taller" title="Taller">+</button>' +
-    '<button data-action="wide" title="Toggle full width">↔</button><button data-action="legend" title="Toggle legend">Legend</button></span></div>';
+  div.innerHTML = panelHeaderHtml(m.title);
 
   let hasAny = false;
   for (const e of m.entries) {{
@@ -296,12 +242,7 @@ function renderPanel(container, pid, m) {{
     for (const v of s.values) {{ const value = parseFloat(v[1]); if (Number.isFinite(value)) allY.push(value); }}
   const largestY = allY.reduce((largest, value) => Math.max(largest, value), -Infinity);
   const smallestY = allY.reduce((smallest, value) => Math.min(smallest, value), Infinity);
-  const spanY = largestY - smallestY;
-  // Fixed-point formatting is intentional: monitoring values must never flip
-  // to exponent notation.  Keep only precision that remains meaningful.
-  const magnitudeDecimals = largestY >= 100 ? 0 : largestY >= 1 ? 2 : largestY >= 0.01 ? 4 : 6;
-  const rangeDecimals = spanY > 0 ? Math.max(0, Math.ceil(-Math.log10(spanY / 6)) + 1) : magnitudeDecimals;
-  const decimals = Math.min(8, Math.max(magnitudeDecimals, rangeDecimals));
+  const decimals = yTickDecimals(largestY, smallestY);
   const yFormat = `,.${{decimals}}f`;
   const formattedLargest = largestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}});
   const formattedSmallest = smallestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}});
