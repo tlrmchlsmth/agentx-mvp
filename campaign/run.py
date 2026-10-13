@@ -2402,7 +2402,10 @@ def fetch_running_cluster_state(config: dict[str, Any], output: Path, pod_name: 
         write_summary(campaign_dir, remote_summary)
         for record in remote_summary.get("overlays", []):
             folder = campaign_dir / record["name"]
-            for filename in ("nyann-submit.log", "aiperf-submit.log", "serving-pods.json"):
+            # The runner writes nyann-job.log to the PVC when the bench
+            # completes; the live-log fallback needs the Job object to still
+            # exist, which no longer holds once the cluster reclaims it.
+            for filename in ("nyann-submit.log", "nyann-job.log", "aiperf-submit.log", "serving-pods.json"):
                 remote_file = remote_campaign / record["name"] / filename
                 exists = kube(namespace, "exec", pod_name, "--", "test", "-f", str(remote_file), check=False)
                 if exists.returncode == 0:
@@ -2710,9 +2713,10 @@ def preview_local(config: dict[str, Any], output: Path, *, pod_name: str,
         else:
             page = AIPERF_REPORT.document(f"Campaign {config['id']}",
                                           '<section class="campaign-overview">' + notice + '</section>')
-            page = page.replace('</head>', AIPERF_REPORT.preview_header_css() + '</head>', 1)
+            page = AIPERF_REPORT.insert_before_close(page, '</head>', AIPERF_REPORT.preview_header_css())
         if auto_refresh:
-            page = page.replace("</body>", "<script>setTimeout(() => location.reload(), 90000);</script></body>", 1)
+            page = AIPERF_REPORT.insert_before_close(
+                page, "</body>", "<script>setTimeout(() => location.reload(), 90000);</script>")
         staged = render / "index.html"
         staged.write_text(page)
         staged.replace(preview / "index.html")

@@ -1199,6 +1199,37 @@ class CampaignTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "kubectl exec cat summary.json failed"):
                     runner.fetch_running_cluster_state(config, root / "output", "helper")
 
+    def test_fetch_running_cluster_state_downloads_nyann_job_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            summary = {"id": config["id"], "status": "running",
+                       "overlays": [{"name": "baseline", "status": "running", "benchmarks": []}]}
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[:4] == ("exec", "helper", "--", "cat"):
+                    return SimpleNamespace(stdout=json.dumps(summary), stderr="", returncode=0)
+                if args[:4] == ("exec", "helper", "--", "test"):
+                    return SimpleNamespace(stdout="", stderr="", returncode=0)
+                raise AssertionError(args)
+
+            downloads = []
+
+            def fake_download(namespace, pod_name, remote, local):
+                downloads.append(Path(local))
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner.TRANSFER, "download_file", side_effect=fake_download), \
+                 patch.object(runner, "preview_local", return_value=0):
+                fetched = runner.fetch_running_cluster_state(config, root / "output", "helper")
+            self.assertEqual(fetched, summary)
+            record_files = {path.name for path in downloads if path.parent.name == "baseline"}
+            # nyann-job.log is the durable stage-window source for completed
+            # nyann benches, whose Job object the cluster may already have
+            # reclaimed when a watch attaches late.
+            self.assertEqual(record_files, {"nyann-submit.log", "nyann-job.log",
+                                            "aiperf-submit.log", "serving-pods.json"})
+
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1691,6 +1722,12 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("ISL 1024 · OSL 512", page)
             self.assertIn("600 s/stage · warmup 60 s at c32", page)
             self.assertIn("ghcr.io/neuralmagic/nyann-bench:latest", page)
+            # Points can render before their monitoring export lands; the page
+            # must explain that instead of silently ignoring the click, and the
+            # click handler has to apply the same concurrency filter as the
+            # trace builder so filtered-out levels never mismap a point.
+            self.assertIn("No monitoring data was recorded for this run.", page)
+            self.assertIn("ACTIVE_CONCURRENCIES.has(c) && DATA[cfg]", page)
 
     def test_download_latest_selects_live_partial_or_final_report(self):
         for status, expected in (("running", "partial preview"),

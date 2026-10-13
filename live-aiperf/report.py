@@ -374,6 +374,19 @@ def write_index(root: Path) -> None:
     write_index_from_runs(root, runs)
 
 
+def insert_before_close(page: str, marker: str, insertion: str) -> str:
+    """Splice content before the document's real closing tag.
+
+    First-occurrence replacement is unsafe on these pages: their scripts can
+    quote the closing-tag text inside strings or comments, and a splice there
+    corrupts the JavaScript.
+    """
+    close = page.rfind(marker)
+    if close < 0:
+        raise ValueError(f"page has no {marker!r} to splice before")
+    return page[:close] + insertion + page[close:]
+
+
 def preview_header_css() -> str:
     return """<style>
 .campaign-overview{background:#181b1f;border:1px solid #2a2a2e;border-radius:7px;padding:14px 16px;margin:12px 0 20px}
@@ -556,7 +569,7 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
         title = model_label or f"Campaign {campaign['id']}"
         page = document(title, f'<h1>{html.escape(title)}</h1><section class="campaign-overview">'
                         + extra_html + '</section>')
-        (root / "index.html").write_text(page.replace('</head>', preview_header_css() + '</head>', 1),
+        (root / "index.html").write_text(insert_before_close(page, '</head>', preview_header_css()),
                                          encoding="utf-8")
         return
 
@@ -670,13 +683,13 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
         if subtitle_start >= 0:
             subtitle_end = page.find('</div>', subtitle_start)
             page = page[:subtitle_start] + page[subtitle_end + len('</div>'):]
-        page = page.replace('</head>', preview_header_css() + '</head>', 1)
+        page = insert_before_close(page, '</head>', preview_header_css())
         header = '<section class="campaign-overview">' + extra_html + \
                  '<div class="campaign-actions">' + overlay_control + source + '</div></section>'
     else:
         header = extra_html + source + overlay_control
     page = page.replace('<div id="root"></div>', header + '<div id="root"></div>', 1)
-    page = page.replace("</body>", pareto_section_html() + "\n</body>", 1)
+    page = insert_before_close(page, "</body>", pareto_section_html() + "\n")
     output.write_text(page, encoding="utf-8")
 
 

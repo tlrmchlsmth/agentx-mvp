@@ -357,14 +357,27 @@ setTimeout(() => {{
 
 function openDashboard(cfg, conc) {{
   const key = cfg + '_' + conc;
-  if (!DASHBOARDS[key]) return;
+  sidePanelTitle.textContent = `${{CONFIGS[cfg].label}} @ c${{C_LABELS[conc]}} — Dashboard`;
+  if (!DASHBOARDS[key]) {{
+    // A point can exist before its monitoring export lands (or after a failed
+    // one); say so instead of silently ignoring the click. The closing body
+    // tag stays split so no page-level closing-tag splice can ever match
+    // inside this string.
+    sidePanelFrame.removeAttribute('srcdoc');
+    sidePanelFrame.srcdoc = '<body style="margin:24px;font-family:Inter,-apple-system,sans-serif;'
+      + 'color:#8e8e8e;font-size:14px;background:#111217;">No monitoring data was recorded for this run.</'
+      + 'body>';
+    sidePanel.classList.add('open');
+    overlay.classList.add('open');
+    return;
+  }}
+  sidePanelFrame.removeAttribute('srcdoc');
   if (!blobCache[key]) {{
     const bin = atob(DASHBOARDS[key]);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     blobCache[key] = URL.createObjectURL(new Blob([bytes], {{ type: 'text/html;charset=utf-8' }}));
   }}
-  sidePanelTitle.textContent = `${{CONFIGS[cfg].label}} @ c${{C_LABELS[conc]}} — Dashboard`;
   sidePanelFrame.src = blobCache[key];
   sidePanel.classList.add('open');
   overlay.classList.add('open');
@@ -373,6 +386,7 @@ function openDashboard(cfg, conc) {{
 function closeDashboard() {{
   sidePanel.classList.remove('open');
   overlay.classList.remove('open');
+  sidePanelFrame.removeAttribute('srcdoc');
   sidePanelFrame.src = 'about:blank';
 }}
 
@@ -411,7 +425,9 @@ function attachClickHandler(plotEl) {{
   plotEl.on('plotly_click', function(eventData) {{
     const pt = eventData.points[0];
     const cfg = CONFIG_KEYS[pt.curveNumber];
-    const validConcs = CONCURRENCIES.filter(c => DATA[cfg] && DATA[cfg][c]);
+    // Must match buildTraces' filter exactly, or pointIndex maps to the wrong
+    // concurrency once the concurrency filter buttons hide some levels.
+    const validConcs = CONCURRENCIES.filter(c => ACTIVE_CONCURRENCIES.has(c) && DATA[cfg] && DATA[cfg][c]);
     const conc = validConcs[pt.pointIndex];
     if (cfg && conc) openDashboard(cfg, conc);
   }});

@@ -146,9 +146,13 @@ watch refresh that fails (Wi-Fi blip, pod churn) is retried after 60 seconds
 and never affects the campaign itself. A campaign still waiting for the
 one-slot campaign queue reports that it has not started yet instead of
 erroring; it begins as soon as the campaign ahead of it finishes. Completed
-AIPerf samples carry their Grafana dashboards embedded — click a chart point
-or the overlay button to open them; while a sweep is still running the
-preview has no samples yet, and therefore no dashboards.
+AIPerf samples and Nyann stages each carry their Grafana dashboards embedded —
+click a chart point or the overlay button to open them; a point whose
+monitoring export has not landed yet opens a panel saying so, and while a
+sweep is still running the preview has no samples yet, and therefore no
+dashboards. Nyann stage windows come from the live Job log while the Job
+exists and from the runner's durable `nyann-job.log` afterwards, so a watch
+attached after a bench completed still gets its dashboards.
 
 To stop a running campaign, use the printed stop command:
 
