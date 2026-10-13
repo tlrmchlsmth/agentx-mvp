@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: glm52-campaign-vllm
+  namespace: ecrncevi-glm52-campaign
+  labels:
+    llm-d.ai/guide: wide-ep
+spec:
+  selector:
+    matchLabels:
+      llm-d.ai/model: GLM-5.2-FP8
+      llm-d.ai/inference-serving: "true"
+  podMetricsEndpoints:
+    - port: dp0
+      path: /metrics
+      interval: 5s
+    - port: vllm-rank0
+      path: /metrics
+      interval: 5s

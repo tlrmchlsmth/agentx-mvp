@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: qwen3-campaign-vllm
+  namespace: ecrncevi-qwen3-campaign
+  labels:
+    llm-d.ai/guide: wide-ep
+spec:
+  selector:
+    matchLabels:
+      llm-d.ai/model: Qwen3-30B-A3B
+      llm-d.ai/inference-serving: "true"
+  podMetricsEndpoints:
+    - port: dp0
+      path: /metrics
+      interval: 5s
+    - port: vllm-rank0
+      path: /metrics
+      interval: 5s

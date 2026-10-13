@@ -12,6 +12,9 @@ set export
 #   just orchestrator-run  # submit through the durable in-cluster controller
 #   just logs / just shell # inspect the typed service
 #   just clean             # delete typed Jobs and service resources
+#   just live-aiperf 1,4,8,16 # benchmark the deployed llm-d model
+#   just live-nyann 1,4,8 1024 512 # synthetic nyann-bench sweep
+#   just live-aiperf-report   # download the newest portable report
 
 NAMESPACE := env_var_or_default('NAMESPACE', 'vllm')
 repo_root := justfile_directory()
@@ -26,6 +29,7 @@ manifesto_user := env_var_or_default('MANIFESTO_USER', env_var_or_default('USER'
 manifesto_args := env_var_or_default('MANIFESTO_ARGS', '')
 kueue_queue := env_var_or_default('KUEUE_QUEUE', 'nightly-eval')
 aiperf_image := env_var_or_default('AIPERF_IMAGE', 'quay.io/tms/aiperf:agentx-v0')
+nyann_image := env_var_or_default('NYANN_IMAGE', 'ghcr.io/neuralmagic/nyann-bench:latest')
 lustre_claim := env_var_or_default('LUSTRE_CLAIM', 'lustre-pvc-vllm')
 lustre_mount := env_var_or_default('LUSTRE_MOUNT', '/mnt/lustre')
 lustre_prefix := env_var_or_default('LUSTRE_PREFIX', '/mnt/lustre/agentx-mvp')
@@ -33,6 +37,7 @@ orchestrator_image := env_var_or_default('ORCHESTRATOR_IMAGE', 'quay.io/tms/benc
 agentx_service_image := env_var_or_default('AGENTX_SERVICE_IMAGE', 'quay.io/tms/agentx-service:0.1.0')
 orchestrator_manifesto_repo := env_var_or_default('ORCHESTRATOR_MANIFESTO_REPO', 'https://github.com/tlrmchlsmth/llm-manifesto.git')
 orchestrator_manifesto_ref := env_var_or_default('ORCHESTRATOR_MANIFESTO_REF', 'main')
+campaign_image := env_var_or_default('CAMPAIGN_IMAGE', 'quay.io/tms/benchmark-orchestrator:amd64')
 orchestrator_deploy := "benchmark-orchestrator"
 orchestrator_spec_configmap := "benchmark-orchestrator-spec"
 model     := env_var_or_default('MODEL', 'deepseek-ai/DeepSeek-V4-Pro')
@@ -57,6 +62,78 @@ agentx_request := env_var_or_default('AGENTX_REQUEST', 'examples/kimi-k3-a100-fu
 
 default:
     @just --list
+
+# Install the shared one-at-a-time CPU benchmark queue in the serving namespace.
+live-benchmark-kueue-setup namespace:
+    kubectl apply -f "{{repo_root}}/kueue/live-benchmark-cluster-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/live-benchmark-local-queue.yaml"
+
+# Queue one overlay campaign at a time in the serving namespace. The campaign
+# queue is separate from the child benchmark queue to avoid admission deadlock.
+campaign-setup namespace:
+    kubectl apply -f "{{repo_root}}/kueue/campaign-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/campaign-local-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/campaign/rbac.yaml"
+
+campaign-validate config:
+    python3 "{{repo_root}}/campaign/run.py" validate "{{config}}"
+
+# Render every build/overlay case and preview build Jobs without contacting Kubernetes.
+campaign-test-local config source_dir output:
+    python3 "{{repo_root}}/campaign/run.py" test-local "{{config}}" --source-dir "{{source_dir}}" --output "{{output}}"
+
+# Orchestrate against the cluster from this checkout; keep the report locally.
+campaign-run-local config output:
+    python3 "{{repo_root}}/campaign/run.py" run-local "{{config}}" --output "{{output}}"
+
+# Start the same local orchestrator in the background and return immediately.
+campaign-start-local config output:
+    python3 "{{repo_root}}/campaign/run.py" start-local "{{config}}" --output "{{output}}"
+
+# Stop one running local campaign and retain its completed artifacts.
+campaign-stop-local config output:
+    python3 "{{repo_root}}/campaign/run.py" stop-local "{{config}}" --output "{{output}}"
+
+# Refresh a running campaign or copy its last report to Downloads as one HTML file.
+campaign-download-latest config output:
+    python3 "{{repo_root}}/campaign/run.py" download-latest "{{config}}" --output "{{output}}"
+
+# Fetch a finished cluster campaign from the PVC and save its standalone HTML to Downloads.
+campaign-download-cluster config output:
+    python3 "{{repo_root}}/campaign/run.py" download-cluster "{{config}}" --output "{{output}}"
+
+# Download all existing artifact directories for this campaign.
+campaign-download-artifacts config output:
+    python3 "{{repo_root}}/campaign/run.py" download-artifacts "{{config}}" --output "{{output}}"
+
+# Resume one specific PVC artifact directory into an existing local output directory.
+campaign-download-artifact config remote output:
+    python3 "{{repo_root}}/campaign/run.py" download-artifacts "{{config}}" --remote "{{remote}}" --output "{{output}}"
+
+campaign-submit config:
+    python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}"
+
+campaign-build:
+    podman build --platform linux/amd64 \
+      --build-arg CAMPAIGN_ONLY=true \
+      -f Dockerfile.orchestrator -t {{campaign_image}} .
+
+campaign-push:
+    podman push {{campaign_image}}
+
+# Benchmark the currently deployed llm-d model. This is intentionally a thin
+# deployment-coupled path: it discovers the model/topology, captures the
+# serving spec, and submits one autonomous sweep Job.
+live-aiperf concurrencies:
+    ./live-aiperf/submit.sh "{{concurrencies}}"
+
+# Run a synthetic ISL/OSL benchmark against the currently deployed llm-d model.
+live-nyann concurrencies isl="1024" osl="512" duration="900" warmup="60":
+    NYANN_IMAGE="{{nyann_image}}" ./live-nyann/submit.sh "{{concurrencies}}" "{{isl}}" "{{osl}}" "{{duration}}" "{{warmup}}"
+
+# Regenerate and download the newest completed live-aiperf report.
+live-aiperf-report monitoring="false":
+    LIVE_AIPERF_MONITORING="{{monitoring}}" ./live-aiperf/download-report.sh
 
 _spec-slug:
     #!/usr/bin/env bash

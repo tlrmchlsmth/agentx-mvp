@@ -8,6 +8,86 @@ The service branch exposes the same bounded benchmark tools over MCP
 The repository also ships a bounded, durable MCP benchmark service. Start
 with [the service contract and deployment guide](docs/agentx-service.md).
 
+## Overlay campaigns
+
+To compare several deployment overlays, point a campaign at an llm-d fork and
+branch or commit, then list its Kustomize overlay paths. The runner deploys each
+overlay, waits for serving readiness, runs the same benchmark sweeps, saves the
+results, and tears it down before starting the next. See
+[overlay campaign setup](docs/campaigns.md) and
+[the campaign configuration example](examples/campaign.example.json).
+
+## Live llm-d sweep
+
+Use this when the question is: “how does the model deployed in this namespace
+perform right now?” It is separate from the typed service and legacy manifesto
+paths: it discovers the live model and topology, records the deployed vLLM
+branch/SHA, captures the serving-pod and AIPerf Job YAML, and submits one
+autonomous Kubernetes Job for the entire concurrency sweep.
+
+Install the dedicated CPU benchmark queue once in the namespace carrying
+`vllm-build-ref` (shown as `vllm` below). This requires permission to create a
+cluster-scoped ResourceFlavor and ClusterQueue:
+
+```bash
+just live-benchmark-kueue-setup vllm
+```
+
+Both live tools submit to the `live-benchmark-client` LocalQueue. Its 4-CPU,
+8-GiB quota admits one benchmark client Job at a time; later AIPerf and nyann
+Jobs wait instead of cancelling an active run. Existing Jobs submitted before
+this change are outside this queue. Set `LIVE_BENCHMARK_QUEUE` only if an
+operator has provisioned another suitable LocalQueue in the serving namespace.
+
+```bash
+just live-aiperf 1,4,8,16
+just live-aiperf-report
+# Optional: infer every benchmark window and bundle Grafana/Prometheus data.
+just live-aiperf-report true
+```
+
+To collect repeated samples in one Job, repeat the concurrency values in the
+argument. Each repeated sample is retained separately, for example
+`1,4,8,16,1,4,8,16` produces `c1-r1` through `c16-r2`; a concurrency that
+appears only once keeps the normal `c<N>` directory name.
+
+The first command returns after submitting the Job, so the laptop can close.
+The Job waits in an init container for the selected serving Pods to appear and
+become Ready, then runs the complete sweep autonomously. The second command
+downloads `~/Downloads/aiperf-history.html`; it rebuilds the self-contained
+report from persisted artifacts for the newest completed Job.
+Passing `true` performs a post-hoc query of the deployed `llmd-grafana` dashboard
+for each saved AIPerf time range, then embeds those offline dashboards in the same
+downloaded HTML. The range is exactly the measured AIPerf request/response window
+(no pre-run padding, so warm-up is excluded). It auto-discovers the monitoring
+service and does not query it by default.
+
+## Live nyann-bench synthetic sweep
+
+Use nyann-bench when you want fixed synthetic input/output sequence lengths
+instead of a dataset trace. The first argument is a comma-separated concurrency
+sweep; ISL, OSL, and stage duration are positional arguments with defaults of
+1024, 512, and 900 seconds:
+
+```bash
+just live-nyann 1,4,8 1024 512
+# Equivalent direct invocation:
+./live-nyann/submit.sh 1,4,8 1024 512 900 60
+```
+
+This submits one Kubernetes Job with one measured stage per concurrency. It
+uses the published `ghcr.io/neuralmagic/nyann-bench:latest` image by default.
+Override `NYANN_IMAGE` to pin a commit-SHA image in production. Raw
+nyann-bench JSONL and timestamp artifacts are written under the configured
+results PVC at `/workload/nyann-agentx/<run-id>`. You can also override
+`RESULTS_PVC`, `BASE_URL`, `MODEL_LABEL`, or `LIVE_NYANN_NAMESPACE` when needed.
+The default 60-second warmup runs once at the maximum requested concurrency
+before the measured stages; pass `0` as the fifth argument to disable it. The
+Job exposes client metrics at `/metrics` on port 9090 and adds both pod and
+Service Prometheus annotations. Nyann auto-detects the model ID from the
+endpoint’s `/v1/models` response; `MODEL_LABEL` is only used for Kubernetes
+selection and metadata.
+
 ## Prerequisites
 
 - `kubectl` configured for your cluster
