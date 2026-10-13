@@ -228,7 +228,12 @@ class CampaignTests(unittest.TestCase):
             def fake_kube(namespace, *args, **kwargs):
                 self.assertEqual(namespace, "vllm")
                 commands.append(args)
-                stdout = '{"items": []}' if args[:2] == ("get", "jobs") else ""
+                if args[:2] == ("get", "jobs"):
+                    stdout = '{"items": []}'
+                elif args[:2] == ("get", "job"):
+                    stdout = f"job/batch/campaign-{config['id']}"
+                else:
+                    stdout = ""
                 return SimpleNamespace(stdout=stdout, returncode=0, stderr="")
 
             with patch.object(runner, "kube", side_effect=fake_kube), \
@@ -237,6 +242,7 @@ class CampaignTests(unittest.TestCase):
                 runner.stop_cluster(config)
             # The job delete outlives the Pod's SIGTERM-to-SIGKILL window.
             self.assertEqual(commands, [
+                ("get", "job", "campaign-test-campaign", "--ignore-not-found", "-o", "name"),
                 ("delete", "job", "campaign-test-campaign", "--ignore-not-found", "--wait=true", "--timeout=240s"),
                 ("get", "jobs", "-o", "json"),
                 ("delete", "configmap", "campaign-test-campaign", "--ignore-not-found"),
@@ -251,13 +257,46 @@ class CampaignTests(unittest.TestCase):
             config = self.config(root)
 
             def fake_kube(namespace, *args, **kwargs):
-                stdout = '{"items": []}' if args[:2] == ("get", "jobs") else ""
+                if args[:2] == ("get", "job"):
+                    stdout = f"job/batch/campaign-{config['id']}"
+                else:
+                    stdout = '{"items": []}' if args[:2] == ("get", "jobs") else ""
+                return SimpleNamespace(stdout=stdout, returncode=0, stderr="")
+
+            # Two overlays: the baseline pods survive the teardown window; the
+            # wait must expire (monotonic jumps past the deadline) and report
+            # pod names only, without the ":uid" snapshot suffix.
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "snapshot",
+                              side_effect=[["pod-a:uid-1"], [], ["pod-a:uid-1"], []]), \
+                 patch.object(runner.time, "monotonic", side_effect=[0.0, 999.0]), \
+                 patch.object(runner.time, "sleep"):
+                with self.assertRaisesRegex(runner.CleanupError, r"Serving Pods remain: pod-a$"):
+                    runner.stop_cluster(config)
+
+    def test_stop_cluster_ignores_pods_deployed_by_the_next_campaign(self):
+        # The one-slot campaign queue admits the next campaign the moment
+        # this Job is deleted, and it deploys the identical overlay: pods
+        # created after the stop began are not this campaign's leftovers.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[:2] == ("get", "job"):
+                    stdout = f"job/batch/campaign-{config['id']}"
+                else:
+                    stdout = '{"items": []}' if args[:2] == ("get", "jobs") else ""
                 return SimpleNamespace(stdout=stdout, returncode=0, stderr="")
 
             with patch.object(runner, "kube", side_effect=fake_kube), \
-                 patch.object(runner, "snapshot", side_effect=[["pod-a"], []]):
-                with self.assertRaisesRegex(runner.CleanupError, "Serving Pods remain: pod-a"):
-                    runner.stop_cluster(config)
+                 patch.object(runner, "snapshot",
+                              side_effect=[["pod-a:uid-1"], [], ["pod-b:uid-2"], []]), \
+                 patch.object(runner.time, "monotonic", return_value=0.0), \
+                 patch.object(runner.time, "sleep"), \
+                 redirect_stdout(io.StringIO()) as captured:
+                runner.stop_cluster(config)
+            self.assertIn("stopped; results remain", captured.getvalue())
 
     def test_stop_deletes_only_jobs_with_exact_campaign_run_ids(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1102,6 +1141,63 @@ class CampaignTests(unittest.TestCase):
                  redirect_stderr(io.StringIO()) as captured:
                 self.assertEqual(runner.watch_cluster(config, root / "output"), 1)
             self.assertIn("killed during cleanup", captured.getvalue())
+
+    def test_watch_cluster_waits_for_queued_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            states = [runner.CampaignNotStarted("campaign test-campaign has not written its summary yet"),
+                      {"status": "completed"}]
+
+            def fake_state(value, out, pod_name, *, auto_refresh=False):
+                item = states.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "get":
+                    return SimpleNamespace(stdout=f"job/batch/campaign-{config['id']}",
+                                           returncode=0, stderr="")
+                return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "fetch_running_cluster_state", side_effect=fake_state), \
+                 patch.object(runner, "download_cluster_report", return_value=root / "latest.html"), \
+                 patch.object(runner.time, "sleep"), \
+                 redirect_stdout(io.StringIO()) as captured_out, \
+                 redirect_stderr(io.StringIO()) as captured_err:
+                self.assertEqual(runner.watch_cluster(config, root / "output"), 0)
+            self.assertIn("has not started yet", captured_out.getvalue())
+            self.assertNotIn("Watch refresh failed", captured_err.getvalue())
+
+    def test_fetch_running_cluster_state_reports_not_started(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+
+            def fake_kube(namespace, *args, **kwargs):
+                self.assertEqual(args[:3], ("exec", "helper", "--"))
+                stderr = ("cat: can't open '/workload/campaigns/test-campaign/summary.json': "
+                          "No such file or directory\ncommand terminated with exit code 1")
+                return SimpleNamespace(stdout="", stderr=stderr, returncode=1)
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                with self.assertRaisesRegex(runner.CampaignNotStarted, "has not written its summary yet"):
+                    runner.fetch_running_cluster_state(config, root / "output", "helper")
+
+    def test_fetch_running_cluster_state_keeps_other_exec_failures_transient(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+
+            def fake_kube(namespace, *args, **kwargs):
+                stderr = "error: dial tcp 10.0.0.1:6443: connect: connection refused"
+                return SimpleNamespace(stdout="", stderr=stderr, returncode=1)
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                with self.assertRaisesRegex(RuntimeError, "kubectl exec cat summary.json failed"):
+                    runner.fetch_running_cluster_state(config, root / "output", "helper")
 
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:

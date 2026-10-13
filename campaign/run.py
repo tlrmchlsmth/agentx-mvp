@@ -76,6 +76,10 @@ class CleanupError(RuntimeError):
     """A running child workload or deployment might still exist."""
 
 
+class CampaignNotStarted(RuntimeError):
+    """The campaign's PVC directory does not exist yet (queued or starting)."""
+
+
 class CampaignStopped(BaseException):
     """SIGTERM asked the in-cluster runner to stop; unwind and cancel.
 
@@ -2239,6 +2243,16 @@ def stop_cluster(config: dict[str, Any]) -> None:
     namespace, campaign_id = config["namespace"], config["id"]
     job_name = f"campaign-{campaign_id}"
     print(f"Stopping campaign {campaign_id}", flush=True)
+    # Pods present before the stop are the only leftover candidates: the
+    # overlay's label selector cannot tell this campaign's pods from the
+    # identical overlay the NEXT campaign deploys as soon as the queue slot
+    # frees, so pods created after this point are never its leftovers.
+    initial: set[str] = set()
+    for overlay in config["overlays"]:
+        initial.update(snapshot(namespace, overlay["pod_selector"]))
+    # A Job that is already gone cannot still be unwinding; skip its wait.
+    runner_present = bool(kube(namespace, "get", "job", job_name, "--ignore-not-found",
+                               "-o", "name", check=False).stdout.strip())
     # --wait outlives the Pod's SIGTERM-to-SIGKILL window (grace period is
     # cleanup_timeout + 60); deleting a still-suspended Job is instant.
     kube(namespace, "delete", "job", job_name, "--ignore-not-found", "--wait=true",
@@ -2253,10 +2267,24 @@ def stop_cluster(config: dict[str, Any]) -> None:
     # stopped campaign must not leave helper Pods behind.
     kube(namespace, "delete", "pods", "-l", DOWNLOAD_POD_LABEL, "--ignore-not-found",
          "--wait=true", f"--timeout={config['cleanup_timeout_seconds']}s")
-    leftovers = []
-    for overlay in config["overlays"]:
-        leftovers.extend(snapshot(namespace, overlay["pod_selector"]))
-    cleanup_error = job_error or (f"Serving Pods remain: {', '.join(sorted(set(leftovers)))}" if leftovers else None)
+    # The Job object disappears before the runner Pod finishes unwinding, and
+    # Kueue can admit the next campaign the moment it does. Only pods that
+    # existed before the stop count, and only once the runner's whole
+    # SIGTERM-to-exit window has clearly passed without them terminating.
+    leftovers: list[str] = []
+    if initial:
+        deadline = (time.monotonic() + config["cleanup_timeout_seconds"] + 120
+                    if runner_present else 0.0)
+        while True:
+            remaining = set()
+            for overlay in config["overlays"]:
+                remaining.update(snapshot(namespace, overlay["pod_selector"]))
+            leftovers = sorted(initial & remaining)
+            if not leftovers or time.monotonic() >= deadline:
+                break
+            time.sleep(15)
+    names = ", ".join(entry.split(":", 1)[0] for entry in leftovers)
+    cleanup_error = job_error or (f"Serving Pods remain: {names}" if leftovers else None)
     if cleanup_error:
         raise CleanupError(f"Campaign {campaign_id} was stopped but cleanup needs attention: {cleanup_error}")
     print(f"Campaign {campaign_id} stopped; results remain on {config['results_pvc']}", flush=True)
@@ -2358,8 +2386,15 @@ def fetch_running_cluster_state(config: dict[str, Any], output: Path, pod_name: 
     namespace = config["namespace"]
     remote_campaign = Path("/workload/campaigns") / config["id"]
     campaign_dir = output.resolve() / "campaigns" / config["id"]
-    remote_summary = json.loads(kube(namespace, "exec", pod_name, "--", "cat",
-                                     str(remote_campaign / "summary.json")).stdout)
+    summary_cat = kube(namespace, "exec", pod_name, "--", "cat",
+                       str(remote_campaign / "summary.json"), check=False)
+    if summary_cat.returncode != 0:
+        if "No such file or directory" in summary_cat.stderr:
+            raise CampaignNotStarted(
+                f"campaign {config['id']} has not written its summary yet (it may still be queued or starting)")
+        raise RuntimeError(f"kubectl exec cat summary.json failed ({summary_cat.returncode}): "
+                           f"{summary_cat.stderr.strip()}")
+    remote_summary = json.loads(summary_cat.stdout)
     if remote_summary["status"] == "running":
         campaign_dir.mkdir(parents=True, exist_ok=True)
         TRANSFER.download_file(namespace, pod_name, str(remote_campaign / "campaign.json"),
@@ -2690,8 +2725,9 @@ def watch_cluster(config: dict[str, Any], output: Path, destination: Path | None
 
     The campaign itself is unaffected by this laptop: a disconnect only stops
     the watching. Refresh failures (Wi-Fi blips, pod churn) retry after 60 s.
-    Exits 0 when the campaign completed, 1 when it failed or was killed, 130
-    on Ctrl-C.
+    A campaign that is still waiting for the one-slot campaign queue reports
+    that it has not started yet instead of erroring. Exits 0 when the
+    campaign completed, 1 when it failed or was killed, 130 on Ctrl-C.
     """
     namespace, campaign_id = config["namespace"], config["id"]
     job_name = f"campaign-{campaign_id}"
@@ -2700,13 +2736,6 @@ def watch_cluster(config: dict[str, Any], output: Path, destination: Path | None
     try:
         while True:
             try:
-                pod_name = "campaign-download-" + secrets.token_hex(8)
-                with helper_pod(config, download_pod(config, pod_name)) as pod_name:
-                    summary = fetch_running_cluster_state(config, output, pod_name, auto_refresh=True)
-                if summary["status"] != "running":
-                    download_cluster_report(config, output, destination)
-                    print(f"Campaign {campaign_id} {summary['status']}", flush=True)
-                    return 0 if summary["status"] == "completed" else 1
                 # A stopped Job object disappears before its Pods finish
                 # terminating, so a missing Job is only fatal once the whole
                 # stop window has clearly passed without a final summary.
@@ -2720,6 +2749,16 @@ def watch_cluster(config: dict[str, Any], output: Path, destination: Path | None
                         return 1
                 else:
                     stale_since = None
+                pod_name = "campaign-download-" + secrets.token_hex(8)
+                with helper_pod(config, download_pod(config, pod_name)) as pod_name:
+                    summary = fetch_running_cluster_state(config, output, pod_name, auto_refresh=True)
+                if summary["status"] != "running":
+                    download_cluster_report(config, output, destination)
+                    print(f"Campaign {campaign_id} {summary['status']}", flush=True)
+                    return 0 if summary["status"] == "completed" else 1
+            except CampaignNotStarted:
+                print(f"Campaign {campaign_id} has not started yet; waiting for the runner "
+                      "(queued campaigns run one at a time)", flush=True)
             except (RuntimeError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
                 print(f"Watch refresh failed; retrying: {exc}", file=sys.stderr, flush=True)
             time.sleep(60)
