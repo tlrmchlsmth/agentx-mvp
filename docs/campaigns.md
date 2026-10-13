@@ -65,7 +65,9 @@ must never use that queue or it could block its own children.
    `vllm-build-ref`, its vLLM commit is recorded separately.
 3. Ensure the results PVC is ReadWriteMany, mounted by both benchmark Jobs and
    the campaign Job, and that the AIPerf and nyann images/secrets are available.
-   `campaign-setup` installs a namespace Role that can apply the resource kinds
+   `campaign-prepare` creates the namespace, both Kueue queues, and that PVC
+   (`workload-pvc`, 20Gi, `shared-vast` by default) in one idempotent step.
+   The RBAC it installs is a namespace Role that can apply the resource kinds
    used by the overlays and submit benchmark Jobs; extend it only if your
    overlays contain additional kinds.
 4. To include Grafana dashboards in the final HTML, set `monitoring` explicitly:
@@ -87,56 +89,134 @@ must never use that queue or it could block its own children.
    while preserving its AIPerf measurements. Omit `monitoring` when no Grafana
    export is wanted.
 
-   For `run-local`, Grafana may live in another namespace. Use
-   `grafana_namespace`, `grafana_service`, `auth_secret`, and `dashboard_uid`
-   instead of `grafana_url`. The runner reads the named Secret, opens a temporary
-   service port-forward during export, and closes it afterward. The GLM 5.2
-   example uses this form. An in-cluster submission using this form records
-   benchmark results without Grafana credentials; `campaign-download-cluster`
-   backfills dashboards after reconnecting. Apply its PodMonitor before the benchmark so
+   Grafana may live in another namespace; the laptop then backfills dashboards
+   after downloading results. Use `grafana_namespace`, `grafana_service`,
+   `auth_secret`, and `dashboard_uid` instead of `grafana_url`: the in-cluster
+   runner records benchmark results without Grafana credentials, and
+   `campaign-download` exports the dashboards from the laptop through a
+   temporary service port-forward after the run. The GLM 5.2 example uses this
+   form. Apply its PodMonitor before the benchmark so
    Prometheus collects both prefill and decode metrics:
 
    ```bash
    kubectl apply -f examples/campaign.glm52-h200-podmonitor.yaml
    ```
 
+## Run in the cluster
+
 ```bash
 export NAMESPACE=vllm
-just live-benchmark-kueue-setup "$NAMESPACE"
-just campaign-setup "$NAMESPACE"
+just campaign-prepare "$NAMESPACE"
 just campaign-validate examples/campaign.example.json
-just campaign-submit examples/campaign.example.json
+just campaign-up examples/campaign.example.json
 ```
 
-`campaign-submit` creates a Kueue-managed Job that keeps running after the
-launching laptop disconnects. It reuses the published
+`campaign-up` submits a Kueue-managed Job that runs the entire campaign in the
+cluster — deploy overlay, benchmark, tear down, next case — so the run survives
+laptop disconnects, sleeps, and Wi-Fi blips. It appends a `-YYYYMMDD-HHMM`
+timestamp to the campaign ID so reruns never collide, writes the modified
+config beside the output directory as the config of record, and prints
+ready-to-paste `campaign-watch`, `campaign-stop`, and `campaign-download`
+commands plus `kubectl` status and logs lines. The Job reuses the published
 `quay.io/tms/benchmark-orchestrator:amd64` runtime and mounts a compressed
-snapshot of the checked-out campaign code through a ConfigMap. No image build
+snapshot of the checked-out campaign code through a ConfigMap; no image build
 or push is needed. Set `CAMPAIGN_IMAGE` only to use another existing runtime.
-
-After submitting, the terminal can close and the laptop can sleep. Check the
-cluster Job with `kubectl -n "$NAMESPACE" get job campaign-<id>` or read its
-logs with `kubectl -n "$NAMESPACE" logs job/campaign-<id>`. At any point,
-download a single HTML snapshot from the PVC with:
-
-```bash
-export KUBECONFIG=~/.kube/config
-just campaign-download-cluster examples/campaign.glm52-h200.json /tmp/glm52-campaign-results
-```
-
-The command prints and saves `~/Downloads/<id>-latest.html`. While the Job is
-running, it captures campaign status, individual Nyann stage progress, and
-completed AIPerf samples through the existing preview renderer; repeat it to refresh
-the file. After completion it downloads the campaign state and the AIPerf
-inputs needed by the final report generator, using resumable checked chunks.
-If the JSON uses a Grafana service in another namespace, dashboards are
-exported from the laptop during the snapshot or final download. Benchmark and
-overlay work continues in the cluster independently of the laptop.
+Pass `--no-monitoring` to skip the config's Grafana block for one run. After
+submitting, the terminal can close: check the Job with
+`kubectl -n "$NAMESPACE" get job campaign-<id>` or follow its logs with
+`kubectl -n "$NAMESPACE" logs -f job/campaign-<id>`.
 
 The example fork URL, branch, overlay paths, and model label are placeholders;
 edit them for the actual deployment before submitting. `campaign-validate`
 checks the experiment file locally. It cannot validate paths in the remote
 repository or cluster permissions.
+
+To follow progress from the laptop, run the printed watch command:
+
+```bash
+just campaign-watch campaign-output/<id>.json
+```
+
+It refreshes `campaign-output/<id>/campaigns/<id>/preview/index.html` every
+60 seconds — planned, running, and completed samples in one self-contained
+HTML, with live Nyann stage progress and completed AIPerf charts — and exits
+when the campaign finishes: 0 when completed, 1 when failed or stopped, 130 on
+Ctrl-C. Ctrl-C only detaches the watching; the campaign keeps running. A
+watch refresh that fails (Wi-Fi blip, pod churn) is retried after 60 seconds
+and never affects the campaign itself.
+
+To stop a running campaign, use the printed stop command:
+
+```bash
+just campaign-stop campaign-output/<id>.json
+```
+
+Deleting the campaign Job delivers SIGTERM to the runner, which unwinds
+through the same cleanup path as a failure: child benchmark Jobs are deleted,
+the serving overlay manifest is removed, the PVC summary is marked
+`cancelled` with a final report, and the campaign's ConfigMap is deleted on
+every exit path (the runner exits 130). The Job's termination grace period
+covers the whole cleanup window; if the runner was killed past it,
+`campaign-stop` reconciles the leftover Jobs, ConfigMap, and download pods
+itself and reports any serving Pods that still remain. Results already
+written to the PVC are kept.
+
+At any point, download results with the printed command:
+
+```bash
+just campaign-download campaign-output/<id>.json
+```
+
+While the campaign runs, it captures campaign status, individual Nyann stage
+progress, and completed AIPerf samples through the preview renderer and saves
+`~/Downloads/<id>-latest.html`; repeat it to refresh the file. After
+completion it downloads the campaign state and the AIPerf inputs needed by
+the final report generator, using resumable checked chunks, and saves the
+final self-contained report. If the JSON uses a Grafana service in another
+namespace, dashboards are exported from the laptop during the snapshot or
+final download. `--dest PATH` chooses another HTML destination.
+
+Downloads copy AIPerf report inputs and Nyann artifacts from the results PVC
+through an ephemeral PVC-mounted Pod in independently verified chunks. They
+start with 1 MiB chunks, double the size after four successful chunks (up to
+32 MiB), and halve it after a transfer or checksum failure. A `.part` file
+and checkpoint preserve verified chunks if the process exits. To pull the
+full raw artifact directories (including AIPerf traces, which the report
+download excludes) into the same local output, run:
+
+```bash
+just campaign-download-artifacts campaign-output/<id>.json \
+  campaign-output/<id>
+```
+
+The command discovers existing AIPerf and Nyann run directories for the
+configured campaign; a benchmark that did not run has no directory to fetch.
+To fetch one directory, use `campaign-download-artifact CONFIG REMOTE OUTPUT`
+with a path printed by the discovery command. Both commands create and remove
+a temporary PVC-mounted Pod. Repeating a download verifies saved chunks and
+downloads only what remains. The original artifact files stay on the PVC.
+
+If monitoring was added to the JSON after the campaign started, regenerate
+its final HTML locally after it finishes:
+
+```bash
+python3 campaign/run.py report-local campaign-output/<id>.json
+```
+
+This exports Grafana dashboards for completed AIPerf samples and Nyann
+stages, then rebuilds the existing chart report from the downloaded
+artifacts. The saved campaign identity check permits this monitoring
+addition. Each completed stage is scraped over its measured start/end
+timestamps (or its configured duration while the final summary is still
+pending); cached dashboards make later refreshes faster. Apply the PodMonitor
+before the benchmark so the historical vLLM series exist in Grafana. Nyann's
+JSON stage summary supplies TTFT, ITL, and end-to-end latency. The report
+also reads its request JSONL to calculate client-side TPOT per completed
+request as `(E2E − TTFT) / (output tokens − 1)`, excluding requests crossing
+stage boundaries and requests with fewer than two output tokens. The cluster
+download copies those JSONL files in checked chunks; completed stages gain
+TPOT once their request records are complete. The Nyann chart defaults to TPOT
+versus output throughput when all plotted stages have TPOT.
 
 The main example shows two builds (`branch0 + branch1 + branch2` and
 `branch0 + branch1 + branch3`) crossed with three overlays. Each overlay path
@@ -264,131 +344,7 @@ Kustomize renderer, but never contacts a Kubernetes API server. To test the
 configured source repo/ref instead, run `python3 campaign/run.py test-local
 <config> --output <new-directory>` without `--source-dir`.
 
-## Run from this checkout
-
-With `KUBECONFIG` set to the target cluster, run the live campaign from the
-local checkout without publishing a runner image:
-
-```bash
-export KUBECONFIG=~/.kube/config
-just campaign-run-local examples/campaign.glm52-h200.json /tmp/glm52-campaign-live
-```
-
-`campaign-run-local` keeps the orchestration process in the foreground while
-serving Pods and benchmark Jobs run on the cluster. To return to your shell
-immediately without publishing a runner image, use `campaign-start-local` with
-a fresh campaign ID and output directory:
-
-```bash
-jq '.id = "glm52-h200-pd-nightly-012"' \
-  examples/campaign.glm52-h200.json > /tmp/campaign.glm52-h200-012.json
-just campaign-start-local /tmp/campaign.glm52-h200-012.json \
-  /tmp/agentx-glm52-nightly-live-20261006-012
-```
-
-The detached runner inherits `KUBECONFIG`, writes progress to
-`<output-directory>.log`, and writes campaign state under the output directory.
-Use `campaign-stop-local` with the same config and output path to stop it.
-
-To terminate that run from another terminal, pass the same configuration and
-output directory to `campaign-stop-local`:
-
-```bash
-just campaign-stop-local /tmp/campaign.glm52-h200-010.json \
-  /tmp/agentx-glm52-nightly-live-20261006-010
-```
-
-This signals only the matching local runner, removes benchmark Jobs whose
-annotated run IDs belong to the campaign, waits for the runner's overlay
-cleanup, and records `cancelled` in `summary.json`. It keeps downloaded
-artifacts and reports. If the runner already exited but left `running` in the
-summary, the same command reconciles that stale status. If serving Pods remain,
-it reports a cleanup error without deleting resources from another run.
-
-While the sweep runs, use the single preview HTML to see planned, running,
-and completed samples. The final `index.html` is generated when the run finishes.
-
-To keep that preview updated throughout the campaign, run this in another terminal:
-
-```bash
-export KUBECONFIG=~/.kube/config
-python3 campaign/run.py preview-local examples/campaign.glm52-h200.json --output /tmp/glm52-campaign-live --watch
-open /tmp/glm52-campaign-live/campaigns/glm52-h200-pd-nightly-009/preview/index.html
-```
-
-The command updates `preview/index.html` every minute; the open page reloads
-periodically. Its progress table shows active and pending samples even before
-the first result finishes. Completed AIPerf results use the existing chart
-renderer and Grafana exporter. On success, the preview file becomes the final
-self-contained report; on failure, it retains the last partial preview.
-Copy `preview/index.html` to download a standalone snapshot at any time.
-Omit `--watch` to take one snapshot. A sample with no
-scraped vLLM metrics keeps its AIPerf charts and displays a missing-monitoring
-notice instead of an empty per-run Grafana dashboard. The monitoring overlay
-still includes any available GPU or other time series for that sample and
-labels its missing vLLM coverage.
-
-For a one-shot download of the latest state, run:
-
-```bash
-export KUBECONFIG=~/.kube/config
-just campaign-download-latest examples/campaign.glm52-h200.json /tmp/glm52-campaign-live
-```
-
-This refreshes a running campaign before saving `~/Downloads/<campaign-id>-latest.html`.
-For a completed campaign it copies the final report; for a failed campaign it
-copies the last partial preview. The Python command also accepts `--dest PATH`.
-
-The local runner downloads AIPerf report inputs and Nyann artifacts from the
-results PVC in independently verified chunks. It starts with 1 MiB chunks,
-doubles the size after four successful chunks (up to 32 MiB), and halves it
-after a transfer or checksum failure. A `.part` file and checkpoint preserve
-verified chunks if the process exits. To resume a PVC artifact directory into
-the same local output after an interrupted campaign, run:
-
-```bash
-just campaign-download-artifacts examples/campaign.glm52-h200.json \
-  /tmp/glm52-campaign-live
-```
-
-The command discovers existing AIPerf and Nyann run directories for the
-configured campaign; a benchmark that did not run has no directory to fetch.
-To fetch one directory, use `campaign-download-artifact CONFIG REMOTE OUTPUT`
-with a path printed by the discovery command. Both commands create and remove
-a temporary PVC-mounted Pod. Repeating a download verifies saved chunks and
-downloads only what remains. The original artifact files stay on the PVC.
-AIPerf's raw traces are still excluded from the automatic report download;
-these commands retrieve them explicitly.
-
-If monitoring was added to the JSON after a `run-local` campaign started,
-regenerate its final HTML after the campaign finishes:
-
-```bash
-python3 campaign/run.py report-local examples/campaign.glm52-h200.json --output /tmp/glm52-campaign-live
-```
-
-This exports Grafana dashboards for completed AIPerf samples and Nyann stages,
-then rebuilds the existing chart report from the saved local artifacts. For a
-running Nyann campaign, add the `monitoring` block to the local JSON and run
-`campaign-download-cluster` again. The saved campaign identity check permits
-this monitoring addition. Each completed stage is scraped over its measured
-start/end timestamps (or its configured duration while the final summary is
-still pending); cached dashboards make later refreshes faster. Apply the
-PodMonitor before the benchmark so the historical vLLM series exist in Grafana.
-Nyann's JSON stage summary supplies TTFT, ITL, and end-to-end latency. The
-report also reads its request JSONL to calculate client-side TPOT per completed
-request as `(E2E − TTFT) / (output tokens − 1)`, excluding requests crossing
-stage boundaries and requests with fewer than two output tokens. The cluster
-download copies those JSONL files in checked chunks; completed stages gain
-TPOT once their request records are complete. The Nyann chart defaults to TPOT
-versus output throughput when all plotted stages have TPOT.
-
-The orchestrator applies one serving overlay at a time and submits the AIPerf
-and nyann Jobs to the cluster. A temporary Pod mounts `results_pvc` so completed
-benchmark artifacts can be copied into the local output directory. The final
-HTML and summary are written locally; the temporary Pod is removed at the end.
-Choose a new campaign ID and an output directory that does not yet exist for
-each run.
+### Legacy per-overlay builds
 
 For a legacy single-overlay campaign without top-level
 `builds`, an overlay may still have its own `build` field:
@@ -435,6 +391,11 @@ unchanged. A failed or timed-out benchmark is marked failed; a timed-out child
 Job is deleted before overlay cleanup. Cleanup always attempts to delete the
 saved rendered manifest and waits for serving Pods to disappear. If cleanup
 fails, the campaign stops to avoid deploying another overlay on top of it.
+Poll loops tolerate transient kubectl failures for up to five minutes, so a
+connectivity blip cannot fail a healthy in-flight benchmark. On SIGTERM
+(`campaign-stop`), the runner cancels its children, cleans up the same way,
+records `cancelled`, and exits 130; its ConfigMap is deleted on every exit
+path.
 
 ```bash
 kubectl -n vllm get job campaign-example-overlay-sweep-001

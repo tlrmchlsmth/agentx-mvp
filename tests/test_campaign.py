@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import importlib.util
 import base64
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 import os
 import re
 import shlex
 import signal
 import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -79,65 +81,183 @@ def run_harness(root, *, call, kube, submit, extra=()):
 
 
 class CampaignTests(unittest.TestCase):
-    def test_start_local_detaches_runner_and_keeps_log(self):
+    def test_display_path_prefers_working_directory_relative(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config_path = root / "config.json"
-            config_path.write_text("{}")
-            output = root / "results"
-            process = SimpleNamespace(pid=321, poll=lambda: None)
-            with patch.object(runner.subprocess, "Popen", return_value=process) as spawn, \
-                 patch.object(runner.time, "sleep"):
-                log = runner.start_local(config_path, output, "test-campaign")
-            self.assertEqual(log, root.resolve() / "results.log")
-            self.assertTrue(log.is_file())
-            self.assertFalse(output.exists())  # The mocked child has not started yet.
-            args = spawn.call_args.args[0]
-            self.assertEqual(args[2:4], ["run-local", str(config_path.resolve())])
-            self.assertEqual(args[-2:], ["--output", str(output.resolve())])
-            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+            original = os.getcwd()
+            os.chdir(directory)
+            try:
+                self.assertEqual(runner.display_path(Path.cwd() / "out"), "out")
+                self.assertEqual(runner.display_path(Path("/not-under-cwd")), "/not-under-cwd")
+            finally:
+                os.chdir(original)
 
-    def test_stop_local_targets_exact_runner_and_marks_cancelled(self):
+    def test_write_derived_config_places_copy_beside_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
-            config_path = root / "config.json"
-            config_path.write_text(json.dumps(config))
-            output = root / "output"
-            campaign = local_campaign(output, config, {"id": config["id"], "status": "running",
-                                                       "overlays": [{"name": "baseline", "status": "running",
-                                                                     "benchmarks": []}]})
-            process = (f"1234 python3 {MODULE_PATH} run-local {config_path} --output {output}\n"
-                       f"5678 python3 {MODULE_PATH} run-local {config_path} --output /tmp/other\n")
-            with patch.object(runner, "call", return_value=SimpleNamespace(stdout=process)):
-                self.assertEqual(runner.local_runner_pids(output, config_path), [1234])
-            actions = []
-            with patch.object(runner, "local_runner_pids", side_effect=[[1234], [], []]), \
-                 patch.object(runner.os, "kill", side_effect=lambda pid, sig: actions.append((pid, sig))), \
-                 patch.object(runner, "delete_campaign_benchmark_jobs", side_effect=lambda value: actions.append("jobs")), \
-                 patch.object(runner, "kube", return_value=SimpleNamespace(returncode=0)), \
-                 patch.object(runner, "snapshot", return_value=[]):
-                runner.stop_local(config, output, config_path)
-            self.assertEqual(actions, [(1234, signal.SIGINT), "jobs"])
-            self.assertEqual(json.loads((campaign / "summary.json").read_text())["status"], "cancelled")
+            output = root / "out"
+            derived = runner.write_derived_config(config, output)
+            self.assertEqual(derived, root / "out.json")
+            self.assertTrue(derived.is_file())
+            self.assertEqual(json.loads(derived.read_text()), config)
 
-    def test_stop_local_reconciles_orphaned_running_summary(self):
+    def test_main_submit_fresh_writes_timestamped_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(self.config(root)))
+            output = root / "out"
+            with patch.object(runner, "submit") as submitted, \
+                 patch.object(sys, "argv", ["run.py", "submit", str(config_path), "--image",
+                                            "registry.example/campaign:sha", "--fresh",
+                                            "--output", str(output)]):
+                self.assertEqual(runner.main(), 0)
+            submitted_config = submitted.call_args.args[0]
+            self.assertRegex(submitted_config["id"], r"^test-campaign-\d{8}-\d{4}$")
+            derived = output.with_name("out.json")
+            self.assertEqual(submitted.call_args.kwargs["config_path"], derived)
+            self.assertEqual(json.loads(derived.read_text())["id"], submitted_config["id"])
+            self.assertEqual(json.loads(config_path.read_text())["id"], "test-campaign")
+
+    def test_main_fresh_defaults_output_under_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(self.config(root)))
+            with patch.object(runner, "submit") as submitted, \
+                 patch.object(runner, "ROOT", root), \
+                 patch.object(sys, "argv", ["run.py", "submit", str(config_path), "--image",
+                                            "registry.example/campaign:sha", "--fresh"]):
+                self.assertEqual(runner.main(), 0)
+            submitted_config = submitted.call_args.args[0]
+            output = root / "campaign-output" / submitted_config["id"]
+            self.assertEqual(submitted.call_args.kwargs["config_path"],
+                             output.with_name(output.name + ".json"))
+
+    def test_main_no_monitoring_strips_block_for_submit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
+            config["monitoring"] = {"grafana_namespace": "llm-d-monitoring",
+                                    "grafana_service": "llmd-grafana",
+                                    "auth_secret": "llmd-grafana",
+                                    "dashboard_uid": "wideep-overview"}
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
-            campaign = local_campaign(root / "output", config,
-                                      {"id": config["id"], "status": "running", "overlays": []})
-            actions = []
-            with patch.object(runner, "local_runner_pids", return_value=[]), \
-                 patch.object(runner.os, "kill", side_effect=AssertionError("must not signal another process")), \
-                 patch.object(runner, "delete_campaign_benchmark_jobs", side_effect=lambda value: actions.append("jobs")), \
-                 patch.object(runner, "kube", return_value=SimpleNamespace(returncode=0)), \
-                 patch.object(runner, "snapshot", return_value=[]):
-                runner.stop_local(config, root / "output", config_path)
-            self.assertEqual(actions, ["jobs"])
-            self.assertEqual(json.loads((campaign / "summary.json").read_text())["status"], "cancelled")
+            output = root / "out"
+            with patch.object(runner, "submit") as submitted, \
+                 patch.object(sys, "argv", ["run.py", "submit", str(config_path), "--image",
+                                            "registry.example/campaign:sha", "--no-monitoring",
+                                            "--output", str(output)]):
+                self.assertEqual(runner.main(), 0)
+            self.assertNotIn("monitoring", submitted.call_args.args[0])
+            self.assertNotIn("monitoring", json.loads(output.with_name("out.json").read_text()))
+            self.assertIn("monitoring", json.loads(config_path.read_text()))
+
+    def test_main_no_monitoring_without_output_defaults_under_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config["monitoring"] = {"grafana_namespace": "llm-d-monitoring",
+                                    "grafana_service": "llmd-grafana",
+                                    "auth_secret": "llmd-grafana",
+                                    "dashboard_uid": "wideep-overview"}
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config))
+            with patch.object(runner, "submit") as submitted, \
+                 patch.object(runner, "ROOT", root), \
+                 patch.object(sys, "argv", ["run.py", "submit", str(config_path), "--image",
+                                            "registry.example/campaign:sha", "--no-monitoring"]):
+                self.assertEqual(runner.main(), 0)
+            self.assertNotIn("monitoring", submitted.call_args.args[0])
+            derived = root / "campaign-output" / "test-campaign.json"
+            self.assertEqual(submitted.call_args.kwargs["config_path"], derived)
+            self.assertNotIn("monitoring", json.loads(derived.read_text()))
+
+    def test_main_fresh_rejected_outside_submit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(self.config(root)))
+            with patch.object(sys, "argv", ["run.py", "validate", str(config_path), "--fresh"]):
+                self.assertEqual(runner.main(), 1)
+
+    def test_main_watch_cluster_defaults_output_under_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(self.config(root)))
+            with patch.object(runner, "watch_cluster", return_value=0) as watch, \
+                 patch.object(runner, "ROOT", root), \
+                 patch.object(sys, "argv", ["run.py", "watch-cluster", str(config_path)]):
+                self.assertEqual(runner.main(), 0)
+            watch.assert_called_once()
+            self.assertEqual(watch.call_args.args[0]["id"], "test-campaign")
+            self.assertEqual(watch.call_args.args[1], root / "campaign-output" / "test-campaign")
+            self.assertIsNone(watch.call_args.args[2])
+
+    def test_main_dispatches_stop_cluster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(self.config(root)))
+            with patch.object(runner, "stop_cluster") as stop, \
+                 patch.object(sys, "argv", ["run.py", "stop-cluster", str(config_path)]):
+                self.assertEqual(runner.main(), 0)
+            stop.assert_called_once()
+            self.assertEqual(stop.call_args.args[0]["id"], "test-campaign")
+
+    def test_main_rejects_removed_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(self.config(root)))
+            for action in ("run-local", "start-local", "stop-local", "preview-local", "download-latest"):
+                with self.subTest(action=action), \
+                     patch.object(sys, "argv", ["run.py", action, str(config_path)]), \
+                     redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        runner.main()
+
+    def test_stop_cluster_deletes_job_children_and_configmap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            commands = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                self.assertEqual(namespace, "vllm")
+                commands.append(args)
+                stdout = '{"items": []}' if args[:2] == ("get", "jobs") else ""
+                return SimpleNamespace(stdout=stdout, returncode=0, stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "snapshot", return_value=[]), \
+                 redirect_stdout(io.StringIO()) as captured:
+                runner.stop_cluster(config)
+            # The job delete outlives the Pod's SIGTERM-to-SIGKILL window.
+            self.assertEqual(commands, [
+                ("delete", "job", "campaign-test-campaign", "--ignore-not-found", "--wait=true", "--timeout=240s"),
+                ("get", "jobs", "-o", "json"),
+                ("delete", "configmap", "campaign-test-campaign", "--ignore-not-found"),
+                ("delete", "pods", "-l", "app.kubernetes.io/name=benchmark-campaign-download",
+                 "--ignore-not-found", "--wait=true", "--timeout=60s"),
+            ])
+            self.assertIn("results remain on results", captured.getvalue())
+
+    def test_stop_cluster_reports_leftover_serving_pods(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+
+            def fake_kube(namespace, *args, **kwargs):
+                stdout = '{"items": []}' if args[:2] == ("get", "jobs") else ""
+                return SimpleNamespace(stdout=stdout, returncode=0, stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "snapshot", side_effect=[["pod-a"], []]):
+                with self.assertRaisesRegex(runner.CleanupError, "Serving Pods remain: pod-a"):
+                    runner.stop_cluster(config)
 
     def test_stop_deletes_only_jobs_with_exact_campaign_run_ids(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -163,17 +283,53 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(len(deletions), 1)
             self.assertEqual(deletions[0][:3], ("delete", "job", "campaign-job"))
 
-    def test_preview_watch_exits_when_campaign_is_cancelled(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = self.config(root)
-            local_campaign(root, config, {"status": "cancelled"}, saved=False)
-            self.assertEqual(runner.watch_preview_local(config, root), 1)
-
     def test_kubectl_logs_replace_invalid_utf8(self):
         with patch.object(runner, "call", return_value=SimpleNamespace(stdout="")) as command:
             runner.kube("vllm", "logs", "job/example")
         self.assertEqual(command.call_args.kwargs["errors"], "replace")
+
+    def test_kube_eventually_retries_transient_failures(self):
+        attempts = []
+        sleeps = []
+
+        def fake_kube(namespace, *args, **kwargs):
+            attempts.append(args[0])
+            if len(attempts) < 3:
+                raise RuntimeError("Unable to connect to the server: connection refused")
+            return SimpleNamespace(stdout="ok", returncode=0, stderr="")
+
+        with patch.object(runner, "kube", side_effect=fake_kube), \
+             patch.object(runner.time, "sleep", side_effect=sleeps.append):
+            self.assertEqual(runner.kube_eventually("vllm", "get", "pods").stdout, "ok")
+        self.assertEqual(attempts, ["get", "get", "get"])
+        self.assertEqual(sleeps, [5, 10])
+
+    def test_kube_eventually_fails_after_retry_budget(self):
+        sleeps = []
+
+        def fake_kube(namespace, *args, **kwargs):
+            raise RuntimeError("Unable to connect to the server: connection refused")
+
+        with patch.object(runner, "kube", side_effect=fake_kube), \
+             patch.object(runner.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaisesRegex(RuntimeError, "connection refused"):
+                runner.kube_eventually("vllm", "get", "pods", timeout=0)
+        self.assertEqual(sleeps, [])
+
+    def test_kube_eventually_does_not_retry_real_answers(self):
+        for message in ("Error from server (NotFound)",
+                        "error: timed out waiting for the condition"):
+            with self.subTest(message=message):
+                sleeps = []
+
+                def fake_kube(namespace, *args, **kwargs):
+                    raise RuntimeError(message)
+
+                with patch.object(runner, "kube", side_effect=fake_kube), \
+                     patch.object(runner.time, "sleep", side_effect=sleeps.append):
+                    with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                        runner.kube_eventually("vllm", "get", "job", "missing")
+                self.assertEqual(sleeps, [])
 
     def config(self, root: Path):
         for name in ("baseline", "candidate"):
@@ -272,7 +428,8 @@ class CampaignTests(unittest.TestCase):
                                                  side_effect=lambda rendered, image: rendered),)):
                 self.assertEqual(runner.run(config, root), 0, (root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(actions, ["render:baseline", "check", "apply", "get", "benchmark:baseline", "delete",
-                                       "render:candidate", "check", "apply", "get", "benchmark:candidate", "delete"])
+                                       "render:candidate", "check", "apply", "get", "benchmark:candidate",
+                                       "delete", "delete"])
             summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(summary["status"], "completed")
             self.assertEqual(summary["source_commit"], "a" * 40)
@@ -452,7 +609,8 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(actions, ["render:baseline", "apply", "benchmark:nightly-baseline", "delete",
                                        "render:candidate", "apply", "benchmark:nightly-candidate", "delete",
                                        "render:baseline", "apply", "benchmark:v0-11-0-baseline", "delete",
-                                       "render:candidate", "apply", "benchmark:v0-11-0-candidate", "delete"])
+                                       "render:candidate", "apply", "benchmark:v0-11-0-candidate", "delete",
+                                       "delete"])
             summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(summary["planned_deployments"], 4)
             self.assertEqual(summary["vllm_image"], "")
@@ -651,7 +809,8 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(runner.run(config, root), 0)
             self.assertEqual(actions, ["render:router",
                                        "render:baseline", "apply", "wait:wide-ep-epp", "benchmark:baseline", "delete",
-                                       "render:candidate", "apply", "wait:wide-ep-epp", "benchmark:candidate", "delete"])
+                                       "render:candidate", "apply", "wait:wide-ep-epp", "benchmark:candidate",
+                                       "delete", "delete"])
             combined = (root / "campaigns/test-campaign/baseline/manifest.yaml").read_text()
             self.assertIn("name: wide-ep-epp", combined)
             self.assertIn(config["vllm_image"], combined)
@@ -683,68 +842,63 @@ class CampaignTests(unittest.TestCase):
                 self.assertIn("name: wide-ep-epp", combined)
                 self.assertIn(config["vllm_image"], combined)
 
-    def test_live_local_runner_copies_pvc_artifacts_and_removes_helper(self):
+    def test_run_sigterm_cancels_children_marks_summary_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
-            output = root / "live-output"
             actions = []
+            calls = []
+            manifest = MARKER_MANIFEST
+
+            def fake_call(args, **kwargs):
+                self.assertEqual(args[:2], ["kubectl", "kustomize"])
+                actions.append("render:" + Path(args[2]).name)
+                return SimpleNamespace(stdout=manifest, returncode=0)
 
             def fake_kube(namespace, *args, **kwargs):
                 self.assertEqual(namespace, "vllm")
+                calls.append(args)
+                if args[0] == "get":
+                    actions.append("check" if "-f" in args else "get")
+                    stdout = '{"items": []}' if args[1] == "jobs" else ""
+                    return SimpleNamespace(stdout=stdout, returncode=0, stderr="")
                 actions.append(args[0])
-                if args[0] == "create":
-                    pod = json.loads(kwargs["input_text"])
-                    self.assertEqual(pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"], "results")
-                if args[0] == "exec":
-                    return SimpleNamespace(stdout="/workload/aiperf-agentx/sample/c1/profile_export_aiperf.json\n",
-                                           stderr="", returncode=0)
                 return SimpleNamespace(stdout="", stderr="", returncode=0)
 
-            def fake_download(namespace, pod, remote, destination):
-                actions.append("download")
-                destination.write_text("{}")
-                return destination
+            def fake_submit(config, overlay, bench, folder, baseline, commit, source_commit):
+                actions.append("benchmark:" + overlay["name"])
+                # A real signal: the handler must unwind the run, not the harness.
+                os.kill(os.getpid(), signal.SIGTERM)
+                raise AssertionError("the SIGTERM handler must interrupt the benchmark")
 
-            def fake_run(value, results_root, artifact_fetcher=None):
-                self.assertEqual(results_root, output.resolve())
-                self.assertIsNotNone(artifact_fetcher)
-                copied = artifact_fetcher(Path("/workload/aiperf-agentx/sample"))
-                self.assertEqual(copied, output.resolve() / "aiperf-agentx/sample")
-                self.assertTrue(copied.is_dir())
-                self.assertTrue((copied / "c1/profile_export_aiperf.json").is_file())
-                self.assertFalse((copied / "c1/profile_export_raw.jsonl").exists())
-                return 0
+            with run_harness(root, call=fake_call, kube=fake_kube, submit=fake_submit,
+                             extra=(patch.object(runner, "apply_vllm_image",
+                                                 side_effect=lambda rendered, image: rendered),
+                                    patch.object(runner, "write_final_report",
+                                                 side_effect=lambda destination, summary: actions.append("report")))):
+                self.assertEqual(runner.run(config, root), 130)
+            self.assertEqual(actions, ["render:baseline", "check", "apply", "get",
+                                       "benchmark:baseline", "delete", "get", "report", "delete"])
+            # The ConfigMap (the Job's code bundle) is removed on every exit path.
+            self.assertEqual(calls[-1], ("delete", "configmap", "campaign-test-campaign", "--ignore-not-found"))
+            summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
+            self.assertEqual(summary["status"], "cancelled")
+            self.assertEqual(summary["overlays"][0]["status"], "cancelled")
 
-            with patch.object(runner, "kube", side_effect=fake_kube), \
-                 patch.object(runner.TRANSFER, "download_file", side_effect=fake_download), \
-                 patch.object(runner, "run", side_effect=fake_run):
-                self.assertEqual(runner.run_local(config, output), 0)
-            self.assertEqual(actions, ["get", "get", "create", "wait", "exec", *(["download"] * 6), "delete"])
-
-    def test_local_interrupt_marks_campaign_cancelled_and_removes_helper(self):
+    def test_cancel_stopped_campaign_preserves_finished_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
-            output = root / "output"
+            campaign = local_campaign(root, config, {"id": config["id"], "status": "completed",
+                                                     "overlays": []})
             actions = []
-
-            def fake_kube(namespace, *args, **kwargs):
-                actions.append(args[0])
-                return SimpleNamespace(returncode=0, stderr="", stdout="")
-
-            def fake_run(value, results_root, artifact_fetcher=None):
-                local_campaign(results_root, config, {"id": config["id"], "status": "running",
-                                                      "overlays": []}, saved=False)
-                raise KeyboardInterrupt
-
-            with patch.object(runner, "kube", side_effect=fake_kube), \
-                 patch.object(runner, "run", side_effect=fake_run), \
-                 patch.object(runner, "delete_campaign_benchmark_jobs", side_effect=lambda value: actions.append("jobs")):
-                self.assertEqual(runner.run_local(config, output), 130)
-            self.assertEqual(actions, ["get", "get", "create", "wait", "jobs", "delete"])
-            summary = json.loads((output / "campaigns" / config["id"] / "summary.json").read_text())
-            self.assertEqual(summary["status"], "cancelled")
+            with patch.object(runner, "delete_campaign_benchmark_jobs",
+                              side_effect=lambda value: actions.append("jobs")), \
+                 patch.object(runner, "write_final_report",
+                              side_effect=AssertionError("must not rewrite a finished report")):
+                self.assertEqual(runner.cancel_stopped_campaign(config, campaign), 130)
+            self.assertEqual(actions, ["jobs"])
+            self.assertEqual(json.loads((campaign / "summary.json").read_text())["status"], "completed")
 
     def test_download_artifacts_uses_temporary_pvc_pod_and_existing_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -759,6 +913,8 @@ class CampaignTests(unittest.TestCase):
                 if args[0] == "create":
                     pod = json.loads(kwargs["input_text"])
                     self.assertEqual(pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"], "results")
+                    self.assertEqual(pod["metadata"]["labels"],
+                                     {"app.kubernetes.io/name": "benchmark-campaign-download"})
                 if args[0] == "exec":
                     return SimpleNamespace(returncode=0, stderr="", stdout=(
                         "/workload/aiperf-agentx/test-campaign-baseline-aiperf\n"))
@@ -823,8 +979,11 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             output = Path(directory) / "output"
+            created = []
 
             def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "create":
+                    created.append(json.loads(kwargs["input_text"]))
                 stdout = '{"id":"test-campaign","status":"running","overlays":[]}' if args[0] == "exec" else ""
                 return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
@@ -842,9 +1001,107 @@ class CampaignTests(unittest.TestCase):
                 runner.download_cluster_report(config, output)
                 tree.assert_not_called()
                 report.assert_not_called()
+                self.assertEqual(created[0]["metadata"]["labels"],
+                                 {"app.kubernetes.io/name": "benchmark-campaign-download"})
                 self.assertEqual(preview.call_args.kwargs["pod_name"].startswith("campaign-download-"), True)
-                self.assertFalse(latest.call_args.kwargs["refresh_running"])
+                latest.assert_called_once_with(config, output, None)
             self.assertEqual(json.loads((output / "campaigns/test-campaign/summary.json").read_text())["status"], "running")
+
+    def test_watch_cluster_previews_running_then_downloads_completed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            output = root / "output"
+            states = [{"status": "running"}, {"status": "completed"}]
+            events = []
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "create":
+                    pod = json.loads(kwargs["input_text"])
+                    self.assertEqual(pod["metadata"]["labels"],
+                                     {"app.kubernetes.io/name": "benchmark-campaign-download"})
+                if args[0] == "get":
+                    return SimpleNamespace(stdout=f"job/batch/campaign-{config['id']}",
+                                           returncode=0, stderr="")
+                return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+            def fake_state(value, out, pod_name, *, auto_refresh=False):
+                events.append(("state", auto_refresh))
+                return states.pop(0)
+
+            def fake_download(value, out, destination=None):
+                events.append(("download", destination))
+                return root / "latest.html"
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "fetch_running_cluster_state", side_effect=fake_state), \
+                 patch.object(runner, "download_cluster_report", side_effect=fake_download), \
+                 patch.object(runner.time, "sleep"):
+                self.assertEqual(runner.watch_cluster(config, output), 0)
+            self.assertEqual(events, [("state", True), ("state", True), ("download", None)])
+
+    def test_watch_cluster_downloads_failed_campaign_and_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "get":
+                    return SimpleNamespace(stdout=f"job/batch/campaign-{config['id']}",
+                                           returncode=0, stderr="")
+                return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "fetch_running_cluster_state",
+                              return_value={"status": "failed"}), \
+                 patch.object(runner, "download_cluster_report", return_value=root / "latest.html"), \
+                 patch.object(runner.time, "sleep"):
+                self.assertEqual(runner.watch_cluster(config, root / "output"), 1)
+
+    def test_watch_cluster_retries_transient_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            states = [RuntimeError("Wi-Fi blip: connection refused"), {"status": "completed"}]
+
+            def fake_state(value, out, pod_name, *, auto_refresh=False):
+                item = states.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "get":
+                    return SimpleNamespace(stdout=f"job/batch/campaign-{config['id']}",
+                                           returncode=0, stderr="")
+                return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "fetch_running_cluster_state", side_effect=fake_state), \
+                 patch.object(runner, "download_cluster_report", return_value=root / "latest.html"), \
+                 patch.object(runner.time, "sleep"):
+                self.assertEqual(runner.watch_cluster(config, root / "output"), 0)
+
+    def test_watch_cluster_exits_when_job_disappears_without_final_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            clock = [0.0]
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[0] == "get":
+                    return SimpleNamespace(stdout="", returncode=0, stderr="")
+                return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 patch.object(runner, "fetch_running_cluster_state",
+                              return_value={"status": "running"}), \
+                 patch.object(runner.time, "monotonic", side_effect=lambda: clock[0]), \
+                 patch.object(runner.time, "sleep",
+                              side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                 redirect_stderr(io.StringIO()) as captured:
+                self.assertEqual(runner.watch_cluster(config, root / "output"), 1)
+            self.assertIn("killed during cleanup", captured.getvalue())
 
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1227,7 +1484,7 @@ class CampaignTests(unittest.TestCase):
 
             with patch.object(runner, "kube", side_effect=fake_kube), \
                  patch.object(runner.TRANSFER, "download_file", side_effect=fake_download):
-                self.assertEqual(runner.preview_local(config, root), 0)
+                self.assertEqual(runner.preview_local(config, root, pod_name="helper"), 0)
             self.assertEqual(len(copy_attempts), 1)
             page = (campaign / "preview/index.html").read_text()
             self.assertIn("<h1>Campaign test-campaign</h1>", page)
@@ -1257,7 +1514,7 @@ class CampaignTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout="" if "-name" in args or "test" in args else remote + "\n")
 
             with patch.object(runner, "kube", side_effect=fake_kube):
-                self.assertEqual(runner.preview_local(config, root, auto_refresh=True), 0)
+                self.assertEqual(runner.preview_local(config, root, pod_name="helper", auto_refresh=True), 0)
             page = (campaign / "preview/index.html").read_text()
             self.assertIn("<td>baseline</td><td>aiperf</td><td>c1</td><td>running</td>", page)
             self.assertIn("<td>candidate</td><td>aiperf</td><td>c1</td><td>pending</td>", page)
@@ -1317,7 +1574,7 @@ class CampaignTests(unittest.TestCase):
                 raise AssertionError(args)
 
             with patch.object(runner, "kube", side_effect=fake_kube):
-                self.assertEqual(runner.preview_local(config, root), 0)
+                self.assertEqual(runner.preview_local(config, root, pod_name="helper"), 0)
             page = (campaign / "preview/index.html").read_text()
             chart = re.search(r"const CONFIGS = (\{.*?\});", page)
             self.assertIsNotNone(chart)
@@ -1339,21 +1596,8 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("600 s/stage · warmup 60 s at c32", page)
             self.assertIn("ghcr.io/neuralmagic/nyann-bench:latest", page)
 
-    def test_failed_campaign_keeps_last_partial_preview(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = self.config(root)
-            campaign = root / "campaigns" / config["id"]
-            preview = campaign / "preview"
-            preview.mkdir(parents=True)
-            (campaign / "summary.json").write_text(json.dumps({"status": "failed"}))
-            (campaign / "index.html").write_text("minimal final report")
-            (preview / "index.html").write_text("completed sample charts")
-            self.assertEqual(runner.watch_preview_local(config, root), 1)
-            self.assertEqual((preview / "index.html").read_text(), "completed sample charts")
-
     def test_download_latest_selects_live_partial_or_final_report(self):
-        for status, expected in (("running", "refreshed preview"),
+        for status, expected in (("running", "partial preview"),
                                  ("failed", "final report"),
                                  ("completed", "final report")):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
@@ -1367,13 +1611,11 @@ class CampaignTests(unittest.TestCase):
                 (preview / "index.html").write_text("partial preview")
                 (campaign / "index.html").write_text("final report")
 
-                def refresh(*args):
-                    (preview / "index.html").write_text("refreshed preview")
-
                 destination = root / "Downloads" / "latest.html"
-                with patch.object(runner, "preview_local", side_effect=refresh) as refresh_call:
-                    self.assertEqual(runner.download_latest_local(config, root, destination), destination.resolve())
-                self.assertEqual(refresh_call.call_count, 1 if status == "running" else 0)
+                with patch.object(runner, "preview_local") as refresh:
+                    self.assertEqual(runner.download_latest_local(config, root, destination),
+                                     destination.resolve())
+                refresh.assert_not_called()
                 self.assertEqual(destination.read_text(), expected)
 
     def test_monitoring_overlay_includes_partial_gpu_data_and_excludes_empty_samples(self):
@@ -1414,7 +1656,8 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "branch, tag, or commit"):
                 runner.load_config(path)
             config["source"]["ref"] = "feature/bench"
-            with patch.object(runner, "fetch_source", side_effect=RuntimeError("ref not found")):
+            with patch.object(runner, "fetch_source", side_effect=RuntimeError("ref not found")), \
+                 patch.object(runner, "kube"):
                 with self.assertRaisesRegex(RuntimeError, "ref not found"):
                     runner.run(config, root)
             summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
@@ -1919,6 +2162,48 @@ class CampaignTests(unittest.TestCase):
             self.assertIn({"name": "tools", "mountPath": "/tools", "readOnly": True},
                           pod["containers"][0]["volumeMounts"])
 
+    def test_submit_sets_termination_grace_period(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            created = []
+
+            with patch.object(runner, "kube", side_effect=capturing_kube(created, namespace="vllm")):
+                runner.submit(config, "registry.example/campaign:sha", "benchmark-campaign")
+            pod = created[1]["spec"]["template"]["spec"]
+            # The SIGTERM handler gets the full cleanup window before SIGKILL.
+            self.assertEqual(pod["terminationGracePeriodSeconds"], config["cleanup_timeout_seconds"] + 60)
+
+    def test_submit_prints_follow_up_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config_path = root / "campaign.json"
+            original = os.getcwd()
+            os.chdir(root)
+            try:
+                with patch.object(runner, "kube",
+                                  return_value=SimpleNamespace(stdout="", stderr="", returncode=0)), \
+                     redirect_stdout(io.StringIO()) as captured:
+                    runner.submit(config, "registry.example/campaign:sha", "benchmark-campaign")
+                text = captured.getvalue()
+                self.assertIn("Campaign test-campaign queued in the cluster (vllm/campaign-test-campaign)", text)
+                self.assertIn("kubectl -n vllm get job campaign-test-campaign", text)
+                self.assertIn("kubectl -n vllm logs -f job/campaign-test-campaign", text)
+                self.assertNotIn("just campaign-watch", text)
+
+                with patch.object(runner, "kube",
+                                  return_value=SimpleNamespace(stdout="", stderr="", returncode=0)), \
+                     redirect_stdout(io.StringIO()) as captured:
+                    runner.submit(config, "registry.example/campaign:sha", "benchmark-campaign",
+                                  config_path=config_path)
+                text = captured.getvalue()
+                self.assertIn("just campaign-watch campaign.json", text)
+                self.assertIn("just campaign-stop campaign.json", text)
+                self.assertIn("just campaign-download campaign.json", text)
+                self.assertIn("The run survives laptop disconnects", text)
+            finally:
+                os.chdir(original)
+
     def test_cleanup_failure_stops_before_next_overlay(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1941,7 +2226,7 @@ class CampaignTests(unittest.TestCase):
                  patch.object(runner, "snapshot", return_value=[]), \
                  patch.object(runner, "wait_ready", side_effect=RuntimeError("not ready")):
                 self.assertEqual(runner.run(config, root), 1)
-            self.assertEqual(actions, ["get", "apply", "delete"])
+            self.assertEqual(actions, ["get", "apply", "delete", "delete"])
             summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(len(summary["overlays"]), 1)
             self.assertEqual(summary["overlays"][0]["cleanup_error"], "teardown failed")

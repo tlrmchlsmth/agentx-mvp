@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 
@@ -74,6 +74,15 @@ PLOTLY_BUNDLE = ROOT / "live-aiperf" / "plotly-basic-2.35.2.min.js.gz"
 
 class CleanupError(RuntimeError):
     """A running child workload or deployment might still exist."""
+
+
+class CampaignStopped(BaseException):
+    """SIGTERM asked the in-cluster runner to stop; unwind and cancel.
+
+    Not an ``Exception`` on purpose: the case loop and ``submit_benchmark``
+    catch ``Exception`` to record benchmark failures, and a stop must not be
+    misrecorded as one.
+    """
 
 
 def call(args: list[str], *, input_text: str | None = None, env: dict[str, str] | None = None,
@@ -509,8 +518,39 @@ def kube(namespace: str, *args: str, **kwargs: Any) -> subprocess.CompletedProce
     return call(["kubectl", "-n", namespace, *args], **kwargs)
 
 
+# How long a poll-loop kubectl call keeps retrying through transient failures
+# (laptop Wi-Fi blips, API-server hiccups) before giving up for real.
+TRANSIENT_KUBECTL_SECONDS = 300
+# kubectl errors that are real answers, not blips: the object is gone, or a
+# wait condition legitimately timed out. Retrying these would only add delay.
+NON_RETRYABLE_KUBECTL = ("(NotFound)", "timed out waiting for the condition")
+
+
+def kube_eventually(namespace: str, *args: str, timeout: int = TRANSIENT_KUBECTL_SECONDS,
+                    **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    """kubectl for poll loops: transient API failures retry, real errors raise.
+
+    Retries with 5-to-60-second backoff while consecutive failures stay under
+    ``timeout`` seconds, so a seconds-long connectivity blip cannot fail a
+    healthy in-flight benchmark (the failure mode that orphaned a full day of
+    serving GPUs).
+    """
+    deadline = time.monotonic() + timeout
+    delay = 5.0
+    while True:
+        try:
+            return kube(namespace, *args, **kwargs)
+        except RuntimeError as exc:
+            if any(marker in str(exc) for marker in NON_RETRYABLE_KUBECTL) or time.monotonic() >= deadline:
+                raise
+            print(f"kubectl {' '.join(args)} failed; retrying in {int(delay)}s: {exc}",
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
+
+
 def snapshot(namespace: str, selector: str) -> list[str]:
-    data = json.loads(kube(namespace, "get", "pods", "-l", selector, "-o", "json").stdout)
+    data = json.loads(kube_eventually(namespace, "get", "pods", "-l", selector, "-o", "json").stdout)
     return sorted(f"{pod['metadata']['name']}:{pod['metadata']['uid']}" for pod in data["items"])
 
 
@@ -885,7 +925,7 @@ def wait_ready(config: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
     deadline = time.monotonic() + config["rollout_timeout_seconds"]
     namespace, selector = config["namespace"], overlay["pod_selector"]
     while time.monotonic() < deadline:
-        pods = json.loads(kube(namespace, "get", "pods", "-l", selector, "-o", "json").stdout)["items"]
+        pods = json.loads(kube_eventually(namespace, "get", "pods", "-l", selector, "-o", "json").stdout)["items"]
         if len(pods) == overlay["expected_pods"] and all(
             pod.get("metadata", {}).get("labels", {}).get("llm-d.ai/model") == overlay["model_label"] and
             pod.get("status", {}).get("phase") == "Running" and any(
@@ -912,8 +952,8 @@ def wait_router_ready(config: dict[str, Any], router_manifest: str) -> None:
              if isinstance(item, dict) and item.get("kind") == "Deployment"]
     for name in names:
         print(f"Waiting for router deployment {name}", flush=True)
-        kube(config["namespace"], "wait", "--for=condition=Available", f"deployment/{name}",
-             f"--timeout={config['rollout_timeout_seconds']}s")
+        kube_eventually(config["namespace"], "wait", "--for=condition=Available", f"deployment/{name}",
+                        f"--timeout={config['rollout_timeout_seconds']}s")
 
 
 def wait_job(config: dict[str, Any], name: str, timeout: int) -> None:
@@ -921,7 +961,7 @@ def wait_job(config: dict[str, Any], name: str, timeout: int) -> None:
     namespace = config["namespace"]
     print(f"Waiting for benchmark Job {namespace}/{name}", flush=True)
     while time.monotonic() < deadline:
-        job = json.loads(kube(namespace, "get", "job", name, "-o", "json").stdout)
+        job = json.loads(kube_eventually(namespace, "get", "job", name, "-o", "json").stdout)
         conditions = {item["type"]: item["status"] for item in job.get("status", {}).get("conditions", [])}
         if conditions.get("Complete") == "True":
             return
@@ -1358,8 +1398,7 @@ def export_nyann_monitoring(config: dict[str, Any], overlay_dir: Path, serving_p
 
 
 def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dict[str, Any],
-                     campaign_dir: Path, baseline: list[str], commit: str | None, source_commit: str,
-                     artifact_fetcher: Callable[[Path], Path] | None = None) -> dict[str, Any]:
+                     campaign_dir: Path, baseline: list[str], commit: str | None, source_commit: str) -> dict[str, Any]:
     tool = bench["tool"]
     run_id = f"{config['id']}-{overlay['name']}-{tool}"
     env = os.environ.copy()
@@ -1417,8 +1456,6 @@ def submit_benchmark(config: dict[str, Any], overlay: dict[str, Any], bench: dic
     if snapshot(config["namespace"], overlay["pod_selector"]) != baseline or build_commit(config["namespace"]) != commit:
         raise RuntimeError(f"{overlay['name']}: serving deployment changed during {tool} benchmark")
     artifact = Path(f"/workload/{'aiperf-agentx' if tool == 'aiperf' else 'nyann-agentx'}/{run_id}")
-    if artifact_fetcher is not None:
-        artifact = artifact_fetcher(artifact)
     if not artifact.exists():
         raise RuntimeError(f"{job_name} completed without expected artifacts: {artifact}")
     measurements = []
@@ -1857,8 +1894,37 @@ def fail_campaign(destination: Path, summary: dict[str, Any], error: str) -> Non
     write_summary(destination, summary)
 
 
-def run(config: dict[str, Any], results_root: Path = Path("/workload"),
-        artifact_fetcher: Callable[[Path], Path] | None = None) -> int:
+def run(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
+    """Run one campaign to completion in the cluster; stop cleanly on SIGTERM.
+
+    The campaign Job's argv-style command makes Python the container's PID 1,
+    and Linux ignores SIGTERM delivered to PID 1 with the default disposition
+    — installing this handler is what makes ``campaign-stop`` work at all.
+    Deleting the campaign Job sends SIGTERM; the handler unwinds through the
+    per-case teardown, and the ConfigMap (the Job's code bundle) is removed on
+    every exit path so same-ID resubmits never collide.
+    """
+    destination = results_root / "campaigns" / config["id"]
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def request_stop(signum: int, frame: Any) -> None:
+        # Disarm before raising: a second SIGTERM during cleanup must not
+        # abort the teardown this stop initiated.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise CampaignStopped()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    try:
+        return _run_campaign(config, results_root)
+    except CampaignStopped:
+        return cancel_stopped_campaign(config, destination)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        kube(config["namespace"], "delete", "configmap", f"campaign-{config['id']}",
+             "--ignore-not-found", check=False)
+
+
+def _run_campaign(config: dict[str, Any], results_root: Path = Path("/workload")) -> int:
     destination = results_root / "campaigns" / config["id"]
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "campaign.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -1918,108 +1984,106 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
                   for overlay in config["overlays"]] if not stopped else [])
     else:
         cases = [(variant, overlay) for variant in sweep_variants(config) for overlay in config["overlays"]]
-    for variant, base_overlay in cases:
-        overlay = dict(base_overlay)
-        if variant:
-            overlay["name"] = f"{variant['name']}-{base_overlay['name']}"
-        name = overlay["name"]
-        print(f"Deploying overlay {name}", flush=True)
-        record = make_case_record(variant, base_overlay, name, "running")
-        summary["overlays"].append(record)
-        write_summary(destination, summary)
-        folder = destination / name
-        folder.mkdir()
-        manifest = folder / "manifest.yaml"
-        applied = False
-        try:
-            if variant and "image" not in variant:
-                rendered = base_manifests[base_overlay["name"]]
-            else:
-                rendered = prepare_overlay_manifest(render_overlay(overlay_root, overlay), config, overlay,
-                                                    variant.get("image") if variant else None)
-            if router_manifest:
-                rendered = router_manifest + "\n---\n" + rendered
-            build = matrix_builds.get(variant["name"]) if variant else None
-            if build:
-                record["vllm_build_inputs"] = build
-            elif "build" in overlay:
-                key = json.dumps(overlay["build"], sort_keys=True)
-                if key not in resolved_builds:
-                    resolved_builds[key] = resolve_build(overlay["build"])
-                build = resolved_builds[key]
-                record["vllm_build_inputs"] = build
-            build = build or {"mode": "nightly", "steps": []}
-            rendered = inject_vllm_build_script(rendered, build, config["results_pvc"])
-            validate_manifest(rendered, config["namespace"])
-            manifest.write_text(rendered)
-            record["manifest_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
-            existing = kube(config["namespace"], "get", "-f", str(manifest), "--ignore-not-found", "-o", "name").stdout.strip()
-            if existing:
-                raise RuntimeError(f"overlay {name} would modify pre-existing resources: {existing}")
-            if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
-                raise RuntimeError(f"overlay {name} cannot start while serving Pods already exist in the namespace")
-            applied = True  # prebuild or apply may partially succeed; clean up the saved manifest
-            if not variant and (build["mode"] == "source" or "deepep" in build):
-                prebuild_commit = vllm_prebuild(rendered, config, overlay, folder)
-                if prebuild_commit:
-                    if build["mode"] == "source":
-                        record["prebuild_commit"] = prebuild_commit
-                    else:
-                        record["deepep_prebuilt"] = True
-                    print(f"Overlay {name} build cache prepared", flush=True)
-            kube(config["namespace"], "apply", "-f", str(manifest))
-            baseline = wait_ready(config, overlay)
-            print(f"Overlay {name} ready: {len(baseline)} serving Pods", flush=True)
-            if router_manifest:
-                wait_router_ready(config, router_manifest)
-            commit = build_commit(config["namespace"])
-            record["serving_pods"] = baseline
-            if commit and build["mode"] == "source":
-                record["vllm_build_commit"] = commit
-            (folder / "serving-pods.json").write_text(kube(config["namespace"], "get", "pods", "-l", overlay["pod_selector"], "-o", "json").stdout)
-            for bench in config["benchmarks"]:
-                try:
-                    if artifact_fetcher is None:
-                        result = submit_benchmark(config, overlay, bench, folder, baseline, commit, source_commit)
-                    else:
-                        result = submit_benchmark(config, overlay, bench, folder, baseline, commit, source_commit,
-                                                  artifact_fetcher)
-                except Exception as exc:
-                    result = {"tool": bench["tool"], "status": "failed", "error": str(exc)}
-                    if isinstance(exc, CleanupError):
-                        record["cleanup_error"] = str(exc)
-                    failed = True
-                record["benchmarks"].append(result)
-                write_summary(destination, summary)
-                if result["status"] != "completed":
-                    failed = True
-                    break
-            record["status"] = "completed" if all(item["status"] == "completed" for item in record["benchmarks"]) else "failed"
-        except Exception as exc:
-            record["status"] = "failed"
-            record["error"] = str(exc)
-            print(f"campaign: overlay {name} failed: {exc}", file=sys.stderr, flush=True)
-            failed = True
-        finally:
-            if applied:
-                print(f"Removing overlay {name}", flush=True)
-                deletion = kube(config["namespace"], "delete", "-f", str(manifest), "--ignore-not-found",
-                                "--wait=true", f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
-                if deletion.returncode:
-                    record["status"] = "failed"
-                    record["cleanup_error"] = deletion.stderr.strip()
-                    failed = True
-                else:
-                    try:
-                        wait_gone(config, overlay["pod_selector"])
-                    except Exception as exc:
-                        record["status"] = "failed"
-                        record["cleanup_error"] = str(exc)
-                        failed = True
+    try:
+        for variant, base_overlay in cases:
+            overlay = dict(base_overlay)
+            if variant:
+                overlay["name"] = f"{variant['name']}-{base_overlay['name']}"
+            name = overlay["name"]
+            print(f"Deploying overlay {name}", flush=True)
+            record = make_case_record(variant, base_overlay, name, "running")
+            summary["overlays"].append(record)
             write_summary(destination, summary)
-        if record.get("cleanup_error") or (record["status"] == "failed" and not config["continue_on_failure"]):
-            break
-    shutil.rmtree(overlay_root)
+            folder = destination / name
+            folder.mkdir()
+            manifest = folder / "manifest.yaml"
+            applied = False
+            try:
+                if variant and "image" not in variant:
+                    rendered = base_manifests[base_overlay["name"]]
+                else:
+                    rendered = prepare_overlay_manifest(render_overlay(overlay_root, overlay), config, overlay,
+                                                        variant.get("image") if variant else None)
+                if router_manifest:
+                    rendered = router_manifest + "\n---\n" + rendered
+                build = matrix_builds.get(variant["name"]) if variant else None
+                if build:
+                    record["vllm_build_inputs"] = build
+                elif "build" in overlay:
+                    key = json.dumps(overlay["build"], sort_keys=True)
+                    if key not in resolved_builds:
+                        resolved_builds[key] = resolve_build(overlay["build"])
+                    build = resolved_builds[key]
+                    record["vllm_build_inputs"] = build
+                build = build or {"mode": "nightly", "steps": []}
+                rendered = inject_vllm_build_script(rendered, build, config["results_pvc"])
+                validate_manifest(rendered, config["namespace"])
+                manifest.write_text(rendered)
+                record["manifest_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
+                existing = kube(config["namespace"], "get", "-f", str(manifest), "--ignore-not-found", "-o", "name").stdout.strip()
+                if existing:
+                    raise RuntimeError(f"overlay {name} would modify pre-existing resources: {existing}")
+                if snapshot(config["namespace"], "llm-d.ai/inference-serving=true"):
+                    raise RuntimeError(f"overlay {name} cannot start while serving Pods already exist in the namespace")
+                applied = True  # prebuild or apply may partially succeed; clean up the saved manifest
+                if not variant and (build["mode"] == "source" or "deepep" in build):
+                    prebuild_commit = vllm_prebuild(rendered, config, overlay, folder)
+                    if prebuild_commit:
+                        if build["mode"] == "source":
+                            record["prebuild_commit"] = prebuild_commit
+                        else:
+                            record["deepep_prebuilt"] = True
+                        print(f"Overlay {name} build cache prepared", flush=True)
+                kube(config["namespace"], "apply", "-f", str(manifest))
+                baseline = wait_ready(config, overlay)
+                print(f"Overlay {name} ready: {len(baseline)} serving Pods", flush=True)
+                if router_manifest:
+                    wait_router_ready(config, router_manifest)
+                commit = build_commit(config["namespace"])
+                record["serving_pods"] = baseline
+                if commit and build["mode"] == "source":
+                    record["vllm_build_commit"] = commit
+                (folder / "serving-pods.json").write_text(kube(config["namespace"], "get", "pods", "-l", overlay["pod_selector"], "-o", "json").stdout)
+                for bench in config["benchmarks"]:
+                    try:
+                        result = submit_benchmark(config, overlay, bench, folder, baseline, commit, source_commit)
+                    except Exception as exc:
+                        result = {"tool": bench["tool"], "status": "failed", "error": str(exc)}
+                        if isinstance(exc, CleanupError):
+                            record["cleanup_error"] = str(exc)
+                        failed = True
+                    record["benchmarks"].append(result)
+                    write_summary(destination, summary)
+                    if result["status"] != "completed":
+                        failed = True
+                        break
+                record["status"] = "completed" if all(item["status"] == "completed" for item in record["benchmarks"]) else "failed"
+            except Exception as exc:
+                record["status"] = "failed"
+                record["error"] = str(exc)
+                print(f"campaign: overlay {name} failed: {exc}", file=sys.stderr, flush=True)
+                failed = True
+            finally:
+                if applied:
+                    print(f"Removing overlay {name}", flush=True)
+                    deletion = kube(config["namespace"], "delete", "-f", str(manifest), "--ignore-not-found",
+                                    "--wait=true", f"--timeout={config['cleanup_timeout_seconds']}s", check=False)
+                    if deletion.returncode:
+                        record["status"] = "failed"
+                        record["cleanup_error"] = deletion.stderr.strip()
+                        failed = True
+                    else:
+                        try:
+                            wait_gone(config, overlay["pod_selector"])
+                        except Exception as exc:
+                            record["status"] = "failed"
+                            record["cleanup_error"] = str(exc)
+                            failed = True
+                write_summary(destination, summary)
+            if record.get("cleanup_error") or (record["status"] == "failed" and not config["continue_on_failure"]):
+                break
+    finally:
+        shutil.rmtree(overlay_root)
     summary["status"] = "failed" if failed else "completed"
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
     try:
@@ -2031,11 +2095,6 @@ def run(config: dict[str, Any], results_root: Path = Path("/workload"),
         failed = True
     print(f"Campaign {config['id']} {summary['status']}; artifacts: {destination}", flush=True)
     return 1 if failed else 0
-
-
-def artifacts_pod_name(config: dict[str, Any]) -> str:
-    """Stable helper Pod name for a campaign's shared PVC access."""
-    return "campaign-artifacts-" + hashlib.sha256(config["id"].encode()).hexdigest()[:16]
 
 
 def artifacts_pod(namespace: str, name: str, pvc: str, *, restart_policy: str,
@@ -2069,72 +2128,23 @@ def helper_pod(config: dict[str, Any], pod: dict[str, Any]) -> Iterator[str]:
             raise CleanupError(f"could not remove artifact Pod {pod_name}: {deleted.stderr.strip()}")
 
 
-def run_local(config: dict[str, Any], output: Path) -> int:
-    """Orchestrate with local kubectl; copy Job artifacts from the shared PVC."""
-    output = output.resolve()
-    output.mkdir(parents=True, exist_ok=False)
-    namespace = config["namespace"]
-    kube(namespace, "get", "localqueue", config["benchmark_queue"])
-    kube(namespace, "get", "pvc", config["results_pvc"])
-    pod = artifacts_pod(namespace, artifacts_pod_name(config), config["results_pvc"],
-                        restart_policy="Always", labels={"app.kubernetes.io/name": "benchmark-campaign-artifacts"})
-    with helper_pod(config, pod) as pod_name:
-        try:
-            def fetch(artifact: Path) -> Path:
-                destination = output / artifact.relative_to("/workload")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                if artifact.parent.name == "aiperf-agentx":
-                    profiles = kube(namespace, "exec", pod_name, "--", "find", str(artifact),
-                                    "-mindepth", "2", "-maxdepth", "2", "-type", "f",
-                                    "-name", "profile_export_aiperf.json").stdout.splitlines()
-                    if not profiles:
-                        raise RuntimeError(f"No completed AIPerf profiles in {artifact}")
-                    for profile in profiles:
-                        copy_aiperf_sample(namespace, pod_name, Path(profile), destination)
-                else:
-                    TRANSFER.download_tree(namespace, pod_name, str(artifact), destination)
-                return destination
-
-            return run(config, output, artifact_fetcher=fetch)
-        except KeyboardInterrupt:
-            campaign_dir = output / "campaigns" / config["id"]
-            cleanup_error = None
-            try:
-                delete_campaign_benchmark_jobs(config)
-            except Exception as exc:
-                cleanup_error = str(exc)
-            mark_campaign_cancelled(campaign_dir, cleanup_error)
-            print(f"Campaign {config['id']} cancelled", flush=True)
-            return 130
+# Label carried by the ephemeral Pods that watch/download spin up against the
+# results PVC; campaign-stop sweeps them so a stopped campaign leaves nothing.
+DOWNLOAD_POD_LABEL = "app.kubernetes.io/name=benchmark-campaign-download"
 
 
-def start_local(config_path: Path, output: Path, campaign_id: str) -> Path:
-    """Detach local orchestration while its workloads run in Kubernetes."""
-    output = output.resolve()
-    if output.exists():
-        raise ValueError(f"Output directory already exists: {output}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    log_path = output.with_name(output.name + ".log")
-    command = [sys.executable, str(Path(__file__).resolve()), "run-local",
-               str(config_path.resolve()), "--output", str(output)]
-    with log_path.open("x") as log:
-        try:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-        except Exception:
-            log_path.unlink(missing_ok=True)
-            raise
-    summary_path = output / "campaigns" / campaign_id / "summary.json"
-    for _ in range(30):
-        returncode = process.poll()
-        if returncode is not None:
-            raise RuntimeError(f"Campaign runner exited ({returncode}); see {log_path}")
-        if summary_path.is_file():
-            break
-        time.sleep(0.1)
-    print(f"Campaign runner started: PID {process.pid}; log: {log_path}", flush=True)
-    print(f"Campaign status: {summary_path}", flush=True)
-    return log_path
+def download_pod(config: dict[str, Any], name: str) -> dict[str, Any]:
+    """Ephemeral PVC-mounted Pod used by watch/download; labeled for stop sweeps."""
+    return artifacts_pod(config["namespace"], name, config["results_pvc"], restart_policy="Never",
+                         labels={"app.kubernetes.io/name": "benchmark-campaign-download"})
+
+
+def display_path(path: Path) -> str:
+    """Format a path for terminal output: cwd-relative when it stays inside it."""
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
 
 
 def campaign_run_ids(config: dict[str, Any]) -> set[str]:
@@ -2161,13 +2171,14 @@ def delete_campaign_benchmark_jobs(config: dict[str, Any]) -> None:
                  "--wait=true", f"--timeout={config['cleanup_timeout_seconds']}s")
 
 
-def mark_campaign_cancelled(campaign_dir: Path, cleanup_error: str | None = None) -> None:
+def mark_campaign_cancelled(campaign_dir: Path, cleanup_error: str | None = None) -> dict[str, Any] | None:
+    """Mark a still-running campaign cancelled; None when it already finished."""
     summary_path = campaign_dir / "summary.json"
     if not summary_path.is_file():
-        return
+        return None
     summary = json.loads(summary_path.read_text())
     if summary.get("status") != "running":
-        return
+        return None
     for record in summary.get("overlays", []):
         if record.get("status") == "running":
             record["status"] = "cancelled"
@@ -2179,33 +2190,32 @@ def mark_campaign_cancelled(campaign_dir: Path, cleanup_error: str | None = None
     if cleanup_error:
         summary["cleanup_error"] = cleanup_error
     write_summary(campaign_dir, summary)
+    return summary
 
 
-def local_runner_pids(output: Path, config_path: Path | None = None) -> list[int]:
-    """Find run-local Python processes for this exact absolute output path."""
-    result = call(["ps", "-axo", "pid=,command="])
-    pids = []
-    for line in result.stdout.splitlines():
-        fields = line.strip().split(maxsplit=1)
-        if len(fields) != 2 or not fields[0].isdigit():
-            continue
+def cancel_stopped_campaign(config: dict[str, Any], campaign_dir: Path) -> int:
+    """Finish unwinding a SIGTERM-stopped campaign and report it as cancelled.
+
+    Reached only from ``run``'s stop handler, after the per-case teardown and
+    the checkout cleanup have already unwound. The still-running guard lives
+    in ``mark_campaign_cancelled`` so a campaign that completed between the
+    signal and this point keeps its real final status.
+    """
+    cleanup_error = None
+    try:
+        delete_campaign_benchmark_jobs(config)
+    except Exception as exc:
+        cleanup_error = str(exc)
+    summary = mark_campaign_cancelled(campaign_dir, cleanup_error)
+    if summary is not None:
         try:
-            args = shlex.split(fields[1])
-        except ValueError:
-            continue
-        if len(args) < 5 or "run-local" not in args or "--output" not in args:
-            continue
-        action = args.index("run-local")
-        if action == 0 or Path(args[action - 1]).resolve() != Path(__file__).resolve():
-            continue
-        if config_path is not None and (action + 1 >= len(args) or
-                Path(args[action + 1]).resolve() != config_path.resolve()):
-            continue
-        index = args.index("--output")
-        if index + 1 < len(args) and Path(args[index + 1]).is_absolute() and \
-                Path(args[index + 1]).resolve() == output.resolve():
-            pids.append(int(fields[0]))
-    return pids
+            write_final_report(campaign_dir, summary)
+        except Exception as exc:
+            summary["status"] = "failed"
+            summary["report_error"] = str(exc)
+            write_summary(campaign_dir, summary)
+    print(f"Campaign {config['id']} cancelled", flush=True)
+    return 130
 
 
 def assert_saved_config(campaign_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
@@ -2217,55 +2227,39 @@ def assert_saved_config(campaign_dir: Path, config: dict[str, Any]) -> dict[str,
     return saved
 
 
-def stop_local(config: dict[str, Any], output: Path, config_path: Path) -> None:
-    """Interrupt one local campaign, then verify and finish its cleanup."""
-    output = output.resolve()
-    campaign_dir = output / "campaigns" / config["id"]
-    saved_config = campaign_dir / "campaign.json"
-    if saved_config.is_file():
-        assert_saved_config(campaign_dir, config)
-        status = json.loads((campaign_dir / "summary.json").read_text())["status"]
-        if status != "running":
-            print(f"Campaign {config['id']} is already {status}")
-            return
-    elif not output.is_dir():
-        raise ValueError(f"No local campaign output at {output}")
-    pids = local_runner_pids(output, config_path)
-    if len(pids) > 1:
-        raise RuntimeError(f"Found {len(pids)} matching run-local processes for {output}; "
-                           "no signal was sent and no cluster resources were deleted")
-    pid = pids[0] if pids else None
-    if pid is not None:
-        os.kill(pid, signal.SIGINT)
-    else:
-        print(f"No live runner for {config['id']}; reconciling saved campaign state", flush=True)
+def stop_cluster(config: dict[str, Any]) -> None:
+    """Stop a running cluster campaign: SIGTERM the runner, then reconcile.
+
+    Deleting the campaign Job sends SIGTERM to the runner Pod; its handler
+    tears down the serving overlay, cancels children, marks the PVC summary
+    cancelled, and deletes its own ConfigMap. Everything after the delete is
+    reconciliation for the cases where that unwind never ran or was SIGKILLed
+    past its grace period.
+    """
+    namespace, campaign_id = config["namespace"], config["id"]
+    job_name = f"campaign-{campaign_id}"
+    print(f"Stopping campaign {campaign_id}", flush=True)
+    # --wait outlives the Pod's SIGTERM-to-SIGKILL window (grace period is
+    # cleanup_timeout + 60); deleting a still-suspended Job is instant.
+    kube(namespace, "delete", "job", job_name, "--ignore-not-found", "--wait=true",
+         f"--timeout={config['cleanup_timeout_seconds'] + 180}s")
     job_error = None
     try:
         delete_campaign_benchmark_jobs(config)
     except Exception as exc:
         job_error = str(exc)
-    if pid is not None:
-        deadline = time.monotonic() + config["cleanup_timeout_seconds"] + 30
-        while pid in local_runner_pids(output, config_path) and time.monotonic() < deadline:
-            time.sleep(1)
-        if pid in local_runner_pids(output, config_path):
-            raise RuntimeError(f"Runner process {pid} is still active; cleanup is not complete")
-    pod_name = artifacts_pod_name(config)
-    kube(config["namespace"], "delete", "pod", pod_name, "--ignore-not-found", "--wait=true",
-         f"--timeout={config['cleanup_timeout_seconds']}s")
-    if not saved_config.is_file():
-        campaign_dir.mkdir(parents=True, exist_ok=True)
-        saved_config.write_text(json.dumps(config, indent=2) + "\n")
-        write_summary(campaign_dir, {"id": config["id"], "status": "running", "overlays": [],
-                                     "vllm_image": config.get("vllm_image", "")})
+    kube(namespace, "delete", "configmap", job_name, "--ignore-not-found", check=False)
+    # A laptop that was watching through a download Pod just retries; a
+    # stopped campaign must not leave helper Pods behind.
+    kube(namespace, "delete", "pods", "-l", DOWNLOAD_POD_LABEL, "--ignore-not-found",
+         "--wait=true", f"--timeout={config['cleanup_timeout_seconds']}s")
     leftovers = []
     for overlay in config["overlays"]:
-        leftovers.extend(snapshot(config["namespace"], overlay["pod_selector"]))
+        leftovers.extend(snapshot(namespace, overlay["pod_selector"]))
     cleanup_error = job_error or (f"Serving Pods remain: {', '.join(sorted(set(leftovers)))}" if leftovers else None)
-    mark_campaign_cancelled(campaign_dir, cleanup_error)
     if cleanup_error:
-        raise CleanupError(f"Campaign {config['id']} was interrupted but cleanup needs attention: {cleanup_error}")
-    print(f"Campaign {config['id']} cancelled; artifacts retained at {output}", flush=True)
+        raise CleanupError(f"Campaign {campaign_id} was stopped but cleanup needs attention: {cleanup_error}")
+    print(f"Campaign {campaign_id} stopped; results remain on {config['results_pvc']}", flush=True)
 
 
 def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination: Path) -> Path:
@@ -2319,7 +2313,7 @@ def copy_nyann_request_files(config: dict[str, Any], pod_name: str, record: dict
 
 
 def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: Path) -> Path:
-    """Resume this campaign's PVC artifacts after a run-local process has exited."""
+    """Download this campaign's raw PVC artifacts through an ephemeral Pod."""
     root = Path("/workload")
     if remote is not None:
         path = Path(remote)
@@ -2327,7 +2321,7 @@ def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: P
             raise ValueError("--remote must be an artifact directory below /workload")
     pod_name = "campaign-download-" + secrets.token_hex(8)
     namespace = config["namespace"]
-    pod = artifacts_pod(namespace, pod_name, config["results_pvc"], restart_policy="Never")
+    pod = download_pod(config, pod_name)
     with helper_pod(config, pod) as pod_name:
         listing = kube(namespace, "exec", pod_name, "--", "sh", "-c",
                        'for root in /workload/aiperf-agentx /workload/nyann-agentx; do '
@@ -2353,32 +2347,46 @@ def download_pvc_artifacts(config: dict[str, Any], remote: str | None, output: P
     return output.resolve()
 
 
+def fetch_running_cluster_state(config: dict[str, Any], output: Path, pod_name: str, *,
+                                auto_refresh: bool = False) -> dict[str, Any]:
+    """Copy a running campaign's stable files and refresh its local preview.
+
+    Only stable per-record files are copied while the cluster runner keeps
+    writing its campaign tree; the preview render reads those plus whatever
+    artifacts already landed on the PVC.
+    """
+    namespace = config["namespace"]
+    remote_campaign = Path("/workload/campaigns") / config["id"]
+    campaign_dir = output.resolve() / "campaigns" / config["id"]
+    remote_summary = json.loads(kube(namespace, "exec", pod_name, "--", "cat",
+                                     str(remote_campaign / "summary.json")).stdout)
+    if remote_summary["status"] == "running":
+        campaign_dir.mkdir(parents=True, exist_ok=True)
+        TRANSFER.download_file(namespace, pod_name, str(remote_campaign / "campaign.json"),
+                               campaign_dir / "campaign.json")
+        write_summary(campaign_dir, remote_summary)
+        for record in remote_summary.get("overlays", []):
+            folder = campaign_dir / record["name"]
+            for filename in ("nyann-submit.log", "aiperf-submit.log", "serving-pods.json"):
+                remote_file = remote_campaign / record["name"] / filename
+                exists = kube(namespace, "exec", pod_name, "--", "test", "-f", str(remote_file), check=False)
+                if exists.returncode == 0:
+                    TRANSFER.download_file(namespace, pod_name, str(remote_file), folder / filename)
+        preview_local(config, output, pod_name=pod_name, auto_refresh=auto_refresh)
+    return remote_summary
+
+
 def download_cluster_report(config: dict[str, Any], output: Path,
                             destination: Path | None = None) -> Path:
-    """Fetch a finished cluster Job's report inputs and render one local HTML file."""
+    """Fetch a cluster campaign's report inputs and render one local HTML file."""
     namespace = config["namespace"]
     remote_campaign = Path("/workload/campaigns") / config["id"]
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     pod_name = "campaign-download-" + secrets.token_hex(8)
-    pod = artifacts_pod(namespace, pod_name, config["results_pvc"], restart_policy="Never")
+    pod = download_pod(config, pod_name)
     with helper_pod(config, pod) as pod_name:
-        # Copy only stable files while a runner is writing its campaign tree.
-        remote_summary = json.loads(kube(namespace, "exec", pod_name, "--", "cat",
-                                         str(remote_campaign / "summary.json")).stdout)
-        if remote_summary["status"] == "running":
-            campaign_dir.mkdir(parents=True, exist_ok=True)
-            TRANSFER.download_file(namespace, pod_name, str(remote_campaign / "campaign.json"),
-                                   campaign_dir / "campaign.json")
-            write_summary(campaign_dir, remote_summary)
-            for record in remote_summary.get("overlays", []):
-                folder = campaign_dir / record["name"]
-                for filename in ("nyann-submit.log", "aiperf-submit.log", "serving-pods.json"):
-                    remote_file = remote_campaign / record["name"] / filename
-                    exists = kube(namespace, "exec", pod_name, "--", "test", "-f", str(remote_file), check=False)
-                    if exists.returncode == 0:
-                        TRANSFER.download_file(namespace, pod_name, str(remote_file), folder / filename)
-            preview_local(config, output, pod_name=pod_name)
-        else:
+        remote_summary = fetch_running_cluster_state(config, output, pod_name)
+        if remote_summary["status"] != "running":
             TRANSFER.download_tree(namespace, pod_name, str(remote_campaign), campaign_dir)
             summary = json.loads((campaign_dir / "summary.json").read_text())
             if summary["status"] == "running":
@@ -2405,7 +2413,7 @@ def download_cluster_report(config: dict[str, Any], output: Path,
             write_summary(campaign_dir, summary)
     if remote_summary["status"] != "running":
         report_local(config, output)
-    return download_latest_local(config, output, destination, refresh_running=False)
+    return download_latest_local(config, output, destination)
 
 
 def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[str, Any],
@@ -2490,8 +2498,8 @@ def preview_progress(config: dict[str, Any], campaign_dir: Path, summary: dict[s
             + "".join(rows) + "</tbody></table></details>")
 
 
-def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = False,
-                  pod_name: str | None = None) -> int:
+def preview_local(config: dict[str, Any], output: Path, *, pod_name: str,
+                  auto_refresh: bool = False) -> int:
     """Render active and completed work into one portable campaign HTML file."""
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     saved_config = campaign_dir / "campaign.json"
@@ -2502,7 +2510,6 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
     if summary["status"] != "running":
         print(f"Campaign is {summary['status']}; use its final report if available")
         return 0
-    pod_name = pod_name or artifacts_pod_name(config)
     namespace = config["namespace"]
     remote_root = "/workload/aiperf-agentx"
     if kube(namespace, "exec", pod_name, "--", "test", "-d", remote_root, check=False).returncode == 0:
@@ -2678,45 +2685,57 @@ def preview_local(config: dict[str, Any], output: Path, *, auto_refresh: bool = 
     return 0
 
 
-def watch_preview_local(config: dict[str, Any], output: Path) -> int:
-    """Keep one preview file current until the final campaign report exists."""
-    campaign_dir = output.resolve() / "campaigns" / config["id"]
-    while True:
-        summary = json.loads((campaign_dir / "summary.json").read_text())
-        if summary["status"] != "running":
-            if summary["status"] in {"failed", "cancelled"}:
-                print(f"Campaign {summary['status']}; retained the last partial preview in "
-                      f"{campaign_dir / 'preview/index.html'}",
-                      file=sys.stderr)
-                return 1
-            final = campaign_dir / "index.html"
-            if final.is_file():
-                preview = campaign_dir / "preview"
-                preview.mkdir(exist_ok=True)
-                staged = preview / "index.html.tmp"
-                shutil.copyfile(final, staged)
-                staged.replace(preview / "index.html")
-                print(f"Final report: {preview / 'index.html'}")
-                return 0
-        else:
+def watch_cluster(config: dict[str, Any], output: Path, destination: Path | None = None) -> int:
+    """Follow a cluster campaign until it finishes, refreshing its preview.
+
+    The campaign itself is unaffected by this laptop: a disconnect only stops
+    the watching. Refresh failures (Wi-Fi blips, pod churn) retry after 60 s.
+    Exits 0 when the campaign completed, 1 when it failed or was killed, 130
+    on Ctrl-C.
+    """
+    namespace, campaign_id = config["namespace"], config["id"]
+    job_name = f"campaign-{campaign_id}"
+    stale_since: float | None = None
+    print(f"Watching campaign {campaign_id}; refreshing every 60s (Ctrl-C to detach)", flush=True)
+    try:
+        while True:
             try:
-                preview_local(config, output, auto_refresh=True)
-            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
-                print(f"Preview refresh failed; retrying: {exc}", file=sys.stderr, flush=True)
-        time.sleep(60)
+                pod_name = "campaign-download-" + secrets.token_hex(8)
+                with helper_pod(config, download_pod(config, pod_name)) as pod_name:
+                    summary = fetch_running_cluster_state(config, output, pod_name, auto_refresh=True)
+                if summary["status"] != "running":
+                    download_cluster_report(config, output, destination)
+                    print(f"Campaign {campaign_id} {summary['status']}", flush=True)
+                    return 0 if summary["status"] == "completed" else 1
+                # A stopped Job object disappears before its Pods finish
+                # terminating, so a missing Job is only fatal once the whole
+                # stop window has clearly passed without a final summary.
+                job = kube(namespace, "get", "job", job_name, "--ignore-not-found", "-o", "name",
+                           check=False)
+                if job.returncode == 0 and not job.stdout.strip():
+                    stale_since = stale_since or time.monotonic()
+                    if time.monotonic() - stale_since > config["cleanup_timeout_seconds"] + 300:
+                        print(f"Campaign {campaign_id} was killed during cleanup; no final summary "
+                              "was written", file=sys.stderr, flush=True)
+                        return 1
+                else:
+                    stale_since = None
+            except (RuntimeError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+                print(f"Watch refresh failed; retrying: {exc}", file=sys.stderr, flush=True)
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print(f"Detached from campaign {campaign_id}; it keeps running in the cluster", flush=True)
+        return 130
 
 
-def download_latest_local(config: dict[str, Any], output: Path, destination: Path | None = None,
-                          *, refresh_running: bool = True) -> Path:
-    """Refresh and save the latest self-contained campaign HTML in one command."""
+def download_latest_local(config: dict[str, Any], output: Path, destination: Path | None = None) -> Path:
+    """Save the latest self-contained campaign HTML in one command."""
     campaign_dir = output.resolve() / "campaigns" / config["id"]
     saved_config = campaign_dir / "campaign.json"
     if not saved_config.is_file():
         raise ValueError(f"No campaign at {campaign_dir}")
     assert_saved_config(campaign_dir, config)
     status = json.loads((campaign_dir / "summary.json").read_text())["status"]
-    if status == "running" and refresh_running:
-        preview_local(config, output)
     preview = campaign_dir / "preview" / "index.html"
     final = campaign_dir / "index.html"
     source = final if status != "running" and final.is_file() else preview
@@ -2749,7 +2768,7 @@ def report_local(config: dict[str, Any], output: Path) -> int:
     assert_saved_config(campaign_dir, config)
     summary = json.loads((campaign_dir / "summary.json").read_text())
     if summary["status"] == "running":
-        raise ValueError("campaign is still running; use preview-local until it finishes")
+        raise ValueError("campaign is still running; use watch-cluster until it finishes")
     summary.setdefault("source_ref", config["source"]["ref"])
     summary.setdefault("planned_deployments", len(config["overlays"]) * len(sweep_variants(config)))
     nyann_spec = next((bench for bench in config["benchmarks"] if bench["tool"] == "nyann"), None)
@@ -2799,7 +2818,8 @@ def campaign_source_bundle() -> bytes:
     return archive.getvalue()
 
 
-def submit(config: dict[str, Any], image: str, service_account: str) -> None:
+def submit(config: dict[str, Any], image: str, service_account: str, *,
+           config_path: Path | None = None) -> None:
     namespace, campaign_id = config["namespace"], config["id"]
     required_name(service_account, "service_account")
     if not image or any(char.isspace() for char in image):
@@ -2825,6 +2845,8 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     job = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": configmap_name, "namespace": namespace,
            "labels": {"kueue.x-k8s.io/queue-name": config["campaign_queue"], "app.kubernetes.io/name": "benchmark-campaign"}},
            "spec": {"suspend": True, "backoffLimit": 0, "template": {"spec": {"restartPolicy": "Never",
+           # Give the SIGTERM handler the full cleanup window before SIGKILL.
+           "terminationGracePeriodSeconds": config["cleanup_timeout_seconds"] + 60,
            "serviceAccountName": service_account, "containers": [{"name": "runner", "image": image,
            "command": ["python3", "/workspace/agentx-mvp/campaign/run.py", "run", "/campaign/campaign.json"],
            "resources": {"requests": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "1Gi"},
@@ -2864,62 +2886,103 @@ def submit(config: dict[str, Any], image: str, service_account: str) -> None:
     except Exception:
         kube(namespace, "delete", "configmap", configmap_name, "--ignore-not-found", check=False)
         raise
-    print(f"Campaign queued: {namespace}/{configmap_name}")
+    print(f"Campaign {campaign_id} queued in the cluster ({namespace}/{configmap_name})", flush=True)
     if local_monitoring:
-        print("Grafana dashboards will be backfilled after downloading the PVC report")
-    print(f"Status: kubectl -n {namespace} get job {configmap_name}")
-    print(f"Logs: kubectl -n {namespace} logs -f job/{configmap_name}")
-    print(f"Results: {config['results_pvc']}:/workload/campaigns/{campaign_id}")
+        print("Grafana dashboards will be backfilled after downloading the PVC report", flush=True)
+    print(flush=True)
+    print(f"  status   kubectl -n {namespace} get job {configmap_name}", flush=True)
+    print(f"  logs     kubectl -n {namespace} logs -f job/{configmap_name}", flush=True)
+    print(f"  results  {config['results_pvc']}:/workload/campaigns/{campaign_id}", flush=True)
+    if config_path is not None:
+        shown = display_path(config_path.resolve())
+        print(flush=True)
+        print(f"  watch    just campaign-watch {shown}", flush=True)
+        print(f"  stop     just campaign-stop {shown}", flush=True)
+        print(f"  download just campaign-download {shown}", flush=True)
+        print(flush=True)
+        print("The run survives laptop disconnects; this terminal can close.", flush=True)
 
 
-# Actions that write into a local artifact directory.
-NEEDS_OUTPUT = {"test-local", "run-local", "start-local", "stop-local", "preview-local",
-                "download-latest", "download-cluster", "download-artifacts", "report-local"}
+# Actions that require an explicit --output artifact directory.
+NEEDS_OUTPUT = {"test-local", "download-artifacts"}
+# Actions whose --output defaults to campaign-output/<id> under the checkout,
+# which is also where submit --fresh writes its derived config's directory.
+DEFAULTED_OUTPUT = {"watch-cluster", "download-cluster", "report-local"}
+
+
+def write_derived_config(config: dict[str, Any], output: Path) -> Path:
+    """Write a modified campaign config beside the output directory.
+
+    ``--fresh`` and ``--no-monitoring`` never edit the source file in place:
+    the derived copy is the config of record for the run, so watch, stop, and
+    download keep working with exactly what ran.
+    """
+    derived = output.with_name(output.name + ".json")
+    derived.parent.mkdir(parents=True, exist_ok=True)
+    derived.write_text(json.dumps(config, indent=2) + "\n")
+    return derived
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "submit", "run", "run-local", "start-local", "test-local",
-                                           "preview-local", "download-latest", "download-cluster", "download-artifacts", "stop-local", "report-local"])
+    parser.add_argument("action", choices=["validate", "submit", "run", "test-local",
+                                           "watch-cluster", "stop-cluster", "download-cluster",
+                                           "download-artifacts", "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
     parser.add_argument("--source-dir", type=Path, help="local llm-d checkout for test-local; otherwise fetch source.repo/ref")
     parser.add_argument("--output", type=Path, help="new artifact directory for test-local")
-    parser.add_argument("--watch", action="store_true", help="refresh preview-local until the campaign finishes")
-    parser.add_argument("--dest", type=Path, help="HTML destination for download-latest/download-cluster")
+    parser.add_argument("--dest", type=Path, help="HTML destination for download-cluster/watch-cluster")
     parser.add_argument("--remote", help="PVC artifact directory below /workload for download-artifacts")
+    parser.add_argument("--fresh", action="store_true",
+                        help="submit: stamp the campaign ID with the start time "
+                             "and default the output directory to campaign-output/<id>")
+    parser.add_argument("--no-monitoring", action="store_true",
+                        help="submit: drop the config's monitoring block for this run")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
+        if args.fresh:
+            if args.action != "submit":
+                raise ValueError("--fresh is only supported with submit")
+            config = {**config, "id": f"{config['id']}-{datetime.now():%Y%m%d-%H%M}"}
+            if args.output is None:
+                args.output = ROOT / "campaign-output" / config["id"]
+        if args.no_monitoring:
+            if args.action != "submit":
+                raise ValueError("--no-monitoring is only supported with submit")
+            config = {k: v for k, v in config.items() if k != "monitoring"}
+        if args.action == "submit" and (args.fresh or args.no_monitoring) and args.output is None:
+            # The derived config is the config of record; it needs a home
+            # beside an output directory even without --fresh.
+            args.output = ROOT / "campaign-output" / config["id"]
         if args.action in NEEDS_OUTPUT and args.output is None:
             raise ValueError(f"--output is required for {args.action}")
-        if args.action != "preview-local" and args.watch:
-            raise ValueError("--watch is only supported with preview-local")
-        if args.action not in {"download-latest", "download-cluster"} and args.dest is not None:
-            raise ValueError("--dest is only supported with download-latest and download-cluster")
+        if args.action in DEFAULTED_OUTPUT and args.output is None:
+            args.output = ROOT / "campaign-output" / config["id"]
+        if args.fresh or args.no_monitoring:
+            # watch/stop/download compare against the config that ran, so
+            # record the modified copy beside the output directory and use it.
+            args.config = write_derived_config(config, args.output)
+            config = load_config(args.config)
+        if args.action not in {"download-cluster", "watch-cluster"} and args.dest is not None:
+            raise ValueError("--dest is only supported with download-cluster and watch-cluster")
         if args.action == "validate":
             print("Campaign configuration is valid")
             return 0
         if args.action == "submit":
             if not args.image:
                 raise ValueError("--image is required for submit")
-            submit(config, args.image, args.service_account)
+            submit(config, args.image, args.service_account,
+                   config_path=args.config if (args.fresh or args.no_monitoring) else None)
             return 0
         if args.action == "test-local":
             return test_local(config, args.output, args.source_dir)
-        if args.action == "run-local":
-            return run_local(config, args.output)
-        if args.action == "start-local":
-            start_local(args.config, args.output, config["id"])
-            return 0
-        if args.action == "stop-local":
-            stop_local(config, args.output, args.config)
-            return 0
-        if args.action == "preview-local":
-            return watch_preview_local(config, args.output) if args.watch else preview_local(config, args.output)
-        if args.action == "download-latest":
-            download_latest_local(config, args.output, args.dest)
+        if args.action == "watch-cluster":
+            return watch_cluster(config, args.output, args.dest)
+        if args.action == "stop-cluster":
+            stop_cluster(config)
             return 0
         if args.action == "download-cluster":
             download_cluster_report(config, args.output, args.dest)

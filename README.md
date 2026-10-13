@@ -11,9 +11,10 @@ with [the service contract and deployment guide](docs/agentx-service.md).
 ## Overlay campaigns
 
 To compare several deployment overlays, point a campaign at an llm-d fork and
-branch or commit, then list its Kustomize overlay paths. The runner deploys each
-overlay, waits for serving readiness, runs the same benchmark sweeps, saves the
-results, and tears it down before starting the next. See
+branch or commit, then list its Kustomize overlay paths. The campaign runs as
+a Kueue Job in the cluster: it deploys each overlay, waits for serving
+readiness, runs the same benchmark sweeps, saves the results, and tears it
+down before starting the next — independently of the submitting laptop. See
 [overlay campaign setup](docs/campaigns.md) and
 [the campaign configuration example](examples/campaign.example.json).
 

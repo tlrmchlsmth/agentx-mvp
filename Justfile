@@ -75,6 +75,54 @@ campaign-setup namespace:
     kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/campaign-local-queue.yaml"
     kubectl apply -n "{{namespace}}" -f "{{repo_root}}/campaign/rbac.yaml"
 
+# One-time namespace bootstrap: the namespace itself, both Kueue queues, runner
+# RBAC, and the results PVC. Override the PVC name, size, and storage class to
+# match the campaign config's results_pvc and cluster provisioner.
+campaign-prepare namespace pvc="workload-pvc" storage="20Gi" storage_class="shared-vast":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Report only what changed: drop the per-resource "unchanged" chatter and
+    # the benign warning kubectl prints (and patches) when a resource was first
+    # created outside kubectl apply.
+    changed=0
+    unchanged=0
+    apply() {
+      local out line
+      if ! out=$(kubectl apply "$@" 2>&1); then
+        printf '%s\n' "$out" >&2
+        return 1
+      fi
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+          *" unchanged") unchanged=$((unchanged + 1)) ;;
+          *last-applied-configuration*) ;;
+          *) changed=$((changed + 1)); printf '%s\n' "$line" ;;
+        esac
+      done <<< "$out"
+    }
+    kubectl create namespace --dry-run=client -o yaml "{{namespace}}" | apply -f -
+    apply -f "{{repo_root}}/kueue/live-benchmark-cluster-queue.yaml"
+    apply -n "{{namespace}}" -f "{{repo_root}}/kueue/live-benchmark-local-queue.yaml"
+    apply -f "{{repo_root}}/kueue/campaign-queue.yaml"
+    apply -n "{{namespace}}" -f "{{repo_root}}/kueue/campaign-local-queue.yaml"
+    apply -n "{{namespace}}" -f "{{repo_root}}/campaign/rbac.yaml"
+    apply -n "{{namespace}}" -f - <<EOF
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: {{pvc}}
+    spec:
+      accessModes:
+        - ReadWriteMany
+      resources:
+        requests:
+          storage: {{storage}}
+      storageClassName: {{storage_class}}
+    EOF
+    printf '%s prepared: Kueue queues, runner RBAC, PVC %s (%d changed, %d unchanged)\n' \
+      "{{namespace}}" "{{pvc}}" "$changed" "$unchanged"
+
 campaign-validate config:
     python3 "{{repo_root}}/campaign/run.py" validate "{{config}}"
 
@@ -82,25 +130,26 @@ campaign-validate config:
 campaign-test-local config source_dir output:
     python3 "{{repo_root}}/campaign/run.py" test-local "{{config}}" --source-dir "{{source_dir}}" --output "{{output}}"
 
-# Orchestrate against the cluster from this checkout; keep the report locally.
-campaign-run-local config output:
-    python3 "{{repo_root}}/campaign/run.py" run-local "{{config}}" --output "{{output}}"
+# Submit a campaign to run fully in the cluster with a fresh timestamped ID
+# and a default output directory; extra flags pass through, e.g.
+# just campaign-up cfg --no-monitoring. The Kueue Job orchestrates the whole
+# sweep, so the run survives laptop disconnects.
+campaign-up config *flags:
+    @python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}" --fresh {{flags}}
 
-# Start the same local orchestrator in the background and return immediately.
-campaign-start-local config output:
-    python3 "{{repo_root}}/campaign/run.py" start-local "{{config}}" --output "{{output}}"
+# Watch a running cluster campaign: refresh its preview report once a minute
+# and exit when the campaign finishes (0 completed, 1 failed or stopped).
+campaign-watch config *flags:
+    @python3 "{{repo_root}}/campaign/run.py" watch-cluster "{{config}}" {{flags}}
 
-# Stop one running local campaign and retain its completed artifacts.
-campaign-stop-local config output:
-    python3 "{{repo_root}}/campaign/run.py" stop-local "{{config}}" --output "{{output}}"
+# Stop one running cluster campaign and retain its completed artifacts.
+campaign-stop config:
+    python3 "{{repo_root}}/campaign/run.py" stop-cluster "{{config}}"
 
-# Refresh a running campaign or copy its last report to Downloads as one HTML file.
-campaign-download-latest config output:
-    python3 "{{repo_root}}/campaign/run.py" download-latest "{{config}}" --output "{{output}}"
-
-# Fetch a finished cluster campaign from the PVC and save its standalone HTML to Downloads.
-campaign-download-cluster config output:
-    python3 "{{repo_root}}/campaign/run.py" download-cluster "{{config}}" --output "{{output}}"
+# Fetch a cluster campaign from the PVC: a snapshot preview while it runs,
+# the full tree plus the standalone HTML report in Downloads when finished.
+campaign-download config *flags:
+    python3 "{{repo_root}}/campaign/run.py" download-cluster "{{config}}" {{flags}}
 
 # Download all existing artifact directories for this campaign.
 campaign-download-artifacts config output:
@@ -109,9 +158,6 @@ campaign-download-artifacts config output:
 # Resume one specific PVC artifact directory into an existing local output directory.
 campaign-download-artifact config remote output:
     python3 "{{repo_root}}/campaign/run.py" download-artifacts "{{config}}" --remote "{{remote}}" --output "{{output}}"
-
-campaign-submit config:
-    python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}"
 
 campaign-build:
     podman build --platform linux/amd64 \
