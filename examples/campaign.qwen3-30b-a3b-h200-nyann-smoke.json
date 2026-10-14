@@ -22,7 +22,8 @@
     "values": [
       "guides/recipes/router/base.values.yaml",
       "guides/wide-ep/router/wide-ep.values.yaml",
-      "guides/wide-ep/router/qwen3-30b-a3b-overrides.values.yaml"
+      "guides/wide-ep/router/qwen3-30b-a3b-overrides.values.yaml",
+      "guides/wide-ep/router/qwen3-30b-a3b-dp2.values.yaml"
     ]
   },
   "monitoring": {
@@ -40,8 +41,8 @@
   "continue_on_failure": false,
   "overlays": [
     {
-      "name": "pd-p1w1d1w1",
-      "path": "guides/wide-ep/modelserver/gpu/vllm-qwen3-30b-a3b/deployments/p1w1d1w1",
+      "name": "pd-p1w1d1w1-dp2",
+      "path": "guides/wide-ep/modelserver/gpu/vllm-qwen3-30b-a3b/deployments/p1w1d1w1-dp2",
       "model_label": "Qwen3-30B-A3B",
       "pod_selector": "llm-d.ai/model=Qwen3-30B-A3B,llm-d.ai/inference-serving=true",
       "expected_pods": 2,
@@ -67,8 +68,8 @@
       "dimensions": {
         "topology": "pd",
         "nodes": 1,
-        "prefill_gpus": 4,
-        "decode_gpus": 4,
+        "prefill_gpus": 2,
+        "decode_gpus": 2,
         "prefill_cuda_graphs": "off",
         "context_length": "131072-yarn"
       }
