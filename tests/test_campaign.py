@@ -1370,6 +1370,9 @@ class CampaignTests(unittest.TestCase):
             def fake_kube(namespace, *args, **kwargs):
                 if args[:2] == ("get", "pods"):
                     return SimpleNamespace(stdout=json.dumps({"items": [pod]}), stderr="", returncode=0)
+                if args[:2] == ("get", "events"):
+                    return SimpleNamespace(stdout="FailedScheduling: Insufficient nvidia.com/gpu",
+                                           stderr="", returncode=0)
                 if args[0] == "describe":
                     return SimpleNamespace(stdout="Events: startup probe refused", stderr="", returncode=0)
                 if args[0] == "logs":
@@ -1387,6 +1390,10 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(entry["restarts"], {"vllm": 2})
             self.assertEqual(entry["waiting"], {"vllm": "CrashLoopBackOff"})
             self.assertIn("startup probe refused", entry["describe"])
+            # describe's Events section can be empty at capture time; the
+            # explicit events fetch keeps scheduler evidence like
+            # FailedScheduling for never-scheduled Pods.
+            self.assertIn("FailedScheduling", entry["events"])
             # A restarted container's previous logs are usually the crash itself.
             self.assertIn("vllm (previous)", entry["logs"])
 
@@ -1733,6 +1740,7 @@ class CampaignTests(unittest.TestCase):
                 "selector": "app=test-model",
                 "pods": [{"pod": "pod-a", "phase": "Running",
                           "restarts": {"vllm": 3}, "waiting": {"vllm": "CrashLoopBackOff"},
+                          "events": "FailedScheduling: Insufficient nvidia.com/gpu",
                           "logs": {"vllm": "ValueError: boom",
                                    "vllm (previous)": "Traceback: earlier crash"}}]}))
             campaign = {"status": "failed", "overlays": [
@@ -1740,6 +1748,7 @@ class CampaignTests(unittest.TestCase):
             banner = runner.AIPERF_REPORT.campaign_banner(campaign, root)
             self.assertIn("Failure diagnostics", banner)
             self.assertIn("pod-a · Running · vllm: CrashLoopBackOff · vllm: 3 restarts", banner)
+            self.assertIn("FailedScheduling", banner)
             self.assertIn("ValueError: boom", banner)
             self.assertIn("Traceback: earlier crash", banner)
             # A campaign without captured diagnostics renders exactly as before.

@@ -435,7 +435,8 @@ def failure_diagnostics_details(record_name: str, campaign_dir: Path) -> str:
         logs = "".join(
             f'<pre>{html.escape(text)}</pre>'
             for text in (pod.get("logs") or {}).values() if text)
-        parts.append(f'<details><summary>{html.escape(headline)}</summary>{logs}</details>')
+        events = (f'<pre>{html.escape(pod["events"])}</pre>' if pod.get("events") else "")
+        parts.append(f'<details><summary>{html.escape(headline)}</summary>{events}{logs}</details>')
     if not parts:
         return ""
     return ('<details class="campaign-detail campaign-failure-logs"><summary>'

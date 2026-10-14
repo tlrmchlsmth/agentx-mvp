@@ -447,10 +447,12 @@ Results are written to `<results PVC>:/workload/campaigns/<campaign-id>/`:
   including repeated concurrencies. Nyann stages come from its Job summary,
   also saved as `nyann-job.log`. A deployment that fails while its overlay was
   applied gets `failure-diagnostics.json` in its record directory — serving
-  Pod phases, restart counts, waiting reasons, and the last 200 lines of each
-  container's logs (plus the previous, crashed instance) — and the report's
-  Failure details section shows them; without this capture the teardown would
-  delete the only copy of the crashed containers' output.
+  Pod phases, restart counts, waiting reasons, the Pod's scheduler events
+  (whose `describe` Events section can already be empty by capture time), and
+  the last 200 lines of each container's logs (plus the previous, crashed
+  instance) — and the report's Failure details section shows them; without
+  this capture the teardown would delete the only copy of the crashed
+  containers' output.
 
 Full AIPerf and nyann artifacts stay in their existing `/workload/aiperf-agentx`
 and `/workload/nyann-agentx` directories, keyed by campaign, overlay, and tool.

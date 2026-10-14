@@ -977,6 +977,12 @@ def capture_failure_diagnostics(config: dict[str, Any], overlay: dict[str, Any],
             "waiting": {status["name"]: (status.get("state", {}).get("waiting") or {}).get("reason")
                         for status in statuses},
             "describe": kube(namespace, "describe", "pod", name, check=False).stdout,
+            # describe's Events section can already be empty at capture time
+            # (short cluster event TTL), and for a never-scheduled Pod the
+            # FailedScheduling events are the only evidence of why.
+            "events": kube(namespace, "get", "events", "--field-selector",
+                           f"involvedObject.name={name}", "--sort-by=.metadata.creationTimestamp",
+                           check=False).stdout,
             "logs": {},
         }
         for status in statuses:
