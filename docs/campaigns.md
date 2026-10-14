@@ -154,6 +154,19 @@ dashboards. Nyann stage windows come from the live Job log while the Job
 exists and from the runner's durable `nyann-job.log` afterwards, so a watch
 attached after a bench completed still gets its dashboards.
 
+To tail every log the campaign produces in one terminal, run:
+
+```bash
+just campaign-logs campaign-output/<id>.json
+```
+
+It aggregates the runner Job, the serving Pods of every overlay, the benchmark
+Jobs the campaign submits, and the campaign-managed router when configured,
+each line prefixed with its Pod (requires [stern](https://github.com/stern/stern),
+`brew install stern`). Only running Pods are tailed, so completed benchmark
+Jobs left over from earlier campaigns stay quiet. Ctrl-C detaches without
+affecting the campaign.
+
 To stop a running campaign, use the printed stop command:
 
 ```bash

@@ -1221,6 +1221,80 @@ class CampaignTests(unittest.TestCase):
             self.assertIn("has not started yet", captured_out.getvalue())
             self.assertNotIn("Watch refresh failed", captured_err.getvalue())
 
+    def test_stern_commands_tail_runner_benchmarks_serving_and_router(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            # Distinct selectors must each get their own invocation; both
+            # overlays sharing one selector must not duplicate it.
+            config["overlays"][1]["pod_selector"] = "app=other-model"
+            config["router"] = {"release": "wide-ep"}
+            commands = runner.stern_commands(config)
+            base = ["stern", "--namespace", "vllm", "--timestamps",
+                    "--field-selector", "status.phase=Running"]
+            # The runner Pod is matched by its job-name label (long campaign
+            # IDs truncate Pod names below the 63-character limit), and only
+            # Running Pods match so finished Jobs from earlier campaigns stay
+            # silent.
+            self.assertEqual(commands[0], base + ["--selector", "job-name=campaign-test-campaign"])
+            self.assertEqual(commands[1], base + [r"^(nyann-|aiperf-)"])
+            self.assertEqual(commands[2], base + ["--selector", "app=other-model"])
+            self.assertEqual(commands[3], base + ["--selector", "app=test-model"])
+            self.assertEqual(commands[4], base + ["--selector", "llm-d-router-gateway=wide-ep-epp"])
+
+    def test_stern_commands_skip_router_without_one_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            commands = runner.stern_commands(config)
+            self.assertEqual(len(commands), 3)  # runner, benchmarks, one deduped selector
+            self.assertFalse(any("router" in argument for command in commands for argument in command))
+
+    def test_logs_cluster_requires_stern(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            with patch.object(runner.shutil, "which", return_value=None), \
+                 redirect_stderr(io.StringIO()) as captured:
+                self.assertEqual(runner.logs_cluster(config), 1)
+            self.assertIn("brew install stern", captured.getvalue())
+
+    def test_logs_cluster_returns_130_on_interrupt_and_terminates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            processes = []
+
+            def fake_popen(args):
+                process = SimpleNamespace(terminated=False)
+                process.poll = lambda: None
+                process.terminate = lambda: setattr(process, "terminated", True)
+                process.wait = lambda: 0
+                processes.append(process)
+                return process
+
+            with patch.object(runner.shutil, "which", return_value="/opt/homebrew/bin/stern"), \
+                 patch.object(runner.subprocess, "Popen", side_effect=fake_popen), \
+                 patch.object(runner.time, "sleep", side_effect=KeyboardInterrupt):
+                self.assertEqual(runner.logs_cluster(config), 130)
+            self.assertEqual(len(processes), 3)
+            self.assertTrue(all(process.terminated for process in processes))
+
+    def test_logs_cluster_stops_surviving_sterns_when_one_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            processes = []
+
+            def fake_popen(args):
+                process = SimpleNamespace(terminated=False, returncode=None if processes else 1)
+                process.poll = lambda: process.returncode
+                process.terminate = lambda: setattr(process, "terminated", True)
+                process.wait = lambda: process.returncode or 0
+                processes.append(process)
+                return process
+
+            with patch.object(runner.shutil, "which", return_value="/opt/homebrew/bin/stern"), \
+                 patch.object(runner.subprocess, "Popen", side_effect=fake_popen):
+                self.assertEqual(runner.logs_cluster(config), 1)
+            self.assertFalse(processes[0].terminated)  # already dead
+            self.assertTrue(processes[1].terminated)
+
     def test_fetch_running_cluster_state_reports_not_started(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

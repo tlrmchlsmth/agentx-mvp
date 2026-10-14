@@ -2337,6 +2337,58 @@ def stop_cluster(config: dict[str, Any]) -> None:
     print(f"Campaign {campaign_id} stopped; results remain on {config['results_pvc']}", flush=True)
 
 
+def stern_commands(config: dict[str, Any]) -> list[list[str]]:
+    """Build one stern invocation per log source of a running campaign.
+
+    stern matches either a pod-name query or a single label selector per
+    invocation, so the runner Pod, the benchmark Pods, each distinct
+    serving-Pod selector, and the router each get their own process whose
+    output interleaves in one terminal, every line prefixed with its Pod.
+    The runner Pod is matched through its job-name label: long campaign IDs
+    truncate Pod names below the 63-character limit while the label keeps
+    the full Job name. Benchmark Jobs can only be matched by name prefix
+    (their run-id annotation is not selectable and their name hash is not
+    derivable from the config). Only Running Pods match, so finished Jobs
+    from earlier campaigns in the namespace do not dump their old logs on
+    attach.
+    """
+    base = ["stern", "--namespace", config["namespace"], "--timestamps",
+            "--field-selector", "status.phase=Running"]
+    commands = [base + ["--selector", f"job-name=campaign-{config['id']}"],
+                base + [r"^(nyann-|aiperf-)"]]
+    for selector in sorted({overlay["pod_selector"] for overlay in config["overlays"]}):
+        commands.append(base + ["--selector", selector])
+    if "router" in config:
+        commands.append(base + ["--selector", f"llm-d-router-gateway={config['router']['release']}-epp"])
+    return commands
+
+
+def logs_cluster(config: dict[str, Any]) -> int:
+    """Tail every log a running campaign produces: the runner Job, the serving
+    Pods of every overlay, the benchmark Jobs it submits, and the router when
+    the campaign manages one. Ctrl-C detaches without touching the campaign.
+    Returns 130 on Ctrl-C, otherwise the exit code of the first stern that
+    stopped on its own (a tail never ends by itself, so that is a failure)."""
+    if shutil.which("stern") is None:
+        print("campaign logs need stern on this laptop: brew install stern", file=sys.stderr)
+        return 1
+    processes = [subprocess.Popen(args) for args in stern_commands(config)]
+    try:
+        while all(process.poll() is None for process in processes):
+            time.sleep(1)
+        code = next(process.returncode for process in processes if process.returncode is not None)
+    except KeyboardInterrupt:
+        code = 130
+    finally:
+        # One source's stern exiting must not leave the command hanging on
+        # the survivors; SIGINT already reached every process on Ctrl-C.
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+            process.wait()
+    return code
+
+
 def copy_aiperf_sample(namespace: str, pod_name: str, profile: Path, destination: Path) -> Path:
     """Copy report inputs without transferring potentially huge raw traces."""
     sample_name = profile.parent.name
@@ -3018,8 +3070,9 @@ def write_derived_config(config: dict[str, Any], output: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["validate", "submit", "run", "test-local",
-                                           "watch-cluster", "stop-cluster", "download-cluster",
-                                           "download-artifacts", "report-local"])
+                                           "watch-cluster", "logs-cluster", "stop-cluster",
+                                           "download-cluster", "download-artifacts",
+                                           "report-local"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--image", help="runner image for submit")
     parser.add_argument("--service-account", default="benchmark-campaign")
@@ -3073,6 +3126,8 @@ def main() -> int:
             return test_local(config, args.output, args.source_dir)
         if args.action == "watch-cluster":
             return watch_cluster(config, args.output, args.dest)
+        if args.action == "logs-cluster":
+            return logs_cluster(config)
         if args.action == "stop-cluster":
             stop_cluster(config)
             return 0
