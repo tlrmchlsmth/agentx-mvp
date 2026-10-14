@@ -81,7 +81,7 @@
       "concurrencies": [
         8
       ],
-      "duration_seconds": 300,
+      "duration_seconds": 60,
       "isl": 1024,
       "osl": 512,
       "warmup_seconds": 60
