@@ -408,10 +408,41 @@ def preview_header_css() -> str:
 .campaign-detail p{margin-top:8px;overflow-wrap:anywhere}
 .campaign-note{font-size:12px;color:#d3bd85;margin-top:10px}
 .campaign-benchmark-summary{font-size:12px;color:#d8eaff;margin:10px 0 4px;overflow-wrap:anywhere}
+.campaign-failure-logs details{margin-top:8px}
+.campaign-failure-logs summary{cursor:pointer;color:#8e8e8e;font-size:12px}
+.campaign-failure-logs pre{white-space:pre-wrap;max-height:340px;overflow:auto;background:#16161a;
+padding:8px;border-radius:6px;font-size:11px;margin-top:6px}
 </style>"""
 
 
-def campaign_banner(campaign: dict[str, Any]) -> str:
+def failure_diagnostics_details(record_name: str, campaign_dir: Path) -> str:
+    """Render the Pod states and container log tails captured for a failed overlay."""
+    path = campaign_dir / record_name / "failure-diagnostics.json"
+    if not path.is_file():
+        return ""
+    try:
+        captured = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return ""
+    parts = []
+    for pod in captured.get("pods", []):
+        headline = " · ".join(filter(None, [
+            pod.get("pod"), pod.get("phase"),
+            *(f"{container}: {reason}" for container, reason in (pod.get("waiting") or {}).items() if reason),
+            *(f"{container}: {restarts} restarts" for container, restarts in (pod.get("restarts") or {}).items()
+              if restarts),
+        ]))
+        logs = "".join(
+            f'<pre>{html.escape(text)}</pre>'
+            for text in (pod.get("logs") or {}).values() if text)
+        parts.append(f'<details><summary>{html.escape(headline)}</summary>{logs}</details>')
+    if not parts:
+        return ""
+    return ('<details class="campaign-detail campaign-failure-logs"><summary>'
+            'Failure diagnostics</summary>' + "".join(parts) + '</details>')
+
+
+def campaign_banner(campaign: dict[str, Any], campaign_dir: Path | None = None) -> str:
     """Summarize campaign state above the shared interactive charts."""
     records = campaign.get("overlays", [])
     completed = sum(record.get("status") == "completed" for record in records)
@@ -429,18 +460,22 @@ def campaign_banner(campaign: dict[str, Any]) -> str:
     if campaign.get("mode") == "mock-test":
         banner += '<p class="campaign-note"><strong>MOCK DATA:</strong> no benchmark or Grafana query ran.</p>'
     errors = []
+    diagnostics = []
     for field in ("error", "report_error"):
         if campaign.get(field):
             errors.append(f"Campaign: {campaign[field]}")
     for record in records:
         if record.get("error"):
             errors.append(f"{record['name']}: {record['error']}")
+            if campaign_dir is not None:
+                diagnostics.append(failure_diagnostics_details(record["name"], campaign_dir))
         for bench in record.get("benchmarks", []):
             if bench.get("error"):
                 errors.append(f"{record['name']} / {bench['tool']}: {bench['error']}")
     if errors:
         banner += ('<details class="campaign-detail"><summary>Failure details</summary><pre>'
                    + html.escape("\n\n".join(errors)) + '</pre></details>')
+    banner += "".join(item for item in diagnostics if item)
     return banner
 
 
@@ -562,7 +597,7 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
     module_spec.loader.exec_module(renderer)
 
     if campaign is not None:
-        extra_html = campaign_banner(campaign) + extra_html
+        extra_html = campaign_banner(campaign, root) + extra_html
     if not runs:
         if campaign is None:
             raise SystemExit(f"No completed live AIPerf runs in {root}")

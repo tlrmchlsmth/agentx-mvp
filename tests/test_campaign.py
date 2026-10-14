@@ -437,6 +437,56 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "simple CLI flags"):
                 runner.load_config(path)
 
+    def test_failed_overlay_captures_diagnostics_before_teardown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            calls = []
+            pod = {"metadata": {"name": "pod-a"},
+                   "status": {"phase": "Running", "containerStatuses": [
+                       {"name": "vllm", "restartCount": 1,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}}
+
+            def fake_call(args, **kwargs):
+                return SimpleNamespace(stdout=MARKER_MANIFEST, returncode=0)
+
+            def fake_kube(namespace, *args, **kwargs):
+                calls.append(args)
+                if args[:2] == ("get", "pods"):
+                    return SimpleNamespace(stdout=json.dumps({"items": [pod]}),
+                                           stderr="", returncode=0)
+                if args[0] == "describe":
+                    return SimpleNamespace(stdout="Events: startup probe refused",
+                                           stderr="", returncode=0)
+                if args[0] == "logs":
+                    return SimpleNamespace(stdout="ValueError: boom", stderr="", returncode=0)
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+            def fake_submit(config, overlay, bench, folder, baseline, commit, source_commit):
+                raise AssertionError("benchmarks must not run after a readiness failure")
+
+            with run_harness(root, call=fake_call, kube=fake_kube, submit=fake_submit,
+                             extra=(patch.object(runner, "apply_vllm_image",
+                                                 side_effect=lambda rendered, image: rendered),
+                                    patch.object(runner, "wait_ready",
+                                                 side_effect=TimeoutError(
+                                                     "baseline: expected 2 ready Pods for app=test-model")))):
+                self.assertEqual(runner.run(config, root), 1)
+            apply_at = next(i for i, args in enumerate(calls) if args[0] == "apply")
+            describe_at = next(i for i, args in enumerate(calls) if args[0] == "describe")
+            delete_at = next(i for i, args in enumerate(calls) if args[0] == "delete")
+            # The capture must happen while the overlay still exists: after the
+            # apply, before the teardown delete.
+            self.assertLess(apply_at, describe_at)
+            self.assertLess(describe_at, delete_at)
+            captured = json.loads(
+                (root / "campaigns/test-campaign/baseline/failure-diagnostics.json").read_text())
+            self.assertEqual(captured["pods"][0]["waiting"], {"vllm": "CrashLoopBackOff"})
+            self.assertIn("ValueError: boom", captured["pods"][0]["logs"]["vllm"])
+            summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
+            self.assertEqual(summary["status"], "failed")
+            self.assertIn("expected 2 ready Pods", summary["overlays"][0]["error"])
+
     def test_runs_overlays_sequentially_and_records_results(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1226,9 +1276,60 @@ class CampaignTests(unittest.TestCase):
             record_files = {path.name for path in downloads if path.parent.name == "baseline"}
             # nyann-job.log is the durable stage-window source for completed
             # nyann benches, whose Job object the cluster may already have
-            # reclaimed when a watch attaches late.
+            # reclaimed when a watch attaches late. failure-diagnostics.json
+            # only exists for overlays that failed while deployed.
             self.assertEqual(record_files, {"nyann-submit.log", "nyann-job.log",
-                                            "aiperf-submit.log", "serving-pods.json"})
+                                            "aiperf-submit.log", "serving-pods.json",
+                                            "failure-diagnostics.json"})
+
+    def test_capture_failure_diagnostics_records_pod_state_and_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            overlay = config["overlays"][0]
+            folder = root / "baseline"
+            pod = {"metadata": {"name": "pod-a"},
+                   "status": {"phase": "Running", "containerStatuses": [
+                       {"name": "vllm", "restartCount": 2,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}}
+
+            def fake_kube(namespace, *args, **kwargs):
+                if args[:2] == ("get", "pods"):
+                    return SimpleNamespace(stdout=json.dumps({"items": [pod]}), stderr="", returncode=0)
+                if args[0] == "describe":
+                    return SimpleNamespace(stdout="Events: startup probe refused", stderr="", returncode=0)
+                if args[0] == "logs":
+                    return SimpleNamespace(stdout=f"log for {args[-1]}", stderr="", returncode=0)
+                raise AssertionError(args)
+
+            with patch.object(runner, "kube", side_effect=fake_kube):
+                runner.capture_failure_diagnostics(config, overlay, folder)
+            captured = json.loads((folder / "failure-diagnostics.json").read_text())
+            self.assertEqual(captured["selector"], "app=test-model")
+            self.assertEqual(len(captured["pods"]), 1)
+            entry = captured["pods"][0]
+            self.assertEqual(entry["pod"], "pod-a")
+            self.assertEqual(entry["phase"], "Running")
+            self.assertEqual(entry["restarts"], {"vllm": 2})
+            self.assertEqual(entry["waiting"], {"vllm": "CrashLoopBackOff"})
+            self.assertIn("startup probe refused", entry["describe"])
+            # A restarted container's previous logs are usually the crash itself.
+            self.assertIn("vllm (previous)", entry["logs"])
+
+    def test_capture_failure_diagnostics_survives_cluster_list_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            folder = root / "baseline"
+
+            def fake_kube(namespace, *args, **kwargs):
+                return SimpleNamespace(stdout="", stderr="error: boom", returncode=1)
+
+            with patch.object(runner, "kube", side_effect=fake_kube), \
+                 redirect_stderr(io.StringIO()) as errors:
+                runner.capture_failure_diagnostics(config, config["overlays"][0], folder)
+            self.assertFalse((folder / "failure-diagnostics.json").exists())
+            self.assertIn("failure diagnostics unavailable", errors.getvalue())
 
     def test_aiperf_report_matches_each_requested_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1548,6 +1649,28 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(metadata["source_commit"], "a" * 40)
                 self.assertIn(commit, (root / "aiperf-agentx" / f"campaign-{build}-pd-aiperf" /
                                        "index.html").read_text())
+
+    def test_campaign_banner_includes_failure_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = root / "baseline"
+            record.mkdir()
+            (record / "failure-diagnostics.json").write_text(json.dumps({
+                "selector": "app=test-model",
+                "pods": [{"pod": "pod-a", "phase": "Running",
+                          "restarts": {"vllm": 3}, "waiting": {"vllm": "CrashLoopBackOff"},
+                          "logs": {"vllm": "ValueError: boom",
+                                   "vllm (previous)": "Traceback: earlier crash"}}]}))
+            campaign = {"status": "failed", "overlays": [
+                {"name": "baseline", "status": "failed", "error": "expected 2 ready Pods"}]}
+            banner = runner.AIPERF_REPORT.campaign_banner(campaign, root)
+            self.assertIn("Failure diagnostics", banner)
+            self.assertIn("pod-a · Running · vllm: CrashLoopBackOff · vllm: 3 restarts", banner)
+            self.assertIn("ValueError: boom", banner)
+            self.assertIn("Traceback: earlier crash", banner)
+            # A campaign without captured diagnostics renders exactly as before.
+            self.assertNotIn("Failure diagnostics",
+                             runner.AIPERF_REPORT.campaign_banner(campaign, root / "missing"))
 
     def test_aiperf_setup_shows_sweep_and_fixed_profile(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2359,7 +2482,9 @@ class CampaignTests(unittest.TestCase):
                  patch.object(runner, "snapshot", return_value=[]), \
                  patch.object(runner, "wait_ready", side_effect=RuntimeError("not ready")):
                 self.assertEqual(runner.run(config, root), 1)
-            self.assertEqual(actions, ["get", "apply", "delete", "delete"])
+            # The extra "get" is the failure-diagnostics pod listing, attempted
+            # between the apply and the teardown delete.
+            self.assertEqual(actions, ["get", "apply", "get", "delete", "delete"])
             summary = json.loads((root / "campaigns/test-campaign/summary.json").read_text())
             self.assertEqual(len(summary["overlays"]), 1)
             self.assertEqual(summary["overlays"][0]["cleanup_error"], "teardown failed")

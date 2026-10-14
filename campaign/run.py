@@ -52,6 +52,7 @@ DIMENSION_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 JOB_LINE = re.compile(r"^Job queued: ([a-z0-9-]+) ", re.MULTILINE)
 GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 BUILD_ACTION = re.compile(r"^(?:checkout|merge|cherry-pick|cherry-pick-parent1|cherry-pick-m[1-9][0-9]*)$")
+FAILURE_LOG_TAIL = 200
 # Defaults for a campaign-managed EPP router, mirroring guides/env.sh in llm-d.
 ROUTER_RELEASE = "wide-ep"
 ROUTER_CHART = "oci://ghcr.io/llm-d/charts/llm-d-router-standalone"
@@ -948,6 +949,48 @@ def wait_gone(config: dict[str, Any], selector: str) -> None:
             return
         time.sleep(5)
     raise TimeoutError(f"serving Pods still exist after cleanup: {selector}")
+
+
+def capture_failure_diagnostics(config: dict[str, Any], overlay: dict[str, Any], folder: Path) -> None:
+    """Snapshot serving Pod state and container logs for a failed overlay.
+
+    The case loop tears the overlay down right after recording the failure,
+    deleting the only copy of the crashed containers' output; a readiness
+    timeout on its own says nothing about why the Pods never came up. Best
+    effort — capture problems are reported but never mask the original error.
+    """
+    namespace, selector = config["namespace"], overlay["pod_selector"]
+    listed = kube(namespace, "get", "pods", "-l", selector, "-o", "json", check=False)
+    try:
+        pods = json.loads(listed.stdout)["items"]
+    except (json.JSONDecodeError, KeyError):
+        print(f"campaign: failure diagnostics unavailable: {listed.stderr.strip()}", file=sys.stderr, flush=True)
+        return
+    report: dict[str, Any] = {"selector": selector, "pods": []}
+    for pod in pods:
+        name = pod["metadata"]["name"]
+        statuses = pod.get("status", {}).get("containerStatuses", [])
+        entry: dict[str, Any] = {
+            "pod": name,
+            "phase": pod.get("status", {}).get("phase"),
+            "restarts": {status["name"]: status.get("restartCount", 0) for status in statuses},
+            "waiting": {status["name"]: (status.get("state", {}).get("waiting") or {}).get("reason")
+                        for status in statuses},
+            "describe": kube(namespace, "describe", "pod", name, check=False).stdout,
+            "logs": {},
+        }
+        for status in statuses:
+            container = status["name"]
+            current = kube(namespace, "logs", name, "-c", container,
+                           f"--tail={FAILURE_LOG_TAIL}", check=False)
+            entry["logs"][container] = current.stdout or current.stderr
+            if status.get("restartCount"):
+                previous = kube(namespace, "logs", name, "-c", container, "--previous",
+                                f"--tail={FAILURE_LOG_TAIL}", check=False)
+                entry["logs"][f"{container} (previous)"] = previous.stdout or previous.stderr
+        report["pods"].append(entry)
+    (folder / "failure-diagnostics.json").write_text(json.dumps(report, indent=2))
+    print(f"Overlay failure diagnostics captured: {folder / 'failure-diagnostics.json'}", flush=True)
 
 
 def wait_router_ready(config: dict[str, Any], router_manifest: str) -> None:
@@ -2065,6 +2108,10 @@ def _run_campaign(config: dict[str, Any], results_root: Path = Path("/workload")
             except Exception as exc:
                 record["status"] = "failed"
                 record["error"] = str(exc)
+                if applied:
+                    # Runs before the finally tears the overlay down: the crashed
+                    # containers' logs are the only evidence of why it failed.
+                    capture_failure_diagnostics(config, overlay, folder)
                 print(f"campaign: overlay {name} failed: {exc}", file=sys.stderr, flush=True)
                 failed = True
             finally:
@@ -2405,7 +2452,9 @@ def fetch_running_cluster_state(config: dict[str, Any], output: Path, pod_name: 
             # The runner writes nyann-job.log to the PVC when the bench
             # completes; the live-log fallback needs the Job object to still
             # exist, which no longer holds once the cluster reclaims it.
-            for filename in ("nyann-submit.log", "nyann-job.log", "aiperf-submit.log", "serving-pods.json"):
+            # failure-diagnostics.json only exists for failed overlays.
+            for filename in ("nyann-submit.log", "nyann-job.log", "aiperf-submit.log",
+                             "serving-pods.json", "failure-diagnostics.json"):
                 remote_file = remote_campaign / record["name"] / filename
                 exists = kube(namespace, "exec", pod_name, "--", "test", "-f", str(remote_file), check=False)
                 if exists.returncode == 0:
