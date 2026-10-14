@@ -2653,7 +2653,7 @@ def preview_local(config: dict[str, Any], output: Path, *, pod_name: str,
     assert_saved_config(campaign_dir, config)
     summary = json.loads((campaign_dir / "summary.json").read_text())
     if summary["status"] != "running":
-        print(f"Campaign is {summary['status']}; use its final report if available")
+        print(f"Campaign is {summary['status']}; use its final report if available", flush=True)
         return 0
     namespace = config["namespace"]
     remote_root = "/workload/aiperf-agentx"
@@ -2827,7 +2827,7 @@ def preview_local(config: dict[str, Any], output: Path, *, pod_name: str,
         staged = render / "index.html"
         staged.write_text(page)
         staged.replace(preview / "index.html")
-    print(f"Preview: {preview / 'index.html'} ({len(runs)} completed samples)")
+    print(f"Preview: {preview / 'index.html'} ({len(runs)} completed samples)", flush=True)
     return 0
 
 
