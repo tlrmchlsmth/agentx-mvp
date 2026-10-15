@@ -1,0 +1,90 @@
+{
+  "id": "qwen3-30b-a3b-h200-pd-nyann-smoke-001",
+  "namespace": "ecrncevi-qwen3-campaign",
+  "source": {
+    "repo": "https://github.com/elvircrn/llm-d.git",
+    "ref": "small-model"
+  },
+  "vllm_images": [
+    {
+      "name": "nightly",
+      "image": "docker.io/vllm/vllm-openai:nightly"
+    },
+    {
+      "name": "0-31-0",
+      "image": "docker.io/vllm/vllm-openai:v0.31.0"
+    }
+  ],
+  "router": {
+    "release": "wide-ep",
+    "chart": "oci://ghcr.io/llm-d/charts/llm-d-router-standalone",
+    "version": "v0",
+    "values": [
+      "guides/recipes/router/base.values.yaml",
+      "guides/wide-ep/router/wide-ep.values.yaml",
+      "guides/wide-ep/router/qwen3-30b-a3b-overrides.values.yaml",
+      "guides/wide-ep/router/qwen3-30b-a3b-dp2.values.yaml"
+    ]
+  },
+  "monitoring": {
+    "grafana_namespace": "llm-d-monitoring",
+    "grafana_service": "llmd-grafana",
+    "auth_secret": "llmd-grafana",
+    "dashboard_uid": "wideep-overview"
+  },
+  "results_pvc": "workload-pvc",
+  "benchmark_queue": "live-benchmark-client",
+  "campaign_queue": "benchmark-campaign",
+  "rollout_timeout_seconds": 3600,
+  "admission_timeout_seconds": 3600,
+  "cleanup_timeout_seconds": 900,
+  "continue_on_failure": false,
+  "overlays": [
+    {
+      "name": "pd-p1w1d1w1-dp2",
+      "path": "guides/wide-ep/modelserver/gpu/vllm-qwen3-30b-a3b/deployments/p1w1d1w1-dp2",
+      "model_label": "Qwen3-30B-A3B",
+      "pod_selector": "llm-d.ai/model=Qwen3-30B-A3B,llm-d.ai/inference-serving=true",
+      "expected_pods": 2,
+      "vllm_cli_args": {
+        "prefill": [
+          "-cc.cudagraph_mode=NONE",
+          "--hf-overrides={\"max_position_embeddings\":131072,\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":32768}}"
+        ],
+        "decode": [
+          "--hf-overrides={\"max_position_embeddings\":131072,\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":32768}}"
+        ]
+      },
+      "vllm_env": {
+        "prefill": {
+          "VLLM_SERVER_DEV_MODE": "1",
+          "MAX_MODEL_LEN": "131072"
+        },
+        "decode": {
+          "VLLM_SERVER_DEV_MODE": "1",
+          "MAX_MODEL_LEN": "131072"
+        }
+      },
+      "dimensions": {
+        "topology": "pd",
+        "nodes": 1,
+        "prefill_gpus": 2,
+        "decode_gpus": 2,
+        "prefill_cuda_graphs": "off",
+        "context_length": "131072-yarn"
+      }
+    }
+  ],
+  "benchmarks": [
+    {
+      "tool": "nyann",
+      "concurrencies": [
+        8
+      ],
+      "duration_seconds": 60,
+      "isl": 1024,
+      "osl": 512,
+      "warmup_seconds": 60
+    }
+  ]
+}

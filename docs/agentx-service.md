@@ -198,9 +198,9 @@ every attempt and exact unpadded measurement window, vLLM image/fingerprint,
 live target-health and duplicate-scrape evidence, exact-window Prometheus
 exports, benchmark stdout, server/GPU telemetry provenance and warnings,
 effective request, target, and queue configuration, and SHA-256 artifact
-hashes. Existing
-`gen_interactivity_chart.py`, Grafana export, dashboard overlay, and report
-files remain unchanged and can operate on the canonical directories.
+hashes. `gen_interactivity_chart.py` is the shared chart renderer driven by
+`report.py`, which also performs Grafana export, dashboard overlay, and report
+generation on the canonical directories.
 
 `just run`, `just smoke`, `just sweep`, and `just orchestrator-run` all submit
 strict request JSON through the authenticated MCP endpoint of the same
@@ -208,4 +208,5 @@ in-cluster typed controller, preserving its single capacity transaction.
 Existing scripts
 needing positional behavior are explicitly prefixed `legacy-` (`legacy-run`,
 `legacy-sweep`, and `legacy-orchestrator-run`) and are not agent-facing.
-Historical report/dashboard recipes remain available for old result trees.
+Current runs are reported through `report.py`; the historical report/dashboard
+recipes for legacy `results_*` trees have been removed.

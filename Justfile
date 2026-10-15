@@ -12,6 +12,9 @@ set export
 #   just orchestrator-run  # submit through the durable in-cluster controller
 #   just logs / just shell # inspect the typed service
 #   just clean             # delete typed Jobs and service resources
+#   just live-aiperf 1,4,8,16 # benchmark the deployed llm-d model
+#   just live-nyann 1,4,8 1024 512 # synthetic nyann-bench sweep
+#   just live-aiperf-report   # download the newest portable report
 
 NAMESPACE := env_var_or_default('NAMESPACE', 'vllm')
 repo_root := justfile_directory()
@@ -26,6 +29,7 @@ manifesto_user := env_var_or_default('MANIFESTO_USER', env_var_or_default('USER'
 manifesto_args := env_var_or_default('MANIFESTO_ARGS', '')
 kueue_queue := env_var_or_default('KUEUE_QUEUE', 'nightly-eval')
 aiperf_image := env_var_or_default('AIPERF_IMAGE', 'quay.io/tms/aiperf:agentx-v0')
+nyann_image := env_var_or_default('NYANN_IMAGE', 'ghcr.io/neuralmagic/nyann-bench:latest')
 lustre_claim := env_var_or_default('LUSTRE_CLAIM', 'lustre-pvc-vllm')
 lustre_mount := env_var_or_default('LUSTRE_MOUNT', '/mnt/lustre')
 lustre_prefix := env_var_or_default('LUSTRE_PREFIX', '/mnt/lustre/agentx-mvp')
@@ -33,6 +37,7 @@ orchestrator_image := env_var_or_default('ORCHESTRATOR_IMAGE', 'quay.io/tms/benc
 agentx_service_image := env_var_or_default('AGENTX_SERVICE_IMAGE', 'quay.io/tms/agentx-service:0.1.0')
 orchestrator_manifesto_repo := env_var_or_default('ORCHESTRATOR_MANIFESTO_REPO', 'https://github.com/tlrmchlsmth/llm-manifesto.git')
 orchestrator_manifesto_ref := env_var_or_default('ORCHESTRATOR_MANIFESTO_REF', 'main')
+campaign_image := env_var_or_default('CAMPAIGN_IMAGE', 'quay.io/tms/benchmark-orchestrator:amd64')
 orchestrator_deploy := "benchmark-orchestrator"
 orchestrator_spec_configmap := "benchmark-orchestrator-spec"
 model     := env_var_or_default('MODEL', 'deepseek-ai/DeepSeek-V4-Pro')
@@ -57,6 +62,131 @@ agentx_request := env_var_or_default('AGENTX_REQUEST', 'examples/kimi-k3-a100-fu
 
 default:
     @just --list
+
+# Install the shared one-at-a-time CPU benchmark queue in the serving namespace.
+live-benchmark-kueue-setup namespace:
+    kubectl apply -f "{{repo_root}}/kueue/live-benchmark-cluster-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/live-benchmark-local-queue.yaml"
+
+# Queue one overlay campaign at a time in the serving namespace. The campaign
+# queue is separate from the child benchmark queue to avoid admission deadlock.
+campaign-setup namespace:
+    kubectl apply -f "{{repo_root}}/kueue/campaign-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/kueue/campaign-local-queue.yaml"
+    kubectl apply -n "{{namespace}}" -f "{{repo_root}}/campaign/rbac.yaml"
+
+# One-time namespace bootstrap: the namespace itself, both Kueue queues, runner
+# RBAC, and the results PVC. Override the PVC name, size, and storage class to
+# match the campaign config's results_pvc and cluster provisioner.
+campaign-prepare namespace pvc="workload-pvc" storage="20Gi" storage_class="shared-vast":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Report only what changed: drop the per-resource "unchanged" chatter and
+    # the benign warning kubectl prints (and patches) when a resource was first
+    # created outside kubectl apply.
+    changed=0
+    unchanged=0
+    apply() {
+      local out line
+      if ! out=$(kubectl apply "$@" 2>&1); then
+        printf '%s\n' "$out" >&2
+        return 1
+      fi
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+          *" unchanged") unchanged=$((unchanged + 1)) ;;
+          *last-applied-configuration*) ;;
+          *) changed=$((changed + 1)); printf '%s\n' "$line" ;;
+        esac
+      done <<< "$out"
+    }
+    kubectl create namespace --dry-run=client -o yaml "{{namespace}}" | apply -f -
+    apply -f "{{repo_root}}/kueue/live-benchmark-cluster-queue.yaml"
+    apply -n "{{namespace}}" -f "{{repo_root}}/kueue/live-benchmark-local-queue.yaml"
+    apply -f "{{repo_root}}/kueue/campaign-queue.yaml"
+    apply -n "{{namespace}}" -f "{{repo_root}}/kueue/campaign-local-queue.yaml"
+    apply -n "{{namespace}}" -f "{{repo_root}}/campaign/rbac.yaml"
+    apply -n "{{namespace}}" -f - <<EOF
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: {{pvc}}
+    spec:
+      accessModes:
+        - ReadWriteMany
+      resources:
+        requests:
+          storage: {{storage}}
+      storageClassName: {{storage_class}}
+    EOF
+    printf '%s prepared: Kueue queues, runner RBAC, PVC %s (%d changed, %d unchanged)\n' \
+      "{{namespace}}" "{{pvc}}" "$changed" "$unchanged"
+
+campaign-validate config:
+    python3 "{{repo_root}}/campaign/run.py" validate "{{config}}"
+
+# Render every build/overlay case and preview build Jobs without contacting Kubernetes.
+campaign-test-local config source_dir output:
+    python3 "{{repo_root}}/campaign/run.py" test-local "{{config}}" --source-dir "{{source_dir}}" --output "{{output}}"
+
+# Submit a campaign to run fully in the cluster with a fresh timestamped ID
+# and a default output directory; extra flags pass through, e.g.
+# just campaign-up cfg --no-monitoring. The Kueue Job orchestrates the whole
+# sweep, so the run survives laptop disconnects.
+campaign-up config *flags:
+    @python3 "{{repo_root}}/campaign/run.py" submit "{{config}}" --image "{{campaign_image}}" --fresh {{flags}}
+
+# Watch a running cluster campaign: refresh its preview report once a minute
+# and exit when the campaign finishes (0 completed, 1 failed or stopped).
+campaign-watch config *flags:
+    @python3 "{{repo_root}}/campaign/run.py" watch-cluster "{{config}}" {{flags}}
+
+# Tail all logs of a running cluster campaign in one terminal: the runner Job,
+# the serving Pods of every overlay, the benchmark Jobs, the vLLM prebuild
+# Jobs, and the router. Requires stern (brew install stern); Ctrl-C detaches
+# without stopping it.
+campaign-logs config:
+    @python3 "{{repo_root}}/campaign/run.py" logs-cluster "{{config}}"
+
+# Stop one running cluster campaign and retain its completed artifacts.
+campaign-stop config:
+    python3 "{{repo_root}}/campaign/run.py" stop-cluster "{{config}}"
+
+# Fetch a cluster campaign from the PVC: a snapshot preview while it runs,
+# the full tree plus the standalone HTML report in Downloads when finished.
+campaign-download config *flags:
+    python3 "{{repo_root}}/campaign/run.py" download-cluster "{{config}}" {{flags}}
+
+# Download all existing artifact directories for this campaign.
+campaign-download-artifacts config output:
+    python3 "{{repo_root}}/campaign/run.py" download-artifacts "{{config}}" --output "{{output}}"
+
+# Resume one specific PVC artifact directory into an existing local output directory.
+campaign-download-artifact config remote output:
+    python3 "{{repo_root}}/campaign/run.py" download-artifacts "{{config}}" --remote "{{remote}}" --output "{{output}}"
+
+campaign-build:
+    podman build --platform linux/amd64 \
+      --build-arg CAMPAIGN_ONLY=true \
+      -f Dockerfile.orchestrator -t {{campaign_image}} .
+
+campaign-push:
+    podman push {{campaign_image}}
+
+# Benchmark the currently deployed llm-d model. This is intentionally a thin
+# deployment-coupled path: it discovers the model/topology, captures the
+# serving spec, and submits one autonomous sweep Job.
+live-aiperf concurrencies:
+    ./live-aiperf/submit.sh "{{concurrencies}}"
+
+# Run a synthetic ISL/OSL benchmark against the currently deployed llm-d model.
+live-nyann concurrencies isl="1024" osl="512" duration="900" warmup="60":
+    NYANN_IMAGE="{{nyann_image}}" ./live-nyann/submit.sh "{{concurrencies}}" "{{isl}}" "{{osl}}" "{{duration}}" "{{warmup}}"
+
+# Regenerate and download the newest completed live-aiperf report.
+live-aiperf-report monitoring="false":
+    LIVE_AIPERF_MONITORING="{{monitoring}}" ./live-aiperf/download-report.sh
 
 _spec-slug:
     #!/usr/bin/env bash
@@ -582,7 +712,6 @@ report outdir:
             echo "=== Prometheus TSDB snapshot disabled (PROMETHEUS_SNAPSHOT=false) ==="
         fi
     done
-    python3 gen_interactivity_chart.py "{{outdir}}" 2>/dev/null || true
 
 
 # Deploy the typed service against operator-provisioned Kueue objects.
@@ -714,8 +843,6 @@ _smoke-interactivity dest concurrency:
     printf '%s\n' "$DECODE_GPUS" > "$WORK/results_${CONFIG_NAME}/decode_gpus.txt"
     printf '%s\n' "$PREFILL_GPUS" > "$WORK/results_${CONFIG_NAME}/prefill_gpus.txt"
     printf '%s\n' "$PODS" > "$WORK/results_${CONFIG_NAME}/pods.txt"
-    python3 gen_interactivity_chart.py "$WORK"
-    mv "$WORK/interactivity_vs_throughput.html" "$DEST/interactivity_vs_throughput.html"
 
 start-model:
     #!/usr/bin/env bash
@@ -982,7 +1109,6 @@ orchestrator-results outdir:
         kubectl cp "$NS/${POD}:${f}" "$LOCAL" 2>/dev/null || true
     done
     echo "Results copied to {{outdir}}/"
-    python3 gen_interactivity_chart.py "{{outdir}}" 2>/dev/null || true
 
 orchestrator-stop:
     #!/usr/bin/env bash

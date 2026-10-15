@@ -5,6 +5,7 @@ description = "Bounded, Kueue-managed AgentX benchmark service"
 requires-python = ">=3.11"
 dependencies = [
   "pydantic>=2.10,<3",
+  "PyYAML>=6,<7",
 ]
 
 [project.optional-dependencies]

@@ -4,3 +4,4 @@ __pycache__
 *.html
 .idea
 .DS_Store
+campaign-output/

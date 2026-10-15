@@ -2,6 +2,7 @@
 import argparse
 import base64
 import concurrent.futures
+import importlib.util
 import json
 import os
 import re
@@ -11,6 +12,20 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _load_common():
+    path = Path(__file__).with_name("dashboard_common.py")
+    spec = importlib.util.spec_from_file_location("agentx_dashboard_common", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Missing shared dashboard plumbing: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+COMMON = _load_common()
 
 _http_semaphore = threading.Semaphore(32)
 
@@ -28,10 +43,18 @@ SCOPED_METRIC_PREFIXES = (
 )
 
 POD_MATCHER_RE = re.compile(r'pod\s*(=~|=)\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
+KUBECTL_LOG_TIMESTAMP_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+(?P<message>.*)$")
+PROFILE_LANES_RE = re.compile(r"PROFILING setup:\s*(?P<concurrency>\d+) trajectory lanes")
 METRIC_SELECTOR_RE = re.compile(
     r'(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
     r'(?P<selector>\{[^{}]*\})'
 )
+BARE_SCOPED_METRIC_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])(?:" + "|".join(re.escape(prefix) for prefix in SCOPED_METRIC_PREFIXES) +
+    r")[A-Za-z0-9_:]*"
+)
+INFERENCE_POOL_SELECTOR_RE = re.compile(r"(?<![A-Za-z0-9_:])(inference_pool_[A-Za-z0-9_:]+)(\{[^{}]*\})")
+BARE_INFERENCE_POOL_RE = re.compile(r"(?<![A-Za-z0-9_:])inference_pool_[A-Za-z0-9_:]+")
 
 
 def parse_relative_time(s):
@@ -146,6 +169,11 @@ def substitute_vars(expr, deployment):
     expr = expr.replace("$namespace", ".*")
     expr = expr.replace("${namespace}", ".*")
     expr = expr.replace("$__rate_interval", "15s")
+    # Grafana turns an "All" variable into a regex matcher.  The live adapter
+    # has no legacy deployment name, so its equivalent is `.*`; leaving that
+    # behind an exact `=` matcher asks Prometheus for a literal asterisk and
+    # silently produces empty panels.
+    expr = re.sub(r'(?<![!~])=\s*"\.\*"', '=~".*"', expr)
     return expr
 
 
@@ -193,25 +221,51 @@ def derive_pod_regex(deployment, pod_regex):
     return "|".join(f"(?:{p})" for p in parts)
 
 
+def pod_regex_for_panel(title, pod_regex):
+    """Restrict phase-specific panels to pods serving that phase.
+
+    Some deployed dashboard revisions omit their old ``job=`` matcher.  The
+    report exporter already knows the exact serving pod names, so use those
+    names instead of trusting a mutable Prometheus job label.
+    """
+    normalized = title.strip().lower()
+    role = None
+    if normalized.startswith("prefill "):
+        role = "prefill"
+    elif normalized.startswith("decode "):
+        role = "decode"
+    if not role or not pod_regex:
+        return pod_regex
+
+    # derive_pod_regex emits each concrete expression as a non-capturing
+    # alternative.  Keep only alternatives naming the requested phase.
+    alternatives = re.findall(r"\(\?:([^()]*)\)", pod_regex)
+    selected = [part for part in alternatives if f"-{role}-" in part]
+    if not selected:
+        return pod_regex
+    return "|".join(f"(?:{part})" for part in selected)
+
+
 def should_scope_metric(metric):
     return metric.startswith(SCOPED_METRIC_PREFIXES)
 
 
-def scope_promql_expr(expr, pod_regex):
-    if not pod_regex:
+def scope_promql_expr(expr, pod_regex, metrics_namespace=None):
+    if not pod_regex and not metrics_namespace:
         return expr
 
-    matcher = f'pod=~"{prom_regex_escape(pod_regex)}"'
+    matcher = f'pod=~"{prom_regex_escape(pod_regex)}"' if pod_regex else ""
 
     def replace_existing_pod_matcher(match):
         return matcher
 
-    expr = POD_MATCHER_RE.sub(replace_existing_pod_matcher, expr)
+    if pod_regex:
+        expr = POD_MATCHER_RE.sub(replace_existing_pod_matcher, expr)
 
     def add_pod_matcher(match):
         metric = match.group("metric")
         selector = match.group("selector")
-        if "pod=" in selector or "pod=~" in selector or not should_scope_metric(metric):
+        if not pod_regex or "pod=" in selector or "pod=~" in selector or not should_scope_metric(metric):
             return match.group(0)
 
         inner = selector[1:-1].strip()
@@ -220,7 +274,56 @@ def scope_promql_expr(expr, pod_regex):
         inner += matcher
         return f"{metric}" + "{" + inner + "}"
 
-    return METRIC_SELECTOR_RE.sub(add_pod_matcher, expr)
+    expr = METRIC_SELECTOR_RE.sub(add_pod_matcher, expr)
+    namespace_matcher = f'namespace="{metrics_namespace}"' if metrics_namespace else ""
+    if metrics_namespace:
+        def scope_inference_pool(match):
+            selector = match.group(2)[1:-1]
+            if re.search(r"\bnamespace\s*(?:=~|!~|=|!=)", selector):
+                selector = re.sub(r'\bnamespace\s*(?:=~|!~|=|!=)\s*"(?:[^"\\]|\\.)*"',
+                                  namespace_matcher, selector)
+            else:
+                selector = (selector + ", " if selector.strip() else "") + namespace_matcher
+            return match.group(1) + "{" + selector + "}"
+        expr = INFERENCE_POOL_SELECTOR_RE.sub(scope_inference_pool, expr)
+
+    # Dashboard queries also use bare names such as rate(vllm:foo_total[1m]).
+    # Scope those names without changing quoted strings or existing selectors.
+    result = []
+    index = 0
+    quote = None
+    selector_depth = 0
+    while index < len(expr):
+        char = expr[index]
+        if quote:
+            result.append(char)
+            if char == "\\" and index + 1 < len(expr):
+                index += 1
+                result.append(expr[index])
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ('"', "'", "`"):
+            quote = char
+        elif char == "{":
+            selector_depth += 1
+        elif char == "}" and selector_depth:
+            selector_depth -= 1
+        if not selector_depth and quote is None:
+            metric = BARE_SCOPED_METRIC_RE.match(expr, index) if pod_regex else None
+            namespace_metric = BARE_INFERENCE_POOL_RE.match(expr, index) if metrics_namespace else None
+            metric = metric or namespace_metric
+            if metric:
+                name = metric.group(0)
+                result.append(name)
+                index = metric.end()
+                if not expr[index:].lstrip().startswith("{"):
+                    result.append("{" + (namespace_matcher if namespace_metric else matcher) + "}")
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
 
 
 def infer_unit(title, unit):
@@ -244,8 +347,10 @@ def infer_unit(title, unit):
     return unit
 
 
-def query_prometheus(base_url, auth, ds_id, expr, start, end, step):
-    path = f"/api/datasources/proxy/{ds_id}/api/v1/query_range"
+def query_prometheus(base_url, auth, ds_uid, expr, start, end, step):
+    # Grafana 12 removed the numeric-ID proxy route.  The datasource UID is
+    # stable and works on both the dashboard API and its proxy route.
+    path = f"/api/datasources/proxy/uid/{ds_uid}/api/v1/query_range"
     params = urllib.parse.urlencode({
         "query": expr,
         "start": int(start),
@@ -269,7 +374,7 @@ def export(args):
 
     dash = grafana_request(args.grafana_url, f"/api/dashboards/uid/{args.dashboard}", args.auth)
     ds_info = grafana_request(args.grafana_url, "/api/datasources/uid/PBFA97CFB590B2093", args.auth)
-    ds_id = ds_info["id"]
+    ds_uid = ds_info["uid"]
 
     dash_body = dash["dashboard"]
     if "elements" in dash_body and "panels" not in dash_body:
@@ -299,6 +404,7 @@ def export(args):
         pid = panel["id"]
         title = panel.get("title", f"panel-{pid}")
         unit = infer_unit(title, panel.get("fieldConfig", {}).get("defaults", {}).get("unit", ""))
+        panel_pod_regex = pod_regex_for_panel(title, pod_regex)
 
         queries = []
         for target in panel.get("targets", []):
@@ -306,17 +412,21 @@ def export(args):
             if not expr:
                 continue
             expr = substitute_vars(expr, args.deployment)
-            expr = scope_promql_expr(expr, pod_regex)
+            expr = scope_promql_expr(expr, panel_pod_regex, args.metrics_namespace)
             legend = target.get("legendFormat", "")
-            result = query_prometheus(args.grafana_url, args.auth, ds_id, expr, start, end, step)
+            result = query_prometheus(args.grafana_url, args.auth, ds_uid, expr, start, end, step)
+            if result.get("status") != "success":
+                raise RuntimeError(
+                    f"Prometheus query failed for panel {pid} ({title}): "
+                    f"{result.get('error') or result}"
+                )
 
             series = []
-            if result.get("status") == "success":
-                for r in result.get("data", {}).get("result", []):
-                    series.append({
-                        "labels": r.get("metric", {}),
-                        "values": r.get("values", []),
-                    })
+            for r in result.get("data", {}).get("result", []):
+                series.append({
+                    "labels": r.get("metric", {}),
+                    "values": r.get("values", []),
+                })
 
             queries.append({"expr": expr, "legend": legend, "series": series})
 
@@ -343,66 +453,45 @@ def export(args):
     else:
         out_path = f"dashboard_{ts_start}_{ts_end}.html"
 
-    html = generate_html(panel_data, row_order, start, end, args.dashboard)
+    html = generate_html(panel_data, row_order, start, end, args.dashboard, args.plotly_bundle)
 
     with open(out_path, "w") as f:
         f.write(html)
 
+    # Machine-readable copy of the panel data next to the page, so
+    # overlay_dashboards reads it instead of scraping the HTML.
+    sidecar = os.path.splitext(out_path)[0] + ".json"
+    with open(sidecar, "w") as f:
+        json.dump({"panels": panel_data, "rows": row_order}, f)
+
     print(f"\nExported to {out_path}")
 
 
-def generate_html(panel_data, row_order, start, end, dashboard_name):
+def generate_html(panel_data, row_order, start, end, dashboard_name, plotly_bundle=None):
     start_str = datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     end_str = datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     panels_json = json.dumps(panel_data)
     rows_json = json.dumps(row_order)
 
+    plotly_tag = COMMON.plotly_tag(plotly_bundle)
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>{dashboard_name} — {start_str} to {end_str}</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+{plotly_tag}
 <style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #111217; color: #d8d9da; font-family: Inter, -apple-system, sans-serif; padding: 16px; }}
-  h1 {{ font-size: 20px; font-weight: 500; margin-bottom: 4px; }}
-  .subtitle {{ font-size: 13px; color: #8e8e8e; margin-bottom: 20px; }}
-  .row-header {{ font-size: 15px; font-weight: 500; color: #d8d9da; padding: 10px 0 6px 4px;
-                 border-bottom: 1px solid #2a2a2e; margin: 16px 0 8px 0; cursor: pointer; user-select: none; }}
-  .row-header:hover {{ color: #fff; }}
-  .row-header .arrow {{ display: inline-block; width: 16px; transition: transform .15s; }}
-  .row-header.collapsed .arrow {{ transform: rotate(-90deg); }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 8px; }}
-  .panel {{ background: #181b1f; border: 1px solid #2a2a2e; border-radius: 4px; padding: 0; overflow: hidden; }}
-  .panel-title {{ font-size: 13px; font-weight: 500; padding: 8px 12px; color: #d8d9da; }}
-  .panel .plot {{ width: 100%; height: 220px; }}
-  .empty {{ color: #555; font-size: 12px; padding: 60px 12px; text-align: center; }}
-  .hidden {{ display: none; }}
-</style>
+{COMMON.BASE_CSS}</style>
 </head>
 <body>
 <h1>{dashboard_name}</h1>
 <div class="subtitle">{start_str} — {end_str}</div>
 <div id="root"></div>
 <script>
-if (!window.Plotly && window.parent && window.parent.Plotly) {{
-  window.Plotly = window.parent.Plotly;
-}}
-const panels = {panels_json};
+{COMMON.PARENT_PLOTLY_SHIM}const panels = {panels_json};
 const rows = {rows_json};
-
-const UNIT_FMT = {{
-  tps: v => v.toFixed(1) + ' tok/s',
-  percentunit: v => (v * 100).toFixed(1) + '%',
-  s: v => v < 0.001 ? (v*1e6).toFixed(0)+'µs' : v < 1 ? (v*1000).toFixed(1)+'ms' : v.toFixed(2)+'s',
-  bytes: v => v > 1e9 ? (v/1e9).toFixed(1)+'GB' : v > 1e6 ? (v/1e6).toFixed(1)+'MB' : v > 1e3 ? (v/1e3).toFixed(1)+'KB' : v+'B',
-  Bps: v => v > 1e9 ? (v/1e9).toFixed(1)+' GB/s' : v > 1e6 ? (v/1e6).toFixed(1)+' MB/s' : v > 1e3 ? (v/1e3).toFixed(1)+' KB/s' : v+' B/s',
-  watt: v => v.toFixed(0) + ' W',
-  percent: v => v.toFixed(1) + '%',
-  short: v => v > 1e6 ? (v/1e6).toFixed(1)+'M' : v > 1e3 ? (v/1e3).toFixed(1)+'K' : Number(v.toPrecision(4)).toString(),
-}};
 
 const UNIT_LABEL = {{
   tps: 'tokens/s',
@@ -431,8 +520,7 @@ function seriesLabel(q, s) {{
 }}
 
 const root = document.getElementById('root');
-let currentGrid = null;
-
+{COMMON.PANEL_JS}
 const lazyObserver = new IntersectionObserver((entries) => {{
   entries.forEach(entry => {{
     if (entry.isIntersecting) {{
@@ -450,34 +538,43 @@ const lazyObserver = new IntersectionObserver((entries) => {{
         line: {{ width: 1.5, color: COLORS[i % COLORS.length] }},
         hovertemplate: '%{{y}}<extra>%{{fullData.name}}</extra>',
       }}));
-      const fmt = UNIT_FMT[p.unit];
       const yTitle = UNIT_LABEL[p.unit] || p.unit || '';
+      const allY = traces.flatMap(trace => trace.y).filter(Number.isFinite);
+      const largestY = allY.reduce((largest, value) => Math.max(largest, value), -Infinity);
+      const smallestY = allY.reduce((smallest, value) => Math.min(smallest, value), Infinity);
+      const decimals = yTickDecimals(largestY, smallestY);
+      const yFormat = `,.${{decimals}}f`;
+      const widestLabel = Math.max(
+        largestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}}).length,
+        smallestY.toLocaleString('en-US', {{minimumFractionDigits: decimals, maximumFractionDigits: decimals}}).length,
+      );
       if (!window.Plotly) {{
         plotDiv.innerHTML = '<div class="empty">Plotly unavailable</div>';
         return;
       }}
       Plotly.newPlot(plotDiv, traces, {{
-        margin: {{ l: 58, r: 16, t: 4, b: 30 }},
+        margin: {{ l: Math.max(76, (widestLabel + 2) * 8), r: 16, t: 4, b: 40 }},
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: {{ color: '#8e8e8e', size: 10 }},
-        xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: '%H:%M' }},
+        xaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e', tickformat: '%H:%M', exponentformat: 'none', showexponent: 'none' }},
         yaxis: {{ gridcolor: '#2a2a2e', linecolor: '#2a2a2e',
                   title: yTitle ? {{ text: yTitle, font: {{ size: 10 }} }} : undefined,
-                  tickformat: fmt ? undefined : '.3s',
-                  hoverformat: '.4g' }},
-        legend: {{ font: {{ size: 9 }}, orientation: 'h', y: -0.3 }},
-        showlegend: traces.length > 1,
+                  tickformat: yFormat, hoverformat: yFormat, exponentformat: 'none', showexponent: 'none', separatethousands: true, automargin: true }},
+        legend: {{ font: {{ size: 9 }}, orientation: 'v', x: 1, xanchor: 'right', y: 1, yanchor: 'top', bgcolor: 'rgba(17,18,23,.88)' }},
+        // Long pod/rank names otherwise cover the data; the panel button can
+        // reveal the legend on demand.
+        showlegend: false,
         hovermode: 'x unified',
-      }}, {{ responsive: true, displayModeBar: false }});
+      }}, {{ responsive: true, displayModeBar: true, displaylogo: false, scrollZoom: true, modeBarButtonsToRemove: ['lasso2d','select2d'] }});
     }}
   }});
 }}, {{ rootMargin: '200px' }});
 
-function renderPanel(container, p) {{
+function renderPanel(container, pid, p) {{
   const div = document.createElement('div');
   div.className = 'panel';
-  div.innerHTML = '<div class="panel-title">' + p.title + '</div>';
+  div.innerHTML = panelHeaderHtml(p.title);
 
   const allSeries = p.queries.flatMap(q => q.series.map(s => ({{q, s}})));
   const hasData = allSeries.some(x => x.s.values.length > 0 && x.s.values.some(v => !isNaN(parseFloat(v[1]))));
@@ -492,42 +589,70 @@ function renderPanel(container, p) {{
   plotDiv.className = 'plot';
   div.appendChild(plotDiv);
   container.appendChild(div);
+  makePanelInteractive(div, plotDiv);
   div._panelData = p;
   lazyObserver.observe(div);
 }}
 
-if (rows.length === 0) {{
-  currentGrid = document.createElement('div');
-  currentGrid.className = 'grid';
-  root.appendChild(currentGrid);
-  for (const p of Object.values(panels)) renderPanel(currentGrid, p);
-}} else {{
-  for (const item of rows) {{
-    if (item.type === 'row') {{
-      const h = document.createElement('div');
-      h.className = 'row-header';
-      h.innerHTML = '<span class="arrow">▾</span> ' + item.title;
-      currentGrid = document.createElement('div');
-      currentGrid.className = 'grid';
-      h.addEventListener('click', () => {{
-        h.classList.toggle('collapsed');
-        currentGrid.classList.toggle('hidden');
-      }});
-      root.appendChild(h);
-      root.appendChild(currentGrid);
-    }} else if (item.type === 'panel' && panels[item.id]) {{
-      if (!currentGrid) {{
-        currentGrid = document.createElement('div');
-        currentGrid.className = 'grid';
-        root.appendChild(currentGrid);
-      }}
-      renderPanel(currentGrid, panels[item.id]);
-    }}
-  }}
-}}
+scaffoldRows(rows, panels, renderPanel);
 </script>
 </body>
 </html>"""
+
+
+def logged_aiperf_window(log_path, directory):
+    """Return exact profiling boundaries for c<N> or c<N>-r<M> runs."""
+    match = re.fullmatch(r"c(\d+)(?:-r\d+)?", os.path.basename(directory))
+    if not match:
+        raise RuntimeError(f"Cannot identify concurrency from {directory}")
+    wanted = match.group(1)
+    repeat_match = re.fullmatch(r"c\d+-r(\d+)", os.path.basename(directory))
+    occurrence = int(repeat_match.group(1)) if repeat_match else 1
+    try:
+        lines = open(log_path, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read AIPerf Job log {log_path}: {exc}") from exc
+    pending_concurrency = None
+    active_window = None
+    windows = {}
+    with lines:
+        for line in lines:
+            stamped = KUBECTL_LOG_TIMESTAMP_RE.match(line)
+            if not stamped:
+                continue
+            timestamp = datetime.fromisoformat(stamped["timestamp"].replace("Z", "+00:00")).timestamp()
+            message = stamped["message"]
+            lanes = PROFILE_LANES_RE.search(message)
+            if lanes:
+                pending_concurrency = lanes["concurrency"]
+            # AIPerf now emits "Phase profiling (profiling) started" and
+            # "Phase profiling (profiling) complete".  Keep the match
+            # specific so the intermediate "sending complete" line does not
+            # close the monitoring window early.
+            if re.search(r"Phase profiling(?: \([^)]*\))? started\b", message):
+                if pending_concurrency:
+                    active_window = [pending_concurrency, timestamp, None]
+                    windows.setdefault(pending_concurrency, []).append(active_window)
+            elif (
+                re.search(r"Phase profiling(?: \([^)]*\))? complete\b", message)
+                and active_window is not None
+            ):
+                active_window[2] = timestamp
+                active_window = None
+
+    concurrency_windows = windows.get(wanted, [])
+    if occurrence > len(concurrency_windows):
+        raise RuntimeError(
+            f"No profiling window #{occurrence} for c{wanted} in {log_path}; "
+            f"found {len(concurrency_windows)} window(s)"
+        )
+    _, start, end = concurrency_windows[occurrence - 1]
+    if start is not None and end is not None and end > start:
+        return start, end
+    raise RuntimeError(
+        f"No complete timestamped profiling phase for c{wanted}-r{occurrence} in {log_path}; "
+        "refusing to guess a monitoring range"
+    )
 
 
 def export_results(args):
@@ -543,10 +668,13 @@ def export_results(args):
         with open(json_path) as f:
             data = json.load(f)
 
-        start_ns = data["min_request_timestamp"]["avg"]
-        end_ns = data["max_response_timestamp"]["avg"]
-        start = start_ns / 1e9 - args.pad
-        end = end_ns / 1e9 + args.pad
+        if args.aiperf_log:
+            start, end = logged_aiperf_window(args.aiperf_log, d)
+        else:
+            start_ns = data["min_request_timestamp"]["avg"]
+            end_ns = data["max_response_timestamp"]["avg"]
+            start = start_ns / 1e9 - args.pad
+            end = end_ns / 1e9 + args.pad
 
         out_path = os.path.join(d, "dashboard.html")
         name = os.path.basename(d)
@@ -562,9 +690,10 @@ def export_results(args):
                 pod_regex = f.read().strip()
         tasks.append((name, start, end, args.pad, argparse.Namespace(
             start=str(start), end=str(end),
-            deployment=deployment, pod_regex=pod_regex, step=args.step,
+            deployment=deployment, pod_regex=pod_regex, metrics_namespace=args.metrics_namespace, step=args.step,
             grafana_url=args.grafana_url, auth=args.auth,
             output=out_path, dashboard=args.dashboard,
+            plotly_bundle=args.plotly_bundle, aiperf_log=args.aiperf_log,
         )))
 
     if not tasks:
@@ -587,10 +716,14 @@ def main():
     parser = argparse.ArgumentParser(description="Export Grafana dashboard to a self-contained HTML file")
     parser.add_argument("--deployment", default=".*", help="Deployment filter (default: .* for all)")
     parser.add_argument("--pod-regex", default="", help="Pod regex used to scope dashboard metrics")
+    parser.add_argument("--metrics-namespace", help="namespace for inference pool dashboard metrics")
     parser.add_argument("--step", type=int, help="Query step in seconds (auto if omitted)")
     parser.add_argument("--grafana-url", default="http://localhost:3001")
-    parser.add_argument("--auth", default="admin:admin", help="user:password")
+    parser.add_argument("--auth", help="user:password")
+    parser.add_argument("--auth-env", help="environment variable containing user:password")
     parser.add_argument("--dashboard", default="wideep-overview", help="Dashboard UID")
+    parser.add_argument("--plotly-bundle", help="gzip-compressed Plotly JS to embed for offline output")
+    parser.add_argument("--aiperf-log", help="Timestamped AIPerf Job log used for profiling-phase boundaries")
 
     sub = parser.add_subparsers(dest="command")
 
@@ -604,6 +737,14 @@ def main():
     results.add_argument("--pad", type=int, default=60, help="Seconds of padding before/after run (default: 60)")
 
     args = parser.parse_args()
+    if args.auth_env:
+        if args.auth:
+            parser.error("use --auth or --auth-env, not both")
+        args.auth = os.environ.get(args.auth_env)
+        if not args.auth:
+            parser.error(f"{args.auth_env} is empty or unset")
+    elif args.auth is None:
+        args.auth = "admin:admin"
 
     if args.command == "results":
         export_results(args)
