@@ -143,8 +143,9 @@ campaign-watch config *flags:
     @python3 "{{repo_root}}/campaign/run.py" watch-cluster "{{config}}" {{flags}}
 
 # Tail all logs of a running cluster campaign in one terminal: the runner Job,
-# the serving Pods of every overlay, the benchmark Jobs, and the router.
-# Requires stern (brew install stern); Ctrl-C detaches without stopping it.
+# the serving Pods of every overlay, the benchmark Jobs, the vLLM prebuild
+# Jobs, and the router. Requires stern (brew install stern); Ctrl-C detaches
+# without stopping it.
 campaign-logs config:
     @python3 "{{repo_root}}/campaign/run.py" logs-cluster "{{config}}"
 

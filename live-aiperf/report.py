@@ -708,7 +708,7 @@ def write_index_from_runs(root: Path, runs: list[dict[str, Any]], *, extra_html:
             f'const b=atob("{encoded_overlay}");const a=new Uint8Array(b.length);'
             'for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);'
             'sidePanelTitle.textContent="Overlay monitoring across concurrencies";'
-            'sidePanelFrame.src=URL.createObjectURL(new Blob([a],{type:"text/html"}));'
+            'sidePanelFrame.srcdoc=new TextDecoder().decode(a);'
             'sidePanel.classList.add("open");overlay.classList.add("open");});</script>'
         )
     if compact_header:

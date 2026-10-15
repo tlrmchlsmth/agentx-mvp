@@ -343,7 +343,11 @@ const sidePanelFrame = document.getElementById('sidePanelFrame');
 const sidePanelTitle = document.getElementById('sidePanelTitle');
 const overlay = document.getElementById('overlay');
 
-const blobCache = {{}};
+// Dashboards load through srcdoc, not blob URLs: srcdoc content inherits the
+// page's origin, so the reports keep working when opened straight from disk
+// (file://), where browsers treat every document as a unique origin and
+// refuse blob: navigations and cross-frame Plotly access.
+const htmlCache = {{}};
 
 // Pre-decode all dashboards in the background so clicks are instant
 setTimeout(() => {{
@@ -351,7 +355,7 @@ setTimeout(() => {{
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    blobCache[key] = URL.createObjectURL(new Blob([bytes], {{ type: 'text/html;charset=utf-8' }}));
+    htmlCache[key] = new TextDecoder().decode(bytes);
   }}
 }}, 100);
 
@@ -363,7 +367,6 @@ function openDashboard(cfg, conc) {{
     // one); say so instead of silently ignoring the click. The closing body
     // tag stays split so no page-level closing-tag splice can ever match
     // inside this string.
-    sidePanelFrame.removeAttribute('srcdoc');
     sidePanelFrame.srcdoc = '<body style="margin:24px;font-family:Inter,-apple-system,sans-serif;'
       + 'color:#8e8e8e;font-size:14px;background:#111217;">No monitoring data was recorded for this run.</'
       + 'body>';
@@ -371,14 +374,13 @@ function openDashboard(cfg, conc) {{
     overlay.classList.add('open');
     return;
   }}
-  sidePanelFrame.removeAttribute('srcdoc');
-  if (!blobCache[key]) {{
+  if (!htmlCache[key]) {{
     const bin = atob(DASHBOARDS[key]);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    blobCache[key] = URL.createObjectURL(new Blob([bytes], {{ type: 'text/html;charset=utf-8' }}));
+    htmlCache[key] = new TextDecoder().decode(bytes);
   }}
-  sidePanelFrame.src = blobCache[key];
+  sidePanelFrame.srcdoc = htmlCache[key];
   sidePanel.classList.add('open');
   overlay.classList.add('open');
 }}

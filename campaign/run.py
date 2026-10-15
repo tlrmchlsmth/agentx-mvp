@@ -2343,25 +2343,53 @@ def stop_cluster(config: dict[str, Any]) -> None:
     print(f"Campaign {campaign_id} stopped; results remain on {config['results_pvc']}", flush=True)
 
 
+def prebuild_job_names(config: dict[str, Any]) -> list[str]:
+    """Exact names of the vLLM prebuild Jobs this campaign can spawn.
+
+    ``vllm_prebuild`` derives each Job's name from a hash of the campaign ID
+    and overlay name, so the set is computable from the config alone. Matrix
+    ``builds`` prebuild every overlay once per source/DeepEP variant, while a
+    per-overlay ``build`` prebuilds only that overlay; overlays that just run
+    the runtime image never spawn one. The Jobs are also deleted as soon as
+    they finish, so the names only ever match while a build is running.
+    """
+    variants = config.get("builds")
+    source_variants = bool(variants) and any(
+        variant.get("steps") or "deepep" in variant for variant in variants)
+    names = set()
+    for overlay in config["overlays"]:
+        build = overlay.get("build") or {}
+        if not source_variants and not (build.get("steps") or "deepep" in build):
+            continue
+        digest = hashlib.sha256(f"{config['id']}/{overlay['name']}".encode()).hexdigest()[:16]
+        names.add("campaign-build-" + digest)
+    return sorted(names)
+
+
 def stern_commands(config: dict[str, Any]) -> list[list[str]]:
     """Build one stern invocation per log source of a running campaign.
 
     stern matches either a pod-name query or a single label selector per
     invocation, so the runner Pod, the benchmark Pods, each distinct
-    serving-Pod selector, and the router each get their own process whose
-    output interleaves in one terminal, every line prefixed with its Pod.
-    The runner Pod is matched through its job-name label: long campaign IDs
-    truncate Pod names below the 63-character limit while the label keeps
-    the full Job name. Benchmark Jobs can only be matched by name prefix
-    (their run-id annotation is not selectable and their name hash is not
-    derivable from the config). Only Running Pods match, so finished Jobs
-    from earlier campaigns in the namespace do not dump their old logs on
-    attach.
+    serving-Pod selector, the router, and the vLLM prebuild Jobs each get
+    their own process whose output interleaves in one terminal, every line
+    prefixed with its Pod. The runner Pod is matched through its job-name
+    label: long campaign IDs truncate Pod names below the 63-character limit
+    while the label keeps the full Job name. Benchmark Jobs can only be
+    matched by name prefix (their run-id annotation is not selectable and
+    their name hash is not derivable from the config). Prebuild Jobs are
+    matched by their exact hashed names (see prebuild_job_names), which keeps
+    other campaigns' builds in the shared namespace out. Only Running Pods
+    match, so finished Jobs from earlier campaigns in the namespace do not
+    dump their old logs on attach.
     """
     base = ["stern", "--namespace", config["namespace"], "--timestamps",
             "--field-selector", "status.phase=Running"]
     commands = [base + ["--selector", f"job-name=campaign-{config['id']}"],
                 base + [r"^(nyann-|aiperf-)"]]
+    prebuilds = prebuild_job_names(config)
+    if prebuilds:
+        commands.append(base + ["^(?:" + "|".join(prebuilds) + ")"])
     for selector in sorted({overlay["pod_selector"] for overlay in config["overlays"]}):
         commands.append(base + ["--selector", selector])
     if "router" in config:
@@ -2371,8 +2399,9 @@ def stern_commands(config: dict[str, Any]) -> list[list[str]]:
 
 def logs_cluster(config: dict[str, Any]) -> int:
     """Tail every log a running campaign produces: the runner Job, the serving
-    Pods of every overlay, the benchmark Jobs it submits, and the router when
-    the campaign manages one. Ctrl-C detaches without touching the campaign.
+    Pods of every overlay, the benchmark Jobs it submits, the vLLM prebuild
+    Jobs it compiles wheels in, and the router when the campaign manages one.
+    Ctrl-C detaches without touching the campaign.
     Returns 130 on Ctrl-C, otherwise the exit code of the first stern that
     stopped on its own (a tail never ends by itself, so that is a failure)."""
     if shutil.which("stern") is None:
@@ -3047,6 +3076,7 @@ def submit(config: dict[str, Any], image: str, service_account: str, *,
         shown = display_path(config_path.resolve())
         print(flush=True)
         print(f"  watch    just campaign-watch {shown}", flush=True)
+        print(f"  tail     just campaign-logs {shown}", flush=True)
         print(f"  stop     just campaign-stop {shown}", flush=True)
         print(f"  download just campaign-download {shown}", flush=True)
         print(flush=True)

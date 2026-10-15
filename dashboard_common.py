@@ -38,16 +38,21 @@ def plotly_tag(bundle_path=None) -> str:
 
 
 def strip_plotly(page: str) -> str:
-    """Remove the page's Plotly <script> tag so it can reuse a parent copy.
+    """Prepare a dashboard page for embedding in the report index.
+
+    The page's Plotly <script> tag is removed so the page can borrow the
+    index's single bundled copy, and the minimal parent-Plotly shim baked
+    into pages from before stylesheet mirroring is swapped for the current
+    one (see PARENT_PLOTLY_SHIM).
 
     Only the first script block is considered, and it is only removed when it
     is the Plotly tag (the vendored bundle references cdn.plot.ly), so pages
     that never embedded Plotly pass through unchanged.
     """
     match = _PLOTLY_SCRIPT.search(page)
-    if not match or "cdn.plot.ly" not in match.group(0):
-        return page
-    return page[:match.start()] + page[match.end():]
+    if match and "cdn.plot.ly" in match.group(0):
+        page = page[:match.start()] + page[match.end():]
+    return _MINIMAL_PARENT_SHIM.sub(lambda _match: PARENT_PLOTLY_SHIM, page)
 
 
 # Dark-theme rules shared by the exported dashboard and the overlay page.
@@ -156,8 +161,53 @@ function scaffoldRows(rows, panels, renderPanel) {
 
 
 # A page stripped by strip_plotly() borrows Plotly from the window that
-# embedded it (the report index carries the single bundled copy).
+# embedded it (the report index carries the single bundled copy).  Plotly
+# registers its stylesheets on the document that evaluated the bundle — the
+# embedding page — so a borrowed namespace would otherwise draw the modebar
+# unstyled inside an iframe: an unpositioned toolbar whose icons fall back
+# to a black fill and vanish on the dark panels.  The shim therefore mirrors
+# every plotly.js-style-* rule block into this document after each draw.
 PARENT_PLOTLY_SHIM = """if (!window.Plotly && window.parent && window.parent.Plotly) {
-  window.Plotly = window.parent.Plotly;
+  const parentPlotly = window.parent.Plotly;
+  const mirrorPlotlyStyles = () => {
+    try {
+      window.parent.document.querySelectorAll('style[id^="plotly.js-style-"]').forEach(block => {
+        if (!block.sheet) return;
+        const css = Array.from(block.sheet.cssRules, rule => rule.cssText).join('\\n');
+        let mirror = document.getElementById(block.id);
+        if (!mirror) {
+          mirror = document.createElement('style');
+          mirror.id = block.id;
+          document.head.appendChild(mirror);
+        }
+        if (mirror.textContent !== css) mirror.textContent = css;
+      });
+    } catch (err) {
+      // An unreachable parent document only costs the modebar styling.
+    }
+  };
+  const mirrorAfterDraw = (draw) => (...args) => {
+    const pending = draw.apply(parentPlotly, args);
+    if (pending && typeof pending.then === 'function') {
+      pending.then(mirrorPlotlyStyles, mirrorPlotlyStyles);
+    }
+    mirrorPlotlyStyles();
+    return pending;
+  };
+  const wrapped = {};
+  for (const name of ['newPlot', 'react']) {
+    if (typeof parentPlotly[name] === 'function') wrapped[name] = mirrorAfterDraw(parentPlotly[name]);
+  }
+  // Copy the namespace instead of mutating the parent's: its own draws stay
+  // untouched while this document's draws refresh the mirrored styles.
+  window.Plotly = Object.assign({}, parentPlotly, wrapped);
+  mirrorPlotlyStyles();
 }
 """
+
+# The first shim only borrowed the parent's namespace verbatim; pages baked
+# with it get the stylesheet-mirroring version swapped in when embedded.
+_MINIMAL_PARENT_SHIM = re.compile(
+    r"if \(!window\.Plotly && window\.parent && window\.parent\.Plotly\) \{\s*"
+    r"window\.Plotly = window\.parent\.Plotly;\s*\}"
+)

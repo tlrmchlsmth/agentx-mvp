@@ -161,11 +161,12 @@ just campaign-logs campaign-output/<id>.json
 ```
 
 It aggregates the runner Job, the serving Pods of every overlay, the benchmark
-Jobs the campaign submits, and the campaign-managed router when configured,
+Jobs the campaign submits, the vLLM prebuild Jobs that compile source builds,
+and the campaign-managed router when configured,
 each line prefixed with its Pod (requires [stern](https://github.com/stern/stern),
 `brew install stern`). Only running Pods are tailed, so completed benchmark
-Jobs left over from earlier campaigns stay quiet. Ctrl-C detaches without
-affecting the campaign.
+Jobs and prebuild Jobs left over from earlier campaigns stay quiet. Ctrl-C
+detaches without affecting the campaign.
 
 To stop a running campaign, use the printed stop command:
 
